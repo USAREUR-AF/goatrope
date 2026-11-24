@@ -7,10 +7,10 @@ SPDX-License-Identifier: Apache-2.0
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted (2026-11-24, operator) |
 | Date | 2026-11-24 |
 | Deciders | operator |
-| Owner | **OPEN**: no owner has been named |
+| Owner | `goat-owners` |
 | Related | goatcore ADR 1257 and `docs/design/goatbuilder-build-targets.md` §3.8 (the network tap as a build target type); [ADR 0002](0002-relay.md) (the relay) |
 
 ## Decision
