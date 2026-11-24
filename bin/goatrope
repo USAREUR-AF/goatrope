@@ -1,0 +1,12 @@
+#!/usr/bin/python3 -I
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# goatrope, run from a checkout or an unpacked release. `goatrope install` copies the
+# software to /usr/local/lib/goatrope and this entry point to /usr/local/sbin/goatrope.
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+from goatrope.cli import main  # noqa: E402
+
+sys.exit(main())

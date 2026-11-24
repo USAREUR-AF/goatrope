@@ -1,0 +1,15 @@
+# goatrope declaration: an inline tap. Every value is a placeholder; replace each one.
+# Inline means the link passes through this machine and is DOWN whenever it is off,
+# restarting or hung. Use listen mode with a tap device or a mirror port to fail open.
+schema = 1
+
+[tap]
+mode = "inline"                    # required: "inline" or "listen"
+ports = ["enxPORTA", "enxPORTB"]   # required: exactly two wired ports, bridged
+management = "eth0"                # required: the interface you manage the machine over
+
+[tap.record]
+ports = ["enxPORTA"]               # one bridge port; it sees both directions
+filter = ""                        # required: a BPF filter, or "" for every frame
+file_mb = 50                       # required: size of one ring file, in MB
+files = 40                         # required: files in the ring (here 2 GB in all)

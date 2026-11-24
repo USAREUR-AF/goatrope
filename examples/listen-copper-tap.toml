@@ -1,0 +1,16 @@
+# goatrope declaration: listen mode behind a passive copper tap (one output per direction).
+# Every value is a placeholder; replace each one.
+schema = 1
+
+[tap]
+mode = "listen"
+source = "copper-tap"              # copper-tap | mirror-port | bypass-relay
+ports = ["enxPORTA", "enxPORTB"]   # one port per tap output
+management = "eth0"
+speed_mbps = 100                   # a passive copper tap's outputs run at 100 Mb/s and do not negotiate
+
+[tap.record]
+ports = ["enxPORTA", "enxPORTB"]   # one ring per port
+filter = ""
+file_mb = 50
+files = 20

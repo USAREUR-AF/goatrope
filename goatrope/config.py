@@ -1,0 +1,417 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+"""The declared configuration: one TOML file, validated before anything changes.
+
+There are no defaults for what the operator must decide: the tap mode, the
+ports, the management interface, the recording filter, and every address and
+port number a decode-and-send or relay section names. A missing value is a
+refusal, never a guess.
+"""
+from __future__ import annotations
+
+import ipaddress
+import re
+import tomllib
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
+
+DEFAULT_PATH = "/etc/goatrope/goatrope.toml"
+IFNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$")
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+SOURCES = ("copper-tap", "mirror-port", "bypass-relay")
+
+
+class ConfigError(Exception):
+    """The declaration is incomplete or contradicts itself. Exit code 2."""
+
+
+@dataclass
+class Record:
+    ports: list[str]
+    filter: str
+    file_mb: int
+    files: int
+    directory: str
+
+
+@dataclass
+class Tap:
+    mode: str
+    ports: list[str]
+    management: str
+    source: str | None
+    speed_mbps: int | None
+    record: Record
+
+
+@dataclass
+class Match:
+    protocol: str
+    src: str | None
+    dst: str | None
+    src_port: int | None
+    dst_port: int | None
+
+
+@dataclass
+class Convert:
+    binary: str
+    sha256: str
+    version: str
+    from_format: str
+    to_format: str
+
+
+@dataclass
+class Destination:
+    url: str
+    scheme: str
+    host: str | None
+    port: int | None
+    path: str | None
+    framing: str | None
+    format: str | None
+
+
+@dataclass
+class Send:
+    name: str
+    port: str
+    match: Match
+    convert: Convert | None
+    to: list[Destination]
+
+
+@dataclass
+class Decode:
+    name: str
+    component: str
+    binary: str
+    sha256: str
+    version: str
+    ports: list[str]
+    filter: str
+    dictionary: str
+    subscribers: str
+
+
+@dataclass
+class RelayRule:
+    direction: str
+    remote: str
+    listen_port: int
+    target: str
+    target_port: int
+    protocol: str
+
+
+@dataclass
+class Relay:
+    wip_acknowledged: bool
+    remote_interface: str
+    link_interface: str
+    link_address: str
+    rules: list[RelayRule]
+
+
+@dataclass
+class Config:
+    path: str
+    tap: Tap | None
+    sends: list[Send] = field(default_factory=list)
+    decodes: list[Decode] = field(default_factory=list)
+    relay: Relay | None = None
+
+    def tap_ports(self) -> list[str]:
+        return list(self.tap.ports) if self.tap else []
+
+
+def _keys(table: dict, where: str, allowed: set[str], required: set[str]) -> None:
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+    missing = sorted(k for k in required if k not in table)
+    if missing:
+        raise ConfigError(f"{where}: missing required key(s) {', '.join(missing)}; there is no default")
+
+
+def _str(table: dict, key: str, where: str) -> str:
+    v = table[key]
+    if not isinstance(v, str) or (key != "filter" and not v):
+        raise ConfigError(f"{where}.{key} must be a non-empty string")
+    return v
+
+
+def _int(table: dict, key: str, where: str, lo: int, hi: int) -> int:
+    v = table[key]
+    if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+        raise ConfigError(f"{where}.{key} must be a whole number from {lo} to {hi}")
+    return v
+
+
+def _ifname(v, where: str) -> str:
+    if not isinstance(v, str) or not IFNAME.match(v):
+        raise ConfigError(f"{where}: {v!r} is not an interface name")
+    return v
+
+
+def _addr(v, where: str) -> str:
+    try:
+        return str(ipaddress.ip_address(v))
+    except (ValueError, TypeError):
+        raise ConfigError(f"{where}: {v!r} is not an IP address") from None
+
+
+def _port_list(v, where: str, lo: int, hi: int) -> list[str]:
+    if not isinstance(v, list) or not lo <= len(v) <= hi:
+        n = f"exactly {lo}" if lo == hi else f"{lo} to {hi}"
+        raise ConfigError(f"{where} must list {n} interface(s)")
+    names = [_ifname(p, where) for p in v]
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{where}: an interface is listed twice")
+    return names
+
+
+def _sha(table: dict, where: str) -> str:
+    v = _str(table, "sha256", where)
+    if not re.fullmatch(r"[0-9a-f]{64}", v):
+        raise ConfigError(f"{where}.sha256 must be 64 lowercase hex digits")
+    return v
+
+
+def _tap(t: dict) -> Tap:
+    w = "[tap]"
+    if not isinstance(t, dict):
+        raise ConfigError(f"{w} must be a table")
+    _keys(t, w, {"mode", "ports", "management", "source", "speed_mbps", "record"},
+          {"mode", "ports", "management", "record"})
+    mode = t["mode"]
+    if mode not in ("inline", "listen"):
+        raise ConfigError(f"{w}.mode must be \"inline\" or \"listen\", not {mode!r}")
+    if mode == "inline":
+        ports = _port_list(t["ports"], f"{w}.ports (inline bridges two ports)", 2, 2)
+        if "source" in t:
+            raise ConfigError(f"{w}.source is for listen mode; an inline tap is the device on the link")
+        source = None
+    else:
+        ports = _port_list(t["ports"], f"{w}.ports (listen takes one port, or two for a passive tap's two outputs)", 1, 2)
+        if "source" not in t:
+            raise ConfigError(f"{w}.source is required in listen mode: one of {', '.join(SOURCES)}")
+        source = t["source"]
+        if source not in SOURCES:
+            raise ConfigError(f"{w}.source must be one of {', '.join(SOURCES)}, not {source!r}")
+    mgmt = _ifname(t["management"], f"{w}.management")
+    if mgmt in ports:
+        raise ConfigError(f"{w}.management ({mgmt}) is also a tap port; manage the machine over another interface")
+    speed = None
+    if "speed_mbps" in t:
+        speed = t["speed_mbps"]
+        if speed not in (10, 100, 1000, 2500, 5000, 10000):
+            raise ConfigError(f"{w}.speed_mbps must be 10, 100, 1000, 2500, 5000 or 10000")
+    if source == "copper-tap" and speed is None:
+        raise ConfigError(f"{w}.speed_mbps is required with source = \"copper-tap\": "
+                          "a passive copper tap's outputs do not negotiate (100 is usual)")
+    r = t["record"]
+    rw = f"{w.rstrip(']')}.record]"
+    if not isinstance(r, dict):
+        raise ConfigError(f"{rw} must be a table")
+    _keys(r, rw, {"ports", "filter", "file_mb", "files", "directory"}, {"ports", "filter", "file_mb", "files"})
+    rports = _port_list(r["ports"], f"{rw}.ports", 1, 1 if mode == "inline" else 2)
+    for p in rports:
+        if p not in ports:
+            raise ConfigError(f"{rw}.ports: {p} is not one of [tap].ports")
+    rfilter = _str(r, "filter", rw)
+    directory = r.get("directory", "/var/lib/goatrope/record")
+    if not isinstance(directory, str) or not directory.startswith("/var/lib/") or ".." in directory:
+        raise ConfigError(f"{rw}.directory must be an absolute path under /var/lib/")
+    return Tap(mode, ports, mgmt, source, speed,
+               Record(rports, rfilter, _int(r, "file_mb", rw, 1, 4096), _int(r, "files", rw, 2, 10000),
+                      directory.rstrip("/")))
+
+
+def _destination(u, where: str, tap_ports: list[str]) -> Destination:
+    if isinstance(u, str):
+        u = {"url": u}
+    if not isinstance(u, dict):
+        raise ConfigError(f"{where} must be a URL string or a table with url")
+    _keys(u, where, {"url", "framing", "format"}, {"url"})
+    url = _str(u, "url", where)
+    s = urlsplit(url)
+    if s.scheme in ("udp", "tcp"):
+        if not s.hostname or s.port is None:
+            raise ConfigError(f"{where}: {url} needs an address and a port, e.g. {s.scheme}://192.0.2.1:5000")
+        _addr(s.hostname, where)
+        framing = u.get("framing")
+        if s.scheme == "tcp" and framing not in ("len32be", "raw"):
+            raise ConfigError(f"{where}: a tcp destination needs framing = \"len32be\" or \"raw\"")
+        if s.scheme == "udp" and framing is not None:
+            raise ConfigError(f"{where}: framing is for tcp destinations")
+        if "format" in u:
+            raise ConfigError(f"{where}: format is for file destinations")
+        return Destination(url, s.scheme, s.hostname, s.port, None, framing, None)
+    if s.scheme in ("http", "https"):
+        if not s.hostname:
+            raise ConfigError(f"{where}: {url} has no host")
+        if "framing" in u or "format" in u:
+            raise ConfigError(f"{where}: an HTTP destination posts each message; no framing or format")
+        return Destination(url, s.scheme, s.hostname, s.port, s.path or "/", None, None)
+    if s.scheme == "file":
+        if not s.path.startswith("/var/lib/goatrope/") or ".." in s.path:
+            raise ConfigError(f"{where}: a file destination must be under /var/lib/goatrope/")
+        fmt = u.get("format")
+        if fmt not in ("jsonl", "raw"):
+            raise ConfigError(f"{where}: a file destination needs format = \"jsonl\" or \"raw\"")
+        if "framing" in u:
+            raise ConfigError(f"{where}: framing is for tcp destinations")
+        return Destination(url, "file", None, None, s.path, None, fmt)
+    if s.scheme == "zenoh":
+        raise ConfigError(f"{where}: goatrope sends no Zenoh itself; use a [[decode]] component's own sink")
+    raise ConfigError(f"{where}: {url} is not udp://, tcp://, http(s):// or file://")
+
+
+def _send(s: dict, i: int, tap: Tap | None) -> Send:
+    w = f"[[send]] #{i + 1}"
+    if not isinstance(s, dict):
+        raise ConfigError(f"{w} must be a table")
+    _keys(s, w, {"name", "port", "match", "convert", "to"}, {"name", "port", "match", "to"})
+    name = _str(s, "name", w)
+    if not NAME.match(name):
+        raise ConfigError(f"{w}.name is lowercase letters, digits and hyphens")
+    w = f"[[send]] {name}"
+    if tap is None:
+        raise ConfigError(f"{w}: decode-and-send reads a tap's copy; declare [tap] first")
+    port = _ifname(s["port"], f"{w}.port")
+    if port not in tap.ports:
+        raise ConfigError(f"{w}.port: {port} is not one of [tap].ports")
+    m = s["match"]
+    if not isinstance(m, dict):
+        raise ConfigError(f"{w}.match must be a table")
+    _keys(m, f"{w}.match", {"protocol", "src", "dst", "src_port", "dst_port"}, {"protocol"})
+    if m["protocol"] != "udp":
+        raise ConfigError(f"{w}.match.protocol: only \"udp\" is built (TCP stream reassembly is not)")
+    if not any(k in m for k in ("src", "dst", "src_port", "dst_port")):
+        raise ConfigError(f"{w}.match names nothing but the protocol; declare at least one address or port")
+    match = Match("udp",
+                  _addr(m["src"], f"{w}.match.src") if "src" in m else None,
+                  _addr(m["dst"], f"{w}.match.dst") if "dst" in m else None,
+                  _int(m, "src_port", f"{w}.match", 1, 65535) if "src_port" in m else None,
+                  _int(m, "dst_port", f"{w}.match", 1, 65535) if "dst_port" in m else None)
+    conv = None
+    if "convert" in s:
+        c = s["convert"]
+        cw = f"{w}.convert"
+        if not isinstance(c, dict):
+            raise ConfigError(f"{cw} must be a table")
+        _keys(c, cw, {"component", "binary", "sha256", "version", "from", "to"},
+              {"component", "binary", "sha256", "version", "from", "to"})
+        if c["component"] != "goat-transformers":
+            raise ConfigError(f"{cw}.component: only \"goat-transformers\" converts")
+        conv = Convert(_str(c, "binary", cw), _sha(c, cw), _str(c, "version", cw), _str(c, "from", cw), _str(c, "to", cw))
+    to = s["to"]
+    if not isinstance(to, list) or not to:
+        raise ConfigError(f"{w}.to must list at least one destination")
+    return Send(name, port, match, conv, [_destination(d, f"{w}.to[{j}]", tap.ports) for j, d in enumerate(to)])
+
+
+def _decode(d: dict, i: int, tap: Tap | None) -> Decode:
+    w = f"[[decode]] #{i + 1}"
+    if not isinstance(d, dict):
+        raise ConfigError(f"{w} must be a table")
+    req = {"name", "component", "binary", "sha256", "version", "ports", "filter", "dictionary", "subscribers"}
+    _keys(d, w, req, req)
+    name = _str(d, "name", w)
+    if not NAME.match(name):
+        raise ConfigError(f"{w}.name is lowercase letters, digits and hyphens")
+    w = f"[[decode]] {name}"
+    if d["component"] != "first-bite":
+        raise ConfigError(f"{w}.component: only \"first-bite\" decodes")
+    if tap is None:
+        raise ConfigError(f"{w}: a decoder reads a tap's copy; declare [tap] first")
+    ports = _port_list(d["ports"], f"{w}.ports", 1, 2)
+    for p in ports:
+        if p not in tap.ports:
+            raise ConfigError(f"{w}.ports: {p} is not one of [tap].ports")
+    return Decode(name, "first-bite", _str(d, "binary", w), _sha(d, w), _str(d, "version", w), ports,
+                  _str(d, "filter", w), _str(d, "dictionary", w), _str(d, "subscribers", w))
+
+
+def _relay(r: dict, tap: Tap | None) -> Relay:
+    w = "[relay]"
+    if not isinstance(r, dict):
+        raise ConfigError(f"{w} must be a table")
+    _keys(r, w, {"wip", "remote_interface", "link_interface", "link_address", "allow"},
+          {"wip", "remote_interface", "link_interface", "link_address", "allow"})
+    if r["wip"] is not True:
+        raise ConfigError(f"{w}.wip must be true: the relay is work in progress and transmits on the link")
+    remote_if = _ifname(r["remote_interface"], f"{w}.remote_interface")
+    link_if = _ifname(r["link_interface"], f"{w}.link_interface")
+    if remote_if == link_if:
+        raise ConfigError(f"{w}: remote_interface and link_interface must differ")
+    if tap is not None:
+        for name in (remote_if, link_if):
+            if name in tap.ports:
+                kind = "listen port: a listen port never transmits" if tap.mode == "listen" else \
+                    "tap port: a relay transmits from its own interface, never through the tap's bridge"
+                raise ConfigError(f"{w}: {name} is a {kind}")
+        if tap.management in (link_if,):
+            raise ConfigError(f"{w}.link_interface is the management interface")
+    try:
+        link_addr = str(ipaddress.ip_interface(r["link_address"]))
+    except (ValueError, TypeError):
+        raise ConfigError(f"{w}.link_address must be an address with a prefix, e.g. 192.0.2.50/24") from None
+    rules = []
+    allow = r["allow"]
+    if not isinstance(allow, list) or not allow:
+        raise ConfigError(f"{w}.allow must list at least one rule; everything else is denied")
+    for j, a in enumerate(allow):
+        aw = f"{w}.allow[{j}]"
+        if not isinstance(a, dict):
+            raise ConfigError(f"{aw} must be a table")
+        req = {"direction", "protocol", "remote", "listen_port", "target", "target_port"}
+        _keys(a, aw, req, req)
+        if a["direction"] != "remote-to-link":
+            raise ConfigError(f"{aw}.direction: only \"remote-to-link\" is built")
+        if a["protocol"] != "udp":
+            raise ConfigError(f"{aw}.protocol: only \"udp\" is built")
+        target = _addr(a["target"], f"{aw}.target")
+        net = ipaddress.ip_interface(link_addr).network
+        if ipaddress.ip_address(target) not in net:
+            raise ConfigError(f"{aw}.target {target} is not on the link ({net})")
+        rules.append(RelayRule("remote-to-link", _addr(a["remote"], f"{aw}.remote"),
+                               _int(a, "listen_port", aw, 1, 65535), target,
+                               _int(a, "target_port", aw, 1, 65535), "udp"))
+    seen = set()
+    for rule in rules:
+        if rule.listen_port in seen:
+            raise ConfigError(f"{w}.allow: listen_port {rule.listen_port} is used twice")
+        seen.add(rule.listen_port)
+    return Relay(True, remote_if, link_if, link_addr, rules)
+
+
+def parse(text: str, path: str = DEFAULT_PATH) -> Config:
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: not valid TOML: {e}") from None
+    _keys(doc, path, {"schema", "tap", "send", "decode", "relay"}, {"schema"})
+    if doc["schema"] != 1:
+        raise ConfigError(f"{path}: schema must be 1")
+    if not any(k in doc for k in ("tap", "relay")):
+        raise ConfigError(f"{path}: declares no role; declare [tap] or [relay]")
+    tap = _tap(doc["tap"]) if "tap" in doc else None
+    sends = [_send(s, i, tap) for i, s in enumerate(doc.get("send", []))]
+    decodes = [_decode(d, i, tap) for i, d in enumerate(doc.get("decode", []))]
+    names = [s.name for s in sends] + [d.name for d in decodes]
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{path}: a [[send]] or [[decode]] name is used twice")
+    relay = _relay(doc["relay"], tap) if "relay" in doc else None
+    return Config(path, tap, sends, decodes, relay)
+
+
+def load(path: str) -> Config:
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise ConfigError(f"cannot read {path}: {e.strerror}") from None
+    return parse(text, path)

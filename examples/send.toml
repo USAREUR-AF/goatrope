@@ -1,0 +1,41 @@
+# goatrope declaration: a listen tap on a mirror port, with decode-and-send.
+# Every address and port number is a documentation placeholder (RFC 5737); replace each one.
+schema = 1
+
+[tap]
+mode = "listen"
+source = "mirror-port"
+ports = ["enxPORTA"]
+management = "eth0"
+
+[tap.record]
+ports = ["enxPORTA"]
+filter = ""
+file_mb = 50
+files = 20
+
+[[send]]
+name = "feed-a"
+port = "enxPORTA"
+match = { protocol = "udp", src = "192.0.2.10", dst_port = 5000 }
+to = [
+  "udp://198.51.100.20:5000",
+  { url = "tcp://198.51.100.21:5001", framing = "len32be" },
+  "http://198.51.100.22:8080/ingest",
+  { url = "file:///var/lib/goatrope/send/feed-a.jsonl", format = "jsonl" },
+]
+# Optional: convert each payload with a pinned goat-transformers binary first.
+# convert = { component = "goat-transformers", binary = "/usr/local/bin/goat-xf", version = "X.Y.Z",
+#             sha256 = "<64 hex digits of that release's goat-xf>", from = "<format>", to = "<format>" }
+
+# Optional: a pinned first-bite decoder that delivers through its own sinks (Zenoh among them).
+# [[decode]]
+# name = "decoder-a"
+# component = "first-bite"
+# binary = "/usr/local/bin/mind"
+# version = "X.Y.Z"
+# sha256 = "<64 hex digits of that release's mind>"
+# ports = ["enxPORTA"]
+# filter = "udp and src host 192.0.2.10"
+# dictionary = "/etc/first-bite/dictionaries/<name>"
+# subscribers = "/etc/first-bite/config/subscribers.yml"
