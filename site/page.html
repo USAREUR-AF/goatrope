@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goatrope</title>
+<meta name="description" content="One small computer with two Ethernet ports: a tap, a relay, or one end of a wormhole between sites.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%23093f46' stroke-width='11'/%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%2338a59d' stroke-width='8' stroke-dasharray='5 3'/%3E%3C/svg%3E">
+<style>
+/* Laid rope on a sea-fog ground. Rope is the one ornament: the name is tied in it, links are made of
+   it, and it is cut where a link is cut. State is drawn (whole, frayed, crossed), never only coloured. */
+:root {
+  --paper: #eef4f3; --panel: #fbfefd; --ink: #0b2a2f; --quiet: #44626a; --rule: #c9dad8; --sunk: #e1ecea;
+  --rope-edge: #083b42; --rope: #2f9a93; --rope-lay: #0a4e55; --accent: #0a6067; --on-accent: #ffffff;
+  --link: #0b5a86; --ghost: #d8efec; --gr: #0d3d44; --gr-ink: #eafaf7; --gr-quiet: #b5dcd7; --pkt: #0b5a86; --pkt2: #ffffff;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: "Avenir Next", Avenir, "Segoe UI", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #06171a; --panel: #0b2226; --ink: #e2f2ef; --quiet: #9dbcb9; --rule: #1d3d41; --sunk: #04100f;
+    --rope-edge: #02100f; --rope: #49b9af; --rope-lay: #0d565a; --accent: #6bd8cd; --on-accent: #04211f;
+    --link: #86c6ee; --ghost: #123a3d; --gr: #154c52; --gr-ink: #effdfa; --gr-quiet: #b5dcd7; --pkt: #d5f0ff; --pkt2: #06171a;
+    color-scheme: dark;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; scroll-padding-top: 1rem; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .pkt { display: none; } }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.6 var(--sans); }
+a { color: var(--link); text-underline-offset: .18em; }
+:focus-visible { outline: 3px solid var(--link); outline-offset: 3px; border-radius: 3px; }
+h1, h2, h3, p { margin: 0; } h2, h3 { text-wrap: balance; line-height: 1.15; } p { text-wrap: pretty; }
+code, pre, .mono { font-family: var(--mono); } code { font-size: .9em; }
+svg { display: block; max-width: 100%; }
+.wrap { max-width: 1200px; margin: 0 auto; padding-inline: 24px; }
+@media (max-width: 640px) { .wrap { padding-inline: 16px; } }
+.skip { position: absolute; left: -999px; } .skip:focus { left: 12px; top: 8px; background: var(--panel); padding: 8px 12px; z-index: 5; }
+
+.top { display: flex; align-items: center; gap: 12px 26px; padding-block: 18px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--ink); text-decoration: none; }
+.mark { width: 30px; height: 30px; }
+.top nav { margin-left: auto; display: flex; gap: 24px; } .top nav a { color: var(--quiet); text-decoration: none; font-size: 16px; } .top nav a:hover { color: var(--ink); text-decoration: underline; }
+@media (max-width: 720px) { .top nav a:not(.gh) { display: none; } }
+
+.hero { padding-block: 26px 44px; overflow: hidden; }
+.hero .wordmark { width: min(820px, 100%); height: auto; overflow: visible; }
+@media (max-width: 860px) { .hero .wordmark { width: calc(100% - 20px); } }
+.hero-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px 56px; align-items: end; margin-top: 10px; }
+.tag { font-size: clamp(25px, 3.1vw, 37px); line-height: 1.16; font-weight: 650; letter-spacing: -.012em; text-wrap: balance; }
+.lede { color: var(--quiet); margin-top: 14px; max-width: 58ch; }
+.acts { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn { display: inline-flex; align-items: center; min-height: 46px; padding: 0 20px; border: 2px solid var(--accent); border-radius: 23px; font: 650 16px var(--sans); text-decoration: none; color: var(--accent); background: transparent; cursor: pointer; }
+.btn.main { background: var(--accent); color: var(--on-accent); }
+.btn:hover { text-decoration: underline; }
+@media (max-width: 860px) { .hero-row { grid-template-columns: minmax(0, 1fr); } }
+
+.worm { margin-top: 34px; }
+.worm figcaption, .cap { color: var(--quiet); font-size: 15px; margin-top: 12px; max-width: 78ch; }
+figure { margin: 0; }
+.fig { width: 100%; height: auto; } .narrow { display: none; }
+@media (max-width: 760px) { .wide { display: none; } .narrow { display: block; } }
+
+.rope path { fill: none; } .r0 { stroke: var(--rope-edge); stroke-linecap: round; stroke-linejoin: round; } .r1 { stroke: var(--rope); stroke-linecap: round; stroke-linejoin: round; } .r2 { stroke: var(--rope-lay); stroke-linecap: round; }
+.fray { fill: none; stroke: var(--rope); stroke-linecap: round; }
+.site { fill: var(--panel); stroke: var(--rule); stroke-width: 1.5; } .node { fill: var(--sunk); stroke: var(--quiet); stroke-width: 1.5; }
+.gr { fill: var(--gr); } .gr.dead { fill: none; stroke: var(--quiet); stroke-width: 1.5; stroke-dasharray: 3 4; }
+.ghost { fill: var(--ghost); stroke: var(--rope); stroke-width: 2; stroke-dasharray: 6 4; } .ghost.solid { stroke-dasharray: none; }
+.wire { stroke: var(--quiet); stroke-width: 3; fill: none; stroke-linecap: round; }
+.copy { stroke: var(--link); stroke-width: 2.5; fill: none; } .head { fill: var(--link); } .deny { stroke: var(--quiet); stroke-width: 2.5; fill: none; stroke-dasharray: 4 5; } .x { stroke: var(--ink); stroke-width: 3; fill: none; stroke-linecap: round; }
+.file { fill: var(--rope); } .file.empty { fill: none; stroke: var(--gr-quiet); } .frame { fill: none; stroke: var(--quiet); stroke-width: 1.5; } .frame.on { fill: var(--rope); stroke: var(--rope-lay); }
+.ring, .ring2 { fill: none; stroke: var(--rope); stroke-width: 2.5; } .ring2 { opacity: .6; }
+.pkt { fill: var(--pkt); stroke: var(--pkt2); stroke-width: 2; } .pkt.back { fill: var(--pkt2); stroke: var(--pkt); }
+.fig text { fill: var(--ink); font-family: var(--sans); } .fig .h { font-size: 18px; font-weight: 700; } .fig .b { font-size: 15px; font-weight: 650; } .fig .s { font-size: 13.5px; fill: var(--quiet); } .fig .m { font: 14px var(--mono); fill: var(--quiet); }
+.narrow .h { font-size: 16px; } .narrow .m { font-size: 13px; } .narrow .s { font-size: 13px; }
+.fig text.on { fill: var(--gr-ink); } .fig text.s.on { fill: var(--gr-quiet); }
+
+.strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 32px; padding-block: 30px; border-block: 1px solid var(--rule); }
+.strip b { display: block; font-size: clamp(25px, 2.8vw, 35px); line-height: 1.1; letter-spacing: -.02em; color: var(--accent); font-variant-numeric: tabular-nums; }
+.strip span { display: block; margin-top: 6px; font-weight: 600; line-height: 1.35; } .strip code { display: block; margin-top: 6px; color: var(--quiet); font-size: 13px; line-height: 1.4; }
+@media (max-width: 860px) { .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px 20px; } }
+
+section { padding-block: 60px; } section h2 { font-size: clamp(27px, 3.4vw, 40px); letter-spacing: -.018em; } .sub { color: var(--quiet); margin-top: 12px; max-width: 66ch; }
+.divider { width: 100%; height: 22px; }
+.roles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 40px; margin-top: 34px; } .roles h3 { font-size: 22px; margin-top: 16px; } .roles p { margin-top: 8px; } .roles .st { color: var(--quiet); font-size: 15px; }
+@media (max-width: 860px) { .roles { grid-template-columns: minmax(0, 1fr); gap: 34px; } .roles .fig { max-width: 440px; } }
+
+.plug { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 20px; margin-top: 26px; }
+.modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; margin-top: 24px; }
+.mode { background: var(--panel); border: 1.5px solid var(--rule); border-radius: 12px; padding: 24px; } .mode h3 { font-size: 22px; } .mode .fig { margin-top: 18px; } .mode p { margin-top: 12px; }
+.js .modes[data-power="off"] .fig.on, .js .modes[data-power="on"] .fig.off, .js .modes[data-power="off"] .when-on, .js .modes[data-power="on"] .when-off { display: none; }
+.modes:not([data-power]) .fig + .fig { margin-top: 10px; }
+@media (max-width: 760px) { .modes { grid-template-columns: minmax(0, 1fr); } .mode { padding: 18px 16px; } }
+
+.install { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 36px; margin-top: 30px; align-items: start; }
+.box { background: var(--panel); border: 1.5px solid var(--rule); border-radius: 12px; overflow: hidden; min-width: 0; } .box header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1.5px solid var(--rule); font-size: 15px; font-weight: 650; }
+.box pre { margin: 0; padding: 16px; font-size: 14px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; } .box pre .ln { display: block; padding-left: 2ch; text-indent: -2ch; } .box .c { color: var(--quiet); }
+.copybtn { font: 650 14px var(--sans); color: var(--link); background: none; border: 0; padding: 6px 8px; cursor: pointer; border-radius: 6px; } .copybtn:hover { text-decoration: underline; }
+.steps { margin: 0; padding-left: 1.3em; } .steps li + li { margin-top: 12px; }
+@media (max-width: 860px) { .install { grid-template-columns: minmax(0, 1fr); } }
+
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 56px; } @media (max-width: 860px) { .two { grid-template-columns: minmax(0, 1fr); gap: 48px; } }
+table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 16px; } th, td { text-align: left; vertical-align: top; padding: 11px 14px 11px 0; border-bottom: 1px solid var(--rule); } th { font-weight: 650; width: 34%; }
+.safe { list-style: none; margin: 20px 0 0; padding: 0; } .safe li { padding: 13px 0 13px 34px; border-bottom: 1px solid var(--rule); position: relative; } .safe li::before { content: ""; position: absolute; left: 2px; top: 19px; width: 16px; height: 16px; border: 5px solid var(--rope); border-radius: 50%; } .safe .not::before { border-style: dashed; border-width: 3px; border-color: var(--quiet); }
+footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var(--quiet); font-size: 15px; } footer p + p { margin-top: 6px; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to the content</a>
+<div class="wrap top"><a class="brand" href="#main">{{mark}}goatrope</a>
+  <nav aria-label="Page"><a href="#roles">Roles</a><a href="#modes">Fail-open or not</a><a href="#install">Install</a><a href="#safety">Safety</a><a class="gh" href="https://github.com/USAREUR-AF/goatrope">GitHub</a></nav></div>
+<main id="main">
+<div class="hero"><div class="wrap">
+  <h1>{{wordmark}}</h1>
+  <div class="hero-row">
+    <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
+    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap, a relay, or one end of a wormhole between sites. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <div class="acts"><a class="btn main" href="https://github.com/USAREUR-AF/goatrope">See it on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
+  </div>
+  <figure class="worm">{{worm-wide}}{{worm-narrow}}
+    <figcaption><b>The wormhole, work in progress.</b> Each end answers on its own link for the machines at the other. The two sensor sites above use the same subnet and the same sensor address, and the controller still reaches each at an address of its own. Addresses are documentation addresses. Do not use it to control real equipment yet.</figcaption></figure>
+</div></div>
+
+<div class="wrap"><div class="strip">
+  <div><b data-measure="inline">500 of 500</b><span>datagrams each way through the inline tap</span><code>tests/netns, inline</code></div>
+  <div><b data-measure="listen">0</b><span>frames out of a listen port: install, traffic, attempts to send, restarts</span><code>tests/netns, listen</code></div>
+  <div><b data-measure="ping">400 of 400</b><span>pings through the bridge while it is deployed again</span><code>tests/netns, deploy</code></div>
+  <div><b data-measure="deps">0</b><span>Python packages beyond the standard library</span><code>site/build.py reads every import</code></div>
+</div></div>
+
+<section id="roles"><div class="wrap">
+  <h2>Three roles on one link</h2>
+  <p class="sub">Each role is off unless the file declares it. The wormhole above is the fourth, for links that are far apart.</p>
+  <div class="roles">
+    <div>{{role-tap}}<h3>Tap</h3><p>Records the link to a bounded ring of capture files, inline or from a copy.</p><p class="st">Built. Tested in network namespaces on Ubuntu 24.04 and 26.04.</p></div>
+    <div>{{role-send}}<h3>Decode and send</h3><p>Takes the tap's copy, keeps the datagrams you name, and delivers them. It never sends on the tapped link.</p><p class="st">Built. Tested the same way.</p></div>
+    <div>{{role-relay}}<h3>Relay</h3><p>Lets one remote machine exchange named datagrams with named machines on the link.</p><p class="st">Work in progress. Runs only while someone runs it.</p></div>
+  </div>
+</div></section>
+
+<section id="modes"><div class="wrap">{{divider}}
+  <h2 style="margin-top:48px">What happens when the machine goes dark</h2>
+  <p class="sub">A computer that bridges two ports is in the link, and no software changes that. The declaration has to say which mode you chose. There is no default.</p>
+  <div class="plug"><button class="btn" id="plug" type="button" hidden>Power the machine on</button><span class="cap" id="plugstate" role="status" style="margin:0"></span></div>
+  <div class="modes">
+    <div class="mode"><h3>Listen fails open</h3>{{listen-on}}{{listen-off}}<p class="when-on">A tap device or a switch mirror port hands goatrope a copy. It receives and does not send.</p><p class="when-off">The link carries on. Only the recording has a gap.</p></div>
+    <div class="mode"><h3>Inline fails closed</h3>{{inline-on}}{{inline-off}}<p class="when-on">Every frame passes through the machine's bridge.</p><p class="when-off">The link is down until the machine is back. A hardware watchdog restarts a hung one.</p></div>
+  </div>
+</div></section>
+
+<section id="install"><div class="wrap">
+  <h2>Install in one command</h2>
+  <p class="sub">Write the declaration, then run the install. It refuses, changing nothing, when a port carries your session, the default route or an address. Release 0.1.0 is one archive for arm64 and amd64.</p>
+  <div class="install">
+    <div class="box" data-box="command"><header>/etc/goatrope/goatrope.toml</header><pre data-box="output"><span class="ln">schema = 1</span><span class="ln"> </span><span class="ln">[tap]</span><span class="ln">mode = "listen"</span><span class="ln">source = "mirror-port"</span><span class="ln">ports = ["enxPORTA"]</span><span class="ln">management = "eth0"</span><span class="ln"> </span><span class="ln">[tap.record]</span><span class="ln">ports = ["enxPORTA"]</span><span class="ln">filter = ""        <span class="c"># every frame</span></span><span class="ln">file_mb = 50</span><span class="ln">files = 40</span></pre></div>
+    <div>
+      <div class="box" data-box="command"><header>On the machine<button class="copybtn" type="button" data-copy="cmd">Copy</button></header><pre id="cmd" data-box="command"><span class="ln">sudo ./bin/goatrope install --config /etc/goatrope/goatrope.toml</span></pre></div>
+      <ol class="steps" style="margin-top:24px">
+        <li>Ubuntu Server 24.04 or 26.04, reached over a third interface. <code>sudo apt-get install -y tcpdump ethtool</code></li>
+        <li>Download <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">release 0.1.0</a>, check it with <code>sha256sum -c SHA256SUMS</code>, unpack it, and change into its directory.</li>
+        <li>Fill in the declaration from <a href="https://github.com/USAREUR-AF/goatrope/blob/main/examples/listen-copper-tap.toml">an example</a>.</li>
+        <li>Cable the link, then run the command above.</li>
+        <li><code>sudo goatrope check</code> exits 0 when the machine matches the file, and 3 when anything differs.</li>
+        <li><code>sudo goatrope uninstall</code> puts the ports back as it found them.</li>
+      </ol>
+      <p class="cap">Every step: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/install-card.md">the install card</a>.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="safety"><div class="wrap">{{divider}}<div class="two" style="margin-top:52px">
+  <div><h2>Hardware</h2>
+    <table><tr><th scope="row">Computer</th><td>Raspberry Pi 4 or 5, or a small amd64 computer. Not yet run on a Pi: tested in containers, in amd64 virtual machines and in an emulated arm64 one</td></tr>
+    <tr><th scope="row">Tap ports</th><td>two wired Ethernet ports, USB adapters included</td></tr>
+    <tr><th scope="row">Management</th><td>a third interface: Wi-Fi or Ethernet</td></tr>
+    <tr><th scope="row">Storage</th><td>room for the ring you declare; install refuses one that does not fit</td></tr></table>
+    <p class="cap"><a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/hardware.md">hardware.md</a> has the tap devices and their limits.</p></div>
+  <div><h2>Safety properties</h2>
+    <ul class="safe">
+      <li><b>Default deny.</b> The relay and the wormhole carry only what a rule names. Both refuse to run while the kernel would route around them.</li>
+      <li><b>No egress from a listen port.</b> The drop is in place before the port goes up, and <code>check</code> reads it.</li>
+      <li><b>A refusal changes nothing.</b> Tests compare the files and ports before and after each one.</li>
+      <li><b>Pinned components.</b> A decoder or converter is hashed and copied in one read, and the copy is what runs.</li>
+      <li><b>Signed releases.</b> Each release is the archive, its checksums and a keyless signature made by the release workflow at the tag. <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">0.1.0</a> is the first.</li>
+      <li class="not"><b>A limit.</b> A process with <code>CAP_NET_RAW</code> can get past the listen drop. Where sending must be impossible, use a tap that cannot transmit. <a href="https://github.com/USAREUR-AF/goatrope/blob/main/SECURITY.md">Known limits</a></li>
+    </ul></div>
+</div></div></section>
+</main>
+<footer><div class="wrap"><p>Written by U.S. Federal government employees. Public domain in the U.S., Apache License 2.0 elsewhere.</p><p><a href="https://github.com/USAREUR-AF/goatrope/blob/main/README.md">README</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/adr/0001-goatrope-is-its-own-repository.md">Why it is its own repository</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/SECURITY.md">Report a vulnerability</a></p></div></footer>
+<script>
+(function () {
+  document.documentElement.classList.add('js');
+  var b = document.getElementById('plug'), s = document.getElementById('plugstate'), m = document.querySelector('.modes');
+  function set(on) { m.dataset.power = on ? 'on' : 'off'; b.textContent = on ? 'Pull the plug' : 'Power the machine on';
+    s.textContent = on ? 'The machine is running.' : 'The machine is off.'; }
+  b.hidden = false; set(false);
+  b.addEventListener('click', function () { set(m.dataset.power !== 'on'); });
+  document.querySelectorAll('[data-copy]').forEach(function (c) {
+    c.addEventListener('click', function () {
+      var el = document.getElementById(c.dataset.copy);
+      var t = Array.from(el.querySelectorAll('.ln')).map(function (x) { return x.textContent; }).join('\n');
+      function pick() { var r = document.createRange(); r.selectNodeContents(el); getSelection().removeAllRanges(); getSelection().addRange(r); c.textContent = 'Selected'; }
+      if (navigator.clipboard) navigator.clipboard.writeText(t).then(function () { c.textContent = 'Copied'; setTimeout(function () { c.textContent = 'Copy'; }, 1600); }, pick); else pick();
+    });
+  });
+})();
+</script>
+</body>
+</html>
