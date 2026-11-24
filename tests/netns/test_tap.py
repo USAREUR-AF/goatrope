@@ -35,7 +35,18 @@ WORK = "/root/gt"
 CFG = f"{WORK}/goatrope.toml"
 RING = "/var/lib/goatrope/record"
 MAGIC = b"GTROPE"
-os.environ["GOATROPE_TEST_WATCHDOG_DEVICE"] = f"{WORK}/watchdog-stand-in"
+# A container has no watchdog device, so check is pointed at a stand-in file. A VM with an
+# emulated watchdog sets GOATROPE_TEST_REAL_WATCHDOG=1 and check reads /dev/watchdog*.
+REAL_WATCHDOG = os.environ.pop("GOATROPE_TEST_REAL_WATCHDOG", "") == "1"
+if not REAL_WATCHDOG:
+    os.environ["GOATROPE_TEST_WATCHDOG_DEVICE"] = f"{WORK}/watchdog-stand-in"
+
+
+def stand_in_watchdog() -> None:
+    if not REAL_WATCHDOG:
+        open(os.environ["GOATROPE_TEST_WATCHDOG_DEVICE"], "w").close()
+
+
 FAILED = []
 RESULTS = []
 
@@ -157,6 +168,7 @@ def snapshot() -> dict:
             "tc": " ".join(ln for ln in sh(f"tc qdisc show dev {p}").stdout.splitlines() if "noqueue" not in ln),
             "features": sh(f"ethtool -k {p} | grep -E '^(generic-receive|large-receive|tcp-segmentation|generic-segmentation)-offload'").stdout,
             "disable_ipv6": open(f"/proc/sys/net/ipv6/conf/{p}/disable_ipv6").read().strip(),
+            "addr_gen_mode": open(f"/proc/sys/net/ipv6/conf/{p}/addr_gen_mode").read().strip(),
         }
     return {"files": files, "ports": ports,
             "bridge": os.path.exists("/sys/class/net/goatrope0"),
@@ -350,6 +362,39 @@ def phase_refusals() -> None:
             env={"SSH_CONNECTION": "203.0.113.9 50000 203.0.113.1 22"},
             setup=lambda: sh("ip link set tp0 up && ip route add 203.0.113.0/24 dev tp0"),
             undo=lambda: sh("ip route del 203.0.113.0/24 dev tp0; ip link set tp0 down"))
+    # A TCP connection through tp0 although tp0 has no address: a host route sends it out
+    # tp0 with the management address as its source. Only the established-connection check
+    # sees it (no address on the port, no default route, not the SSH session).
+    held = []
+
+    def hold_tcp():
+        mgmt = sh("ip -4 -o addr show dev eth0").stdout.split()[3].split("/")[0]
+        sh("sysctl -qw net.ipv6.conf.tp0.disable_ipv6=1; ip link set tp0 up")
+        sh(f"ip route add 192.0.2.1/32 dev tp0 src {mgmt}")
+        sh(f"ip -n a route add {mgmt}/32 dev a0")
+        held.append(subprocess.Popen(["ip", "netns", "exec", "a", sys.executable, "-c",
+                                      "import socket,time\ns=socket.create_server(('192.0.2.1',7022))\n"
+                                      "c=s.accept()\ntime.sleep(120)"]))
+        time.sleep(1)
+        held.append(subprocess.Popen([sys.executable, "-c",
+                                      "import socket,time\nc=socket.create_connection(('192.0.2.1',7022),5)\n"
+                                      "time.sleep(120)"]))
+        for _ in range(50):
+            if "192.0.2.1:7022" in sh("ss -Htn state established").stdout:
+                break
+            time.sleep(0.2)
+
+    def drop_tcp():
+        for proc in held:
+            proc.kill()
+            proc.wait()
+        held.clear()
+        mgmt = sh("ip -4 -o addr show dev eth0").stdout.split()[3].split("/")[0]
+        sh("ip route del 192.0.2.1/32 dev tp0", check=False)
+        sh(f"ip -n a route del {mgmt}/32 dev a0", check=False)
+        sh("ip link set tp0 down; sysctl -qw net.ipv6.conf.tp0.disable_ipv6=0")
+    refused("port carries an established TCP connection", ok_cfg, "carries an established connection to 192.0.2.1",
+            setup=hold_tcp, undo=drop_tcp)
     refused("listen without a source", LISTEN.replace('source = "mirror-port"\n', ""), "source is required")
     refused("copper tap without a declared speed", LISTEN.replace('"mirror-port"', '"copper-tap"'),
             "speed_mbps is required")
@@ -410,6 +455,88 @@ to = ["udp://127.0.0.1:5000"]
     def free():
         sh("ip link del other0")
     refused("port already in another bridge", ok_cfg, "already a member of other0", setup=enslave, undo=free)
+
+    rec = 'ports = ["tp0"]\nfilter = ""\n'
+    refused("recording directory is /var/lib itself", ok_cfg.replace(rec, rec + 'directory = "/var/lib/"\n'),
+            "must be /var/lib/goatrope/<name>")
+    refused("recording directory is a system directory", ok_cfg.replace(rec, rec + 'directory = "/var/lib/dpkg"\n'),
+            "must be /var/lib/goatrope/<name>")
+    refused("recording directory is goatrope's own state directory",
+            ok_cfg.replace(rec, rec + 'directory = "/var/lib/goatrope/send"\n'), "must be /var/lib/goatrope/<name>")
+    refused("a newline in the filter (a line injected into the unit file)",
+            ok_cfg.replace('filter = ""', 'filter = "udp\\nExecStartPost=/bin/true"'), "control character")
+    refused("a quote in the filter", ok_cfg.replace('filter = ""', 'filter = "udp\' or 1"'), "quote")
+    refused("a VLAN on top of a port", ok_cfg, "carries tp1.100",
+            setup=lambda: sh("ip link add link tp1 name tp1.100 type vlan id 100"),
+            undo=lambda: sh("ip link del tp1.100"))
+    refused("the SSH session over a port's link-local address", ok_cfg, "carries this session",
+            env={"SSH_CONNECTION": "fe80::1%tp0 50000 fe80::2%tp0 22"})
+    # A TCP connection to a link-local address through tp0, while another interface (dum0) also
+    # has a link-local route: the route lookup alone would name dum0.
+    ll = []
+
+    def hold_ll():
+        sh("ip link add dum0 type dummy && ip link set dum0 up && ip link set tp0 up")
+        sh("ip -n a link set a0 up")
+        for _ in range(50):
+            out = sh("ip -n a -6 -o addr show dev a0 scope link").stdout
+            if out and "tentative" not in out and "tentative" not in sh("ip -6 -o addr show dev tp0").stdout:
+                break
+            time.sleep(0.2)
+        addr = sh("ip -n a -6 -o addr show dev a0 scope link").stdout.split()[3].split("/")[0]
+        ll.append(subprocess.Popen(["ip", "netns", "exec", "a", sys.executable, "-c",
+                                    "import socket,time\ns=socket.create_server(('::',7023),family=socket.AF_INET6)\n"
+                                    "c=s.accept()\ntime.sleep(120)"]))
+        time.sleep(1)
+        ll.append(subprocess.Popen([sys.executable, "-c",
+                                    f"import socket,time\nc=socket.create_connection(('{addr}%tp0',7023),5)\n"
+                                    "time.sleep(120)"]))
+        for _ in range(50):
+            if ":7023" in sh("ss -Htn state established").stdout:
+                break
+            time.sleep(0.2)
+
+    def drop_ll():
+        for proc in ll:
+            proc.kill()
+            proc.wait()
+        ll.clear()
+        sh("ip link del dum0; ip link set tp0 down")
+    refused("a TCP connection to a link-local address through a port", ok_cfg,
+            "carries an established connection to fe80:", setup=hold_ll, undo=drop_ll)
+    st = os.statvfs("/var/lib")
+    room = min(0.9 * st.f_bavail * st.f_frsize, (st.f_bavail - 0.05 * st.f_blocks) * st.f_frsize)
+    files = int(0.6 * room / 100e6)
+    refused("two rings that do not fit although one would", LISTEN.replace("file_mb = 5", "file_mb = 100")
+            .replace("files = 4", f"files = {files}"), "2 ring(s)")
+    refused("an HTTP destination whose name does not resolve", ok_cfg + """
+[[send]]
+name = "s"
+port = "tp0"
+match = { protocol = "udp", dst_port = 5000 }
+to = ["http://no-such-host.invalid/in"]
+""", "cannot resolve")
+    refused("a file destination without max_mb", ok_cfg + """
+[[send]]
+name = "s"
+port = "tp0"
+match = { protocol = "udp", dst_port = 5000 }
+to = [{ url = "file:///var/lib/goatrope/send/s.jsonl", format = "jsonl" }]
+""", "needs max_mb")
+    # An unreadable state file (a power cut while it was first written) is never "not installed".
+    os.makedirs("/var/lib/goatrope", exist_ok=True)
+    for name, text in (("empty", ""), ("truncated", '{"ports": {"tp0": {"up": fal')):
+        with open("/var/lib/goatrope/state.json", "w") as f:
+            f.write(text)
+        b1 = snapshot()
+        p = gr("uninstall")
+        p2 = gr("install", "--config", CFG)
+        d = diff(b1, snapshot())
+        result(p.returncode == 2 and p2.returncode == 2 and "unreadable" in p.stderr and not d,
+               f"refused: uninstall and install with a {name} state file",
+               f"exit {p.returncode}/{p2.returncode}; {(p.stderr + p2.stderr).strip()[-160:]}; {d[:2]}")
+    shutil.rmtree("/var/lib/goatrope")
+    write_cfg(ok_cfg)
     write_cfg(ok_cfg)
     p = subprocess.run(["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups"] + GR
                        + ["install", "--config", CFG], capture_output=True, text=True)
@@ -428,7 +555,7 @@ def phase_inline() -> None:
     with open(f"{WORK}/before.json", "w") as f:
         json.dump(before, f)
     write_cfg(INLINE)
-    open(os.environ["GOATROPE_TEST_WATCHDOG_DEVICE"], "w").close()
+    stand_in_watchdog()
     p = gr("install", "--config", CFG)
     result(p.returncode == 0, "install inline", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-600:]}")
     print("    " + "\n    ".join(p.stdout.strip().splitlines()[-12:]), flush=True)
@@ -562,7 +689,7 @@ def phase_listen() -> None:
     with open(f"{WORK}/before.json", "w") as f:
         json.dump(before, f)
     write_cfg(LISTEN)
-    open(os.environ["GOATROPE_TEST_WATCHDOG_DEVICE"], "w").close()
+    stand_in_watchdog()
     # Watch the feed side from before install: nothing may come back toward it, ever.
     c0, c1 = Capture("feed", "f0", "listen-f0"), Capture("feed", "f1", "listen-f1")
     p = gr("install", "--config", CFG)
@@ -633,15 +760,21 @@ def phase_send() -> None:
 name = "plain"
 port = "tp0"
 match = {{ protocol = "udp", src = "192.0.2.10", dst_port = 5000 }}
-to = ["udp://127.0.0.1:9101", {{ url = "file:///var/lib/goatrope/send/plain.jsonl", format = "jsonl" }},
+to = ["udp://127.0.0.1:9101", {{ url = "file:///var/lib/goatrope/send/plain.jsonl", format = "jsonl", max_mb = 50 }},
       {{ url = "tcp://127.0.0.1:9102", framing = "len32be" }}, "http://127.0.0.1:9103/in"]
 
 [[send]]
 name = "converted"
 port = "tp0"
 match = {{ protocol = "udp", dst_port = 5000 }}
-convert = {{ component = "goat-transformers", binary = "{xf}", version = "stand-in", sha256 = "{pin}", from = "a", to = "b" }}
+convert = {{ component = "goat-transformers", binary = "{xf}", version = "stand-in", sha256 = "{pin}", from = "a", to = "b", packs = "/opt/gt-test" }}
 to = ["udp://127.0.0.1:9104"]
+
+[[send]]
+name = "bounded"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5001 }}
+to = [{{ url = "file:///var/lib/goatrope/send/bounded.jsonl", format = "jsonl", max_mb = 1 }}]
 """
     write_cfg(cfg)
     rx = subprocess.Popen([sys.executable, "-c", """
@@ -693,7 +826,10 @@ print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv
             " s.send(frame([192,0,2,11],2000+i,struct.pack('!HHHH',40000,5000,8+len(pl),0)+pl)); time.sleep(0.005)\n"
             "pl=b'FRAG'+b'q'*2000\n"
             "u=struct.pack('!HHHH',40000,5000,8+len(pl),0)+pl\n"
-            "s.send(frame([192,0,2,10],3000,u[:1480],0,True)); s.send(frame([192,0,2,10],3000,u[1480:],1480,False))\n")
+            "s.send(frame([192,0,2,10],3000,u[:1480],0,True)); s.send(frame([192,0,2,10],3000,u[1480:],1480,False))\n"
+            "for i in range(600):\n"
+            " pl=b'BIG'+i.to_bytes(4,'big')+b'b'*1400\n"
+            " s.send(frame([192,0,2,10],4000+i,struct.pack('!HHHH',40000,5001,8+len(pl),0)+pl)); time.sleep(0.002)\n")
     sh(f"ip netns exec feed python3 -c \"{code}\"")
     got = json.loads(rx.communicate(timeout=60)[0])
     result(got["udp"] == 101, "send: UDP destination got the 100 matching datagrams and 1 reassembled from 2 fragments",
@@ -705,6 +841,15 @@ print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv
     result(got["conv"] == 151, "send: the converted feed (wider match) got 151 converted messages", f"{got['conv']}")
     sample = bytes.fromhex(got["sample_conv"][0]).decode() if got["sample_conv"] else ""
     result(sample == b"SEND\x00\x00\x00\x00".hex().upper(), "send: the converter's output is what was sent", sample)
+    time.sleep(2)
+    b = "/var/lib/goatrope/send/bounded.jsonl"
+    sizes = [os.path.getsize(f) if os.path.exists(f) else -1 for f in (b, b + ".1")]
+    n = sum(len(open(f).read().splitlines()) for f in (b, b + ".1") if os.path.exists(f))
+    result(sizes[1] > 0 and max(sizes) < 1_000_000 + 4_000 and n == 600,
+           "send: a file destination with max_mb = 1 is cut at 1 MB, one older file kept, nothing lost",
+           f"sizes {sizes}, {n} of 600 lines")
+    mode = oct(os.stat("/var/lib/goatrope/send/plain.jsonl").st_mode & 0o777)
+    result(mode == "0o640", "send: file destinations are not world-readable", mode)
     check_exit(0, "send: check after install (pins and heartbeats)")
     with open(xf, "a") as f:
         f.write("# changed\n")
@@ -770,6 +915,11 @@ def phase_relay() -> None:
     p = gr("relay", "--config", CFG)
     result(p.returncode == 2 and "IPv6 is on" in p.stderr, "relay refused: IPv6 on its link interface", p.stderr.strip()[-120:])
     sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=1")
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "IP forwarding is on" in p.stderr,
+           "relay refused: IP forwarding on (the kernel would route around the allow rules)", p.stderr.strip()[-120:])
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 net.ipv6.conf.all.forwarding=0")
     cap = Capture("linkhost", "l0", "relay-link")
     rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
 import socket, json, select
@@ -839,9 +989,205 @@ print(replies)
     write_cfg(RELAY.replace('target = "192.0.2.2", target_port = 7000', 'target = "198.51.100.9", target_port = 7000'))
     p = gr("relay", "--config", CFG)
     result(p.returncode == 2 and "is not on the link" in p.stderr, "relay refused: a target that is not on the link", p.stderr.strip()[-120:])
+    write_cfg(RELAY.replace('target = "192.0.2.2", target_port = 7000', 'target = "192.0.2.255", target_port = 7000'))
+    p = gr("validate", "--config", CFG)
+    result(p.returncode == 2 and "names one machine" in p.stderr, "relay refused: a broadcast target", p.stderr.strip()[-120:])
+
+    # A reply that cannot be sent (the remote peer has no key on wg0) is counted; the relay keeps running.
+    write_cfg(RELAY)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2)
+    primed = 0
+    for _ in range(10):  # until the relay has forwarded one datagram from the remote, so it knows the peer
+        sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7000 1 prime wga", check=False)
+        time.sleep(2.5)
+        try:
+            primed = sum(r["to_link"] for r in json.load(open("/var/lib/goatrope/relay.health"))["rules"])
+        except (OSError, ValueError, KeyError):
+            primed = 0
+        if primed:
+            break
+    port = next((ln.split()[3].rsplit(":", 1)[1] for ln in sh("ss -Huan").stdout.splitlines()
+                 if ln.split()[3].startswith(("192.0.2.50:", "192.0.2.50%"))), None)
+    allowed = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/allowed.key").read(), capture_output=True,
+                             text=True).stdout.strip()
+    sh(f"wg set wg0 peer {allowed} remove")
+    sh("ip netns exec linkhost python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+       f"s.bind(('192.0.2.2',7000));[s.sendto(b'late',('192.0.2.50',{port})) for i in range(3)]\"", check=False)
+    time.sleep(3)
+    health = json.load(open("/var/lib/goatrope/relay.health"))
+    errs = sum(r.get("send_errors", 0) for r in health["rules"])
+    result(relay.poll() is None and errs >= 1, "relay (WIP): a reply it cannot send is counted and the relay keeps running",
+           f"running={relay.poll() is None}, send_errors={errs}, primed={primed}, port={port}, health={health['rules']}")
+    sh(f"wg set wg0 peer {allowed} allowed-ips 10.99.0.2/32")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=1")
+    try:
+        rc = relay.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        relay.kill()
+        rc = None
+    result(rc == 1, "relay (WIP): it stops when IP forwarding is turned on while it runs", f"exit {rc}")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0")
 
 
 PHASES["relay"] = phase_relay
+
+COMPONENTS = "/opt/gt-components"  # run.sh copies the real binaries here when GOATROPE_TEST_COMPONENTS is set
+REMOTE_ID = "122624160b42bf241b6ed1b4b69808ac0870086b53150e0200"  # goat-transformers' README example message
+NTP = ("240206e90000060000000a80c0000201ed135500c0000000ed13554040000000ed13554043000000ed13554043800000")
+
+
+def phase_components() -> None:
+    """The real goat-transformers goat-xf in a [[send]] and the real first-bite mind in a [[decode]]."""
+    if not os.path.exists(f"{COMPONENTS}/goat-xf"):
+        result(None, "components: not run (no real binaries given; set GOATROPE_TEST_COMPONENTS)")
+        return
+    xf, mind = f"{COMPONENTS}/goat-xf", f"{COMPONENTS}/mind"
+    pin = {b: hashlib.sha256(open(b, "rb").read()).hexdigest() for b in (xf, mind)}
+    ver = {b: sh(f"{b} --version", check=False).stdout.strip() or "unknown" for b in (mind,)}
+    with open(f"{COMPONENTS}/publishers.yml", "w") as f:
+        f.write("publishers:\n  - name: records\n    publisher_type: PUB\n    address: \"tcp://127.0.0.1:47123\"\n"
+                "    topic: \"subsystem/message_type\"\n")
+    with open(f"{COMPONENTS}/subscribers.yml", "w") as f:
+        f.write("subscribers:\n  - name: ToFile\n    subscriber_type: local\n    subtype: locallog\n"
+                "    zmq_url: 127.0.0.1\n    zmq_port: 47123\n    local_logfile: records.jsonl\n"
+                "    topics: [\"*\"]\n")
+    sh(f"chmod -R go+rX {COMPONENTS}")
+    write_cfg(LISTEN + f"""
+[[send]]
+name = "remote-id"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5000 }}
+convert = {{ component = "goat-transformers", binary = "{xf}", version = "main", sha256 = "{pin[xf]}", from = "remote-id", to = "cot-xml", packs = "{COMPONENTS}/packs" }}
+to = ["udp://127.0.0.1:9105"]
+
+[[decode]]
+name = "ntp"
+component = "first-bite"
+binary = "{mind}"
+version = "{ver[mind]}"
+sha256 = "{pin[mind]}"
+ports = ["tp0"]
+filter = "udp port 123"
+dictionary = "{COMPONENTS}/dictionaries/ntp"
+subscribers = "{COMPONENTS}/subscribers.yml"
+publishers = "{COMPONENTS}/publishers.yml"
+""")
+    rx = subprocess.Popen([sys.executable, "-c", """
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 9105)); s.settimeout(25)
+got = []
+try:
+    while len(got) < 10: got.append(s.recv(65535).decode(errors="replace"))
+except socket.timeout: pass
+print(json.dumps(got))
+"""], stdout=subprocess.PIPE, text=True)
+    c0 = Capture("feed", "f0", "components-f0")
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "components: install with the real goat-xf and mind",
+           f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
+    for _ in range(30):
+        if sh("systemctl is-active goatrope-decode@ntp.service", check=False).stdout.strip() == "active" and \
+                ":47123" in sh("ss -Htln", check=False).stdout:
+            break
+        time.sleep(1)
+    time.sleep(3)
+    code = ("import socket,struct,time\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\ns.bind(('f0',0))\n"
+            "def ck(h):\n s=sum(struct.unpack('!10H',h));s=(s>>16)+(s&0xffff);return (~(s+(s>>16)))&0xffff\n"
+            "def frame(ident,sport,dport,pl):\n"
+            " u=struct.pack('!HHHH',sport,dport,8+len(pl),0)+pl\n"
+            " h=struct.pack('!BBHHHBBH4s4s',0x45,0,20+len(u),ident,0,64,17,0,bytes([192,0,2,10]),bytes([192,0,2,20]))\n"
+            " h=h[:10]+struct.pack('!H',ck(h))+h[12:]\n"
+            " return b'\\x02\\x00\\x00\\x00\\x00\\x20'+b'\\x02\\x00\\x00\\x00\\x00\\x10'+b'\\x08\\x00'+h+u\n"
+            f"for i in range(10):\n s.send(frame(5000+i,40000,5000,bytes.fromhex('{REMOTE_ID}'))); time.sleep(0.2)\n"
+            f"for i in range(20):\n s.send(frame(6000+i,123,123,bytes.fromhex('{NTP}'))); time.sleep(0.05)\n")
+    sh(f"ip netns exec feed python3 -c \"{code}\"")
+    got = json.loads(rx.communicate(timeout=60)[0])
+    result(len(got) == 10 and all(g.startswith("<event") for g in got),
+           "components: goat-xf converted 10 of 10 Remote ID messages to Cursor-on-Target XML and they were sent",
+           f"{len(got)} of 10; {got[0][:90] if got else ''}")
+    time.sleep(5)
+    recs = []
+    for path in glob.glob("/var/lib/goatrope-decode-ntp/records.jsonl") + glob.glob("/var/lib/private/goatrope-decode-ntp/records.jsonl"):
+        recs = open(path).read().splitlines()
+        break
+    strata = sum('"stratum"' in r for r in recs)
+    jl = sh("journalctl -u goatrope-decode@ntp.service --no-pager -n 15", check=False).stdout
+    result(strata == 20, "components: mind decoded 20 of 20 NTP packets against its dictionary and wrote them",
+           f"{strata} records with a stratum field; {len(recs)} lines" + ("" if strata == 20 else "; " + jl[-500:]))
+    pid = sh("systemctl show -p MainPID --value goatrope-decode@ntp.service", check=False).stdout.strip()
+    user = sh(f"ps -o user= -p {pid}", check=False).stdout.split() if pid not in ("", "0") else []
+    result(bool(user) and "root" not in user, "components: mind runs as its own dynamic user, not root", " ".join(user))
+    check_exit(0, "components: check after install (pins, units)")
+    time.sleep(1)
+    frames = c0.stop()
+    result(not frames, "components: nothing was sent toward the feed while the decoders ran", f"{len(frames)} frames")
+    # A binary replaced after install: the running copy is the verified one; a restart refuses the new one.
+    shutil.copyfile(mind, f"{WORK}/mind.orig")
+    with open(mind, "ab") as f:
+        f.write(b"\0")
+    sh("systemctl restart goatrope-decode@ntp.service", check=False)
+    time.sleep(3)
+    a = sh("systemctl is-active goatrope-decode@ntp.service", check=False).stdout.strip()
+    result(a != "active", "components: a changed mind binary is refused at start", a)
+    shutil.copyfile(f"{WORK}/mind.orig", mind)
+
+
+PHASES["components"] = phase_components
+
+
+def nm_states() -> dict[str, str]:
+    out = sh("nmcli -t -f DEVICE,STATE device", check=False).stdout
+    return dict(ln.rsplit(":", 1) for ln in out.splitlines() if ":" in ln)
+
+
+def phase_networkmanager() -> None:
+    """NetworkManager manages the ports before install (as it does on a desktop image); install must take
+    them from it at once, and uninstall must give them back."""
+    topo_listen()
+    before = snapshot()
+    with open(f"{WORK}/before.json", "w") as f:
+        json.dump(before, f)
+    managed = {}
+    for _ in range(60):
+        managed = {k: v for k, v in nm_states().items() if k in ("tp0", "tp1")}
+        if len(managed) == 2 and all(v != "unmanaged" for v in managed.values()):
+            break
+        time.sleep(1)
+    result(len(managed) == 2 and all(v != "unmanaged" for v in managed.values()),
+           "networkmanager: before install, NetworkManager manages tp0 and tp1", str(managed))
+    write_cfg(LISTEN)
+    stand_in_watchdog()
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "networkmanager: install listen", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+    st = nm_states()
+    result(st.get("tp0") == "unmanaged" and st.get("tp1") == "unmanaged",
+           "networkmanager: right after install, NetworkManager no longer manages the ports", str({k: st.get(k) for k in ("tp0", "tp1")}))
+    result(st.get("eth0") == "unmanaged", "networkmanager: the management interface, which another file keeps "
+           "from NetworkManager, is still not managed by it (goatrope adds to unmanaged-devices, never replaces it)",
+           f"eth0: {st.get('eth0')}")
+    c0, c1 = Capture("feed", "f0", "nm-f0"), Capture("feed", "f1", "nm-f1")
+    time.sleep(20)  # DHCP and router solicitation retries would show here
+    sh("systemctl restart NetworkManager.service")
+    time.sleep(10)
+    f0, f1 = c0.stop(), c1.stop()
+    result(not f0 and not f1, "networkmanager: nothing sent toward the feed over 30 s, a NetworkManager restart included",
+           f"{len(f0)} + {len(f1)} frames")
+    j = check_exit(0, "networkmanager: check after install", "--json")
+    ids = [i["id"] for i in (j or {}).get("items", [])]
+    result(sum(i.startswith("networkmanager-unmanaged:") for i in ids) == 2,
+           "networkmanager: check reads NetworkManager's view of both ports", ", ".join(i for i in ids if "networkmanager" in i))
+    p = gr("uninstall", "--purge")
+    for _ in range(20):
+        st = nm_states()
+        if st.get("tp0") != "unmanaged":
+            break
+        time.sleep(1)
+    result(p.returncode == 0 and st.get("tp0") != "unmanaged",
+           "networkmanager: after uninstall, NetworkManager manages the ports again", str({k: st.get(k) for k in ("tp0", "tp1")}))
+
+
+PHASES["networkmanager"] = phase_networkmanager
 
 
 if __name__ == "__main__":

@@ -12,5 +12,13 @@ RUN apt-get update \
       python3 iputils-ping kmod util-linux dbus udev wireguard-tools \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask systemd-resolved.service getty.target console-getty.service 2>/dev/null; true
+# NM=1: NetworkManager too, set up as on a desktop image where it manages wired ports (tp*), while
+# the management interface (eth0) stays with someone else.
+ARG NM=0
+RUN if [ "$NM" = 1 ]; then apt-get update \
+ && apt-get install -y --no-install-recommends network-manager \
+ && rm -rf /var/lib/apt/lists/* \
+ && printf '[keyfile]\nunmanaged-devices=interface-name:eth0\n' > /etc/NetworkManager/conf.d/10-test-management.conf \
+ && printf 'KERNEL=="tp*", ENV{NM_UNMANAGED}="0"\n' > /etc/udev/rules.d/86-test-nm-manage-tp.rules; fi
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
