@@ -19,19 +19,19 @@ A tag `goatrope-v<version>` publishes exactly three files, checked by `tools/che
 | `SHA256SUMS` | the archive's SHA-256. The pin's digest is this file's SHA-256 |
 | `SHA256SUMS.cosign-bundle` | the keyless signature over `SHA256SUMS`, cosign's legacy bundle |
 
-The signer is `https://github.com/<owner>/goatrope/.github/workflows/release.yml` at the tag.
-`<owner>` is not decided. A component declaration:
+The signer is `https://github.com/USAREUR-AF/goatrope/.github/workflows/release.yml` at the tag.
+A component declaration:
 
 ```yaml
 goatrope:
   var: goatrope_release
   artifact_type: release
   deploy_playbook: goatrope-deploy.yml
-  fleet: "<owner>/goatrope@goatrope-v<version>@sha256:<SHA-256 of SHA256SUMS>"
+  fleet: "USAREUR-AF/goatrope@goatrope-v<version>@sha256:<SHA-256 of SHA256SUMS>"
   release:
     checksums: SHA256SUMS
     files: {amd64: goatrope-<version>.tar.gz, arm64: goatrope-<version>.tar.gz}
-    signer: https://github.com/<owner>/goatrope/.github/workflows/release.yml
+    signer: https://github.com/USAREUR-AF/goatrope/.github/workflows/release.yml
 ```
 
 The archive's name carries the version, so `files` changes with the pin.

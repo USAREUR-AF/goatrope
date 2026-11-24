@@ -11,10 +11,10 @@
 # The archive also gets a GitHub build provenance attestation, which is not a release file. Verify:
 #
 #   cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
-#     --certificate-identity https://github.com/<owner>/goatrope/.github/workflows/release.yml@refs/tags/goatrope-v<version> \
+#     --certificate-identity https://github.com/USAREUR-AF/goatrope/.github/workflows/release.yml@refs/tags/goatrope-v<version> \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 #   sha256sum -c SHA256SUMS
-#   gh attestation verify goatrope-<version>.tar.gz --repo <owner>/goatrope
+#   gh attestation verify goatrope-<version>.tar.gz --repo USAREUR-AF/goatrope
 name: release
 
 on:
