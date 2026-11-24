@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: compile, validate examples, shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Python compiles with the system interpreter (standard library only)
+        run: python3 -m py_compile goatrope/*.py bin/goatrope tests/netns/test_tap.py
+      - name: Every example declaration validates
+        run: for f in examples/*.toml; do ./bin/goatrope validate --config "$f"; done
+      - name: shellcheck
+        run: shellcheck tests/netns/run.sh tools/build-release.sh
+      - name: VERSION agrees with the package
+        run: test "$(python3 -I -c 'import sys; sys.path.insert(0, "."); import goatrope; print(goatrope.VERSION)')" = "$(cat VERSION)"
+
+  netns:
+    name: namespace tests, Ubuntu ${{ matrix.ubuntu }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run (privileged container with systemd as PID 1, veth pairs, namespaces)
+        run: OUT="$RUNNER_TEMP/results" tests/netns/run.sh "${{ matrix.ubuntu }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: netns-ubuntu-${{ matrix.ubuntu }}
+          path: ${{ runner.temp }}/results
+
+  reuse:
+    name: REUSE
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - run: pip install 'reuse==5.0.2' && reuse lint
