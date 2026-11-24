@@ -18,6 +18,9 @@ from urllib.parse import urlsplit
 DEFAULT_PATH = "/etc/goatrope/goatrope.toml"
 IFNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,14}$")
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+RECORD_DIR = "/var/lib/goatrope/record"
+# goatrope's own directories under /var/lib/goatrope; a recording directory may not be one of them.
+RESERVED_DIRS = ("send", "components", "state.json", "relay.health")
 SOURCES = ("copper-tap", "mirror-port", "bypass-relay")
 
 
@@ -60,6 +63,7 @@ class Convert:
     version: str
     from_format: str
     to_format: str
+    packs: str
 
 
 @dataclass
@@ -71,6 +75,7 @@ class Destination:
     path: str | None
     framing: str | None
     format: str | None
+    max_mb: int | None = None
 
 
 @dataclass
@@ -93,6 +98,7 @@ class Decode:
     filter: str
     dictionary: str
     subscribers: str
+    publishers: str
 
 
 @dataclass
@@ -139,7 +145,16 @@ def _str(table: dict, key: str, where: str) -> str:
     v = table[key]
     if not isinstance(v, str) or (key != "filter" and not v):
         raise ConfigError(f"{where}.{key} must be a non-empty string")
+    _plain(v, f"{where}.{key}")
     return v
+
+
+def _plain(v: str, where: str) -> None:
+    """Values reach unit files, environment files and command lines: no control characters, no quotes."""
+    if any(ord(c) < 32 or ord(c) == 127 for c in v):
+        raise ConfigError(f"{where} contains a control character (a newline, tab or similar)")
+    if any(c in v for c in "'\"\\"):
+        raise ConfigError(f"{where} contains a quote or a backslash")
 
 
 def _int(table: dict, key: str, where: str, lo: int, hi: int) -> int:
@@ -221,12 +236,13 @@ def _tap(t: dict) -> Tap:
         if p not in ports:
             raise ConfigError(f"{rw}.ports: {p} is not one of [tap].ports")
     rfilter = _str(r, "filter", rw)
-    directory = r.get("directory", "/var/lib/goatrope/record")
-    if not isinstance(directory, str) or not directory.startswith("/var/lib/") or ".." in directory:
-        raise ConfigError(f"{rw}.directory must be an absolute path under /var/lib/")
+    directory = r.get("directory", RECORD_DIR)
+    m = re.fullmatch(r"/var/lib/goatrope/([a-z0-9][a-z0-9-]{0,31})", directory) if isinstance(directory, str) else None
+    if not m or m.group(1) in RESERVED_DIRS:
+        raise ConfigError(f"{rw}.directory must be /var/lib/goatrope/<name> (lowercase letters, digits, hyphens; "
+                          f"not {', '.join(RESERVED_DIRS)}): goatrope gives it to tcpdump and --purge deletes it")
     return Tap(mode, ports, mgmt, source, speed,
-               Record(rports, rfilter, _int(r, "file_mb", rw, 1, 4096), _int(r, "files", rw, 2, 10000),
-                      directory.rstrip("/")))
+               Record(rports, rfilter, _int(r, "file_mb", rw, 1, 4096), _int(r, "files", rw, 2, 10000), directory))
 
 
 def _destination(u, where: str, tap_ports: list[str]) -> Destination:
@@ -234,9 +250,11 @@ def _destination(u, where: str, tap_ports: list[str]) -> Destination:
         u = {"url": u}
     if not isinstance(u, dict):
         raise ConfigError(f"{where} must be a URL string or a table with url")
-    _keys(u, where, {"url", "framing", "format"}, {"url"})
+    _keys(u, where, {"url", "framing", "format", "max_mb"}, {"url"})
     url = _str(u, "url", where)
     s = urlsplit(url)
+    if s.scheme != "file" and "max_mb" in u:
+        raise ConfigError(f"{where}: max_mb is for file destinations")
     if s.scheme in ("udp", "tcp"):
         if not s.hostname or s.port is None:
             raise ConfigError(f"{where}: {url} needs an address and a port, e.g. {s.scheme}://192.0.2.1:5000")
@@ -263,7 +281,10 @@ def _destination(u, where: str, tap_ports: list[str]) -> Destination:
             raise ConfigError(f"{where}: a file destination needs format = \"jsonl\" or \"raw\"")
         if "framing" in u:
             raise ConfigError(f"{where}: framing is for tcp destinations")
-        return Destination(url, "file", None, None, s.path, None, fmt)
+        if "max_mb" not in u:
+            raise ConfigError(f"{where}: a file destination needs max_mb (the file is cut there and one older "
+                              "file is kept, so it holds at most twice max_mb)")
+        return Destination(url, "file", None, None, s.path, None, fmt, _int(u, "max_mb", where, 1, 100000))
     if s.scheme == "zenoh":
         raise ConfigError(f"{where}: goatrope sends no Zenoh itself; use a [[decode]] component's own sink")
     raise ConfigError(f"{where}: {url} is not udp://, tcp://, http(s):// or file://")
@@ -302,11 +323,12 @@ def _send(s: dict, i: int, tap: Tap | None) -> Send:
         cw = f"{w}.convert"
         if not isinstance(c, dict):
             raise ConfigError(f"{cw} must be a table")
-        _keys(c, cw, {"component", "binary", "sha256", "version", "from", "to"},
-              {"component", "binary", "sha256", "version", "from", "to"})
+        req = {"component", "binary", "sha256", "version", "from", "to", "packs"}
+        _keys(c, cw, req, req)
         if c["component"] != "goat-transformers":
             raise ConfigError(f"{cw}.component: only \"goat-transformers\" converts")
-        conv = Convert(_str(c, "binary", cw), _sha(c, cw), _str(c, "version", cw), _str(c, "from", cw), _str(c, "to", cw))
+        conv = Convert(_str(c, "binary", cw), _sha(c, cw), _str(c, "version", cw), _str(c, "from", cw),
+                       _str(c, "to", cw), _str(c, "packs", cw))
     to = s["to"]
     if not isinstance(to, list) or not to:
         raise ConfigError(f"{w}.to must list at least one destination")
@@ -317,7 +339,9 @@ def _decode(d: dict, i: int, tap: Tap | None) -> Decode:
     w = f"[[decode]] #{i + 1}"
     if not isinstance(d, dict):
         raise ConfigError(f"{w} must be a table")
-    req = {"name", "component", "binary", "sha256", "version", "ports", "filter", "dictionary", "subscribers"}
+    # publishers: first-bite's record socket is an address and port, so it is declared, not defaulted
+    req = {"name", "component", "binary", "sha256", "version", "ports", "filter", "dictionary", "subscribers",
+           "publishers"}
     _keys(d, w, req, req)
     name = _str(d, "name", w)
     if not NAME.match(name):
@@ -332,7 +356,8 @@ def _decode(d: dict, i: int, tap: Tap | None) -> Decode:
         if p not in tap.ports:
             raise ConfigError(f"{w}.ports: {p} is not one of [tap].ports")
     return Decode(name, "first-bite", _str(d, "binary", w), _sha(d, w), _str(d, "version", w), ports,
-                  _str(d, "filter", w), _str(d, "dictionary", w), _str(d, "subscribers", w))
+                  _str(d, "filter", w), _str(d, "dictionary", w), _str(d, "subscribers", w),
+                  _str(d, "publishers", w))
 
 
 def _relay(r: dict, tap: Tap | None) -> Relay:
@@ -374,9 +399,14 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
         if a["protocol"] != "udp":
             raise ConfigError(f"{aw}.protocol: only \"udp\" is built")
         target = _addr(a["target"], f"{aw}.target")
-        net = ipaddress.ip_interface(link_addr).network
-        if ipaddress.ip_address(target) not in net:
+        iface = ipaddress.ip_interface(link_addr)
+        net, t = iface.network, ipaddress.ip_address(target)
+        if t not in net:
             raise ConfigError(f"{aw}.target {target} is not on the link ({net})")
+        if t == iface.ip or (net.num_addresses > 2 and t in (net.network_address, net.broadcast_address)) \
+                or t.is_multicast:
+            raise ConfigError(f"{aw}.target {target} is the relay's own, the network, a broadcast or a multicast "
+                              "address; a rule names one machine")
         rules.append(RelayRule(a["direction"], _addr(a["remote"], f"{aw}.remote"),
                                _int(a, "listen_port", aw, 1, 65535), target,
                                _int(a, "target_port", aw, 1, 65535), "udp"))

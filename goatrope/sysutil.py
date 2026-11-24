@@ -35,6 +35,51 @@ def read(path: str, default: str | None = None) -> str | None:
         return default
 
 
+def write_file(path: str, content: str, mode: int = 0o644) -> None:
+    """Replace path atomically and durably: a power cut leaves the old file or the new one, never half."""
+    d = os.path.dirname(path)
+    tmp = os.path.join(d, f".{os.path.basename(path)}.goatrope-new")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(d)
+
+
+def fsync_dir(d: str) -> None:
+    fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def uppers(ifname: str) -> list[str]:
+    """Devices stacked on ifname (VLAN, macvlan, ipvlan, a bridge or bond it belongs to)."""
+    try:
+        return sorted(n[len("upper_"):] for n in os.listdir(f"{SYS_NET}/{ifname}") if n.startswith("upper_"))
+    except OSError:
+        return []
+
+
+def lowers(ifname: str, depth: int = 0) -> set[str]:
+    """ifname and every device beneath it: tp0.100 is carried by tp0."""
+    out = {ifname}
+    if depth > 8:
+        return out
+    try:
+        for n in os.listdir(f"{SYS_NET}/{ifname}"):
+            if n.startswith("lower_"):
+                out |= lowers(n[len("lower_"):], depth + 1)
+    except OSError:
+        pass
+    return out
+
+
 def write(path: str, value: str) -> bool:
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -87,35 +132,98 @@ def route_dev(addr: str) -> str | None:
 
 
 def default_route_devs() -> list[str]:
+    """Every device a default route in any table leaves through, ECMP next hops included."""
     devs = []
     for fam in ("-4", "-6"):
-        p = run(["ip", "-j", fam, "route", "show", "default"])
+        p = run(["ip", "-j", fam, "route", "show", "default", "table", "all"])
         if p.returncode == 0 and p.stdout.strip():
-            devs += [r.get("dev") for r in json.loads(p.stdout) if r.get("dev")]
-    return devs
+            for r in json.loads(p.stdout):
+                if r.get("dev"):
+                    devs.append(r["dev"])
+                devs += [h["dev"] for h in r.get("nexthops", []) if h.get("dev")]
+    return sorted(set(devs))
 
 
-def established_peers() -> list[str]:
-    """Peer addresses of every established TCP connection (an SSH session among them)."""
+def _split_scope(hostport: str) -> tuple[str, str | None]:
+    """'[fe80::1%tp0]:22' or '192.0.2.1:22' or 'fe80::1%tp0' -> (address, scope interface or None)."""
+    h = hostport
+    if h.startswith("[") and "]" in h:
+        inside, rest = h[1:h.index("]")], h[h.index("]") + 1:]
+        if rest.startswith("%"):  # ss prints the scope after the bracket: [fe80::1]%tp0:22
+            inside += "%" + rest[1:].rsplit(":", 1)[0]
+        h = inside
+    elif h.count(":") == 1:
+        h = h.rsplit(":", 1)[0]
+    addr, _, scope = h.partition("%")
+    return addr, (scope or None)
+
+
+def peer_devices(peer: str, scope: str | None = None) -> set[str]:
+    """The devices a connection to peer uses, down to the physical port: for a link-local
+    peer the scope names the interface; otherwise the route does."""
+    try:
+        ip = ipaddress.ip_address(peer)
+    except ValueError:
+        return set()
+    if ip.is_loopback:
+        return {"lo"}
+    dev = scope if (scope and ip.is_link_local) else route_dev(peer)
+    return lowers(dev) if dev else set()
+
+
+def established() -> list[tuple[str, set[str]]]:
+    """(peer, devices beneath it) for every established TCP connection, an SSH session among them."""
     p = run(["ss", "-Htn", "state", "established"])
-    peers = []
+    out = []
     for line in p.stdout.splitlines():
         cols = line.split()
-        if len(cols) >= 4:
-            host = cols[-1].rsplit(":", 1)[0].strip("[]")
-            host = host.split("%", 1)[0]
-            try:
-                ip = ipaddress.ip_address(host)
-            except ValueError:
-                continue
-            if not ip.is_loopback:
-                peers.append(str(ip))
-    return sorted(set(peers))
+        if len(cols) < 4:
+            continue
+        local, peer = cols[-2], cols[-1]
+        laddr, lscope = _split_scope(local)
+        paddr, pscope = _split_scope(peer)
+        devs = peer_devices(paddr, pscope or lscope) - {"lo"}
+        if lscope:
+            devs |= lowers(lscope)
+        if devs:
+            out.append((paddr, devs))
+    return out
 
 
-def session_peer() -> str | None:
+def session() -> tuple[str, set[str]] | None:
+    """The operator's SSH session: (peer, devices beneath it)."""
     s = os.environ.get("SSH_CONNECTION") or os.environ.get("GOATROPE_SSH_CONNECTION")
-    return s.split()[0] if s else None
+    if not s:
+        return None
+    parts = s.split()
+    paddr, pscope = _split_scope(parts[0])
+    lscope = _split_scope(parts[2])[1] if len(parts) > 2 else None
+    devs = peer_devices(paddr, pscope or lscope)
+    return paddr, devs
+
+
+def nm_active() -> bool:
+    return unit_active("NetworkManager.service") == "active" and have("nmcli")
+
+
+def nm_states() -> dict[str, str]:
+    """{device: state} as NetworkManager sees them."""
+    p = run(["nmcli", "-t", "-f", "DEVICE,STATE", "device"])
+    out = {}
+    for line in p.stdout.splitlines():
+        dev, _, state = line.rpartition(":")
+        if dev:
+            out[dev.replace("\\:", ":")] = state
+    return out
+
+
+def forwarding(ifname: str) -> list[str]:
+    """Which IP families forward packets arriving on ifname."""
+    on = []
+    for fam in ("ipv4", "ipv6"):
+        if read(f"/proc/sys/net/{fam}/conf/{ifname}/forwarding") == "1":
+            on.append(fam)
+    return on
 
 
 OFFLOADS = {"gro": "generic-receive-offload", "lro": "large-receive-offload",

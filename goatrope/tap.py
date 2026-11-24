@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 
 from . import VERSION, config as cfgmod, sysutil as su
@@ -135,7 +136,7 @@ def recorder_argv(cfg: cfgmod.Config, port: str) -> list[str]:
     argv = ["/usr/bin/tcpdump", "-n", "-i", port, "-s", "0", "-B", "8192",
             "-C", str(r.file_mb), "-W", str(r.files), "-Z", "tcpdump", "-w", f"{r.directory}/{port}.pcap"]
     if r.filter:
-        argv.append(r.filter)
+        argv += ["--", r.filter]  # after "--": a filter is never read as a tcpdump option
     return argv
 
 
@@ -143,7 +144,8 @@ def _record_unit(cfg: cfgmod.Config) -> str:
     r = cfg.tap.record
     argv = recorder_argv(cfg, "%i")
     if r.filter:
-        argv[-1] = "'" + r.filter.replace("'", "") + "'"
+        # the declaration refuses quotes, backslashes and control characters; escape systemd's specifiers
+        argv[-1] = "'" + r.filter.replace("%", "%%").replace("$", "$$") + "'"
     return HEADER.format(v=VERSION, cfg=f"{ETC}/goatrope.toml") + f"""[Unit]
 Description=goatrope: bounded recording ring on %i ({r.files} files of {r.file_mb} MB)
 After=goatrope-ports.service
@@ -167,7 +169,9 @@ def _watchdog() -> str:
 
 def _nm(cfg: cfgmod.Config) -> str:
     names = list(cfg.tap.ports) + ([BRIDGE] if cfg.tap.mode == "inline" else [])
-    return (HEADER.format(v=VERSION, cfg=f"{ETC}/goatrope.toml") + "[keyfile]\nunmanaged-devices="
+    # "+=" adds to what other files set; "=" would replace it, and NetworkManager would take every
+    # device those files keep from it (on Ubuntu: every wired port, the management port among them).
+    return (HEADER.format(v=VERSION, cfg=f"{ETC}/goatrope.toml") + "[keyfile]\nunmanaged-devices+="
             + ";".join(f"interface-name:{n}" for n in names) + "\n")
 
 
@@ -225,6 +229,10 @@ def preflight(cfg: cfgmod.Config, prior_state: dict | None) -> None:
         m = su.master(p)
         if m and m not in ours:
             raise Refusal(f"{p} is already a member of {m}; remove it from there first")
+        stacked = [u for u in su.uppers(p) if u not in ours]
+        if stacked:
+            raise Refusal(f"{p} carries {', '.join(stacked)} (a VLAN or other device on top of it); "
+                          "remove it first, or what uses it loses the link")
     taken = set(tap.ports) | ({BRIDGE} if su.exists(BRIDGE) else set())
     for p in sorted(taken):
         addrs = [a for a in su.addresses(p) if not a.lower().startswith("fe80:")]  # link-local goes with IPv6
@@ -234,17 +242,18 @@ def preflight(cfg: cfgmod.Config, prior_state: dict | None) -> None:
     for dev in su.default_route_devs():
         if dev in taken:
             raise Refusal(f"the default route leaves through {dev}; it cannot become a tap port")
-    peer = su.session_peer()
-    if peer:
-        dev = su.route_dev(peer)
-        if dev in taken:
-            raise Refusal(f"{dev} carries this session (from {peer}); manage the machine over {tap.management} first")
-    for peer in su.established_peers():
-        dev = su.route_dev(peer)
-        if dev in taken:
-            raise Refusal(f"{dev} carries an established connection to {peer}; it cannot become a tap port")
+    sess = su.session()
+    if sess and sess[1] & taken:
+        raise Refusal(f"{', '.join(sorted(sess[1] & taken))} carries this session (from {sess[0]}); "
+                      f"manage the machine over {tap.management} first")
+    for peer, devs in su.established():
+        if devs & taken:
+            raise Refusal(f"{', '.join(sorted(devs & taken))} carries an established connection to {peer}; "
+                          "it cannot become a tap port")
     r = tap.record
-    need = r.files * r.file_mb * 1_000_000
+    # one ring per recorded port, plus what file destinations may hold (twice max_mb each)
+    need = len(r.ports) * r.files * r.file_mb * 1_000_000
+    need += sum(2 * d.max_mb * 1_000_000 for s in cfg.sends for d in s.to if d.scheme == "file")
     probe = r.directory
     while not os.path.exists(probe):
         probe = os.path.dirname(probe)
@@ -253,9 +262,13 @@ def preflight(cfg: cfgmod.Config, prior_state: dict | None) -> None:
     used = 0
     if os.path.isdir(r.directory):
         used = sum(os.path.getsize(os.path.join(r.directory, f)) for f in os.listdir(r.directory))
-    if need > 0.9 * (free + used):
-        raise Refusal(f"the recording ring ({r.files} x {r.file_mb} MB = {need / 1e9:.1f} GB) does not fit in "
-                      f"90% of the {(free + used) / 1e9:.1f} GB available at {probe}; declare fewer or smaller files")
+    # leave 10% of what is available, and at least 5% of the filesystem, for the system
+    room = min(0.9 * (free + used), free + used - 0.05 * st.f_blocks * st.f_frsize)
+    if need > room:
+        raise Refusal(f"the recording ({len(r.ports)} ring(s) of {r.files} x {r.file_mb} MB"
+                      f"{' plus file destinations' if any(d.scheme == 'file' for s in cfg.sends for d in s.to) else ''}"
+                      f" = {need / 1e9:.1f} GB) does not fit in the {max(room, 0) / 1e9:.1f} GB goatrope may use "
+                      f"at {probe}; declare fewer or smaller files")
     if cfg.relay and tap.mode == "listen":
         for n in (cfg.relay.link_interface, cfg.relay.remote_interface):
             if n in tap.ports:
@@ -316,12 +329,28 @@ def _snapshot_port(p: str) -> dict:
     fl = su.flags(p)
     return {"features": {k: v[0] for k, v in su.features(p).items() if not v[1]},
             "eee": su.eee(p), "link": su.link_settings(p), "up": "UP" in fl, "noarp": "NOARP" in fl,
-            "disable_ipv6": su.read(f"/proc/sys/net/ipv6/conf/{p}/disable_ipv6")}
+            "disable_ipv6": su.read(f"/proc/sys/net/ipv6/conf/{p}/disable_ipv6"),
+            "addr_gen_mode": su.read(f"/proc/sys/net/ipv6/conf/{p}/addr_gen_mode"),
+            "clsact": "clsact" in su.run(["tc", "qdisc", "show", "dev", p]).stdout}
 
 
 def _load_state() -> dict | None:
-    s = su.read(STATE)
-    return json.loads(s) if s else None
+    """None when goatrope is not installed. An unreadable state file is never taken for "not installed"."""
+    if not os.path.exists(STATE):
+        return None
+    for path in (STATE, STATE + ".bak"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                state = json.load(f)
+            if isinstance(state, dict) and "ports" in state:
+                if path != STATE:
+                    print(f"goatrope: {STATE} is unreadable; using the previous copy {path}", file=sys.stderr)
+                return state
+        except (OSError, ValueError):
+            continue
+    raise Refusal(f"{STATE} is unreadable or empty (a power cut during install?) and has no readable "
+                  f"previous copy; goatrope will not guess what to restore. Inspect it, then remove it and "
+                  "restore the ports by hand, or reinstall over it")
 
 
 def _install_software() -> None:
@@ -335,13 +364,17 @@ def _install_software() -> None:
         shutil.copyfile(os.path.join(os.path.dirname(here), "VERSION") if os.path.exists(
             os.path.join(os.path.dirname(here), "VERSION")) else os.path.join(here, "VERSION"),
             os.path.join(tmp, "goatrope", "VERSION"))
-        shutil.rmtree(LIB, ignore_errors=True)
+        old = LIB + ".old"
+        shutil.rmtree(old, ignore_errors=True)
+        su.run(["sync"])
+        if os.path.isdir(LIB):
+            os.rename(LIB, old)  # LIB is missing only between these two renames
         os.rename(tmp, LIB)
+        su.fsync_dir(os.path.dirname(LIB))
+        shutil.rmtree(old, ignore_errors=True)
     wrapper = ("#!/usr/bin/python3 -I\n# Written by goatrope install; goatrope uninstall removes it.\n"
                f"import sys\nsys.path.insert(0, {LIB!r})\nfrom goatrope.cli import main\nsys.exit(main())\n")
-    with open(BIN, "w", encoding="utf-8") as f:
-        f.write(wrapper)
-    os.chmod(BIN, 0o755)
+    su.write_file(BIN, wrapper, 0o755)
 
 
 def install(cfg: cfgmod.Config, log=print) -> None:
@@ -361,6 +394,7 @@ def install(cfg: cfgmod.Config, log=print) -> None:
         "networkd": {"enabled": su.unit_enabled("systemd-networkd.service"),
                      "active": su.unit_active("systemd-networkd.service")},
         "created_dirs": [],
+        "var_lib_private_existed": os.path.isdir("/var/lib/private"),  # systemd makes it for DynamicUser
     }
     for p in tap.ports:  # first sight of a port: remember how it was
         state["ports"].setdefault(p, _snapshot_port(p))
@@ -369,8 +403,8 @@ def install(cfg: cfgmod.Config, log=print) -> None:
     state["record_directory"] = tap.record.directory
     stale = [f for f in state.get("files", []) if f not in files]
 
-    for d in (STATE_DIR, ETC, tap.record.directory):
-        _makedirs(d, state)
+    for d in (STATE_DIR, ETC, tap.record.directory) + tuple(sorted({os.path.dirname(f) for f in files})):
+        _makedirs(d, state)  # every directory install creates is in the state before anything is written
     shutil.chown(tap.record.directory, "tcpdump", "tcpdump") if _user("tcpdump") else None
     os.chmod(tap.record.directory, 0o750)
     state["files"] = sorted(files)
@@ -378,15 +412,17 @@ def install(cfg: cfgmod.Config, log=print) -> None:
 
     _install_software()
     if os.path.realpath(cfg.path) != os.path.realpath(f"{ETC}/goatrope.toml"):
-        shutil.copyfile(cfg.path, f"{ETC}/goatrope.toml")
-        os.chmod(f"{ETC}/goatrope.toml", 0o644)
+        with open(cfg.path, encoding="utf-8") as f:
+            text = f.read()
+        prev = su.read(f"{ETC}/goatrope.toml")
+        if prev is not None and prev != text.strip():
+            su.write_file(f"{ETC}/goatrope.toml.prev", prev + "\n")
+            log(f"  the previous declaration is kept as {ETC}/goatrope.toml.prev")
+        su.write_file(f"{ETC}/goatrope.toml", text)
     for f in stale:
         _remove(f)
     for path, content in files.items():
-        _makedirs(os.path.dirname(path), state)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.chmod(path, 0o644)
+        su.write_file(path, content, sendmod.MODES.get(path, 0o644))
     for unit in [u for u in state.get("units", []) if u not in units(cfg) + sendmod.units(cfg)]:
         su.systemctl("disable", "--now", unit)
     state["units"] = units(cfg) + sendmod.units(cfg)
@@ -394,6 +430,9 @@ def install(cfg: cfgmod.Config, log=print) -> None:
 
     su.systemctl("daemon-reload")
     su.run(["sysctl", "-q", "-p", SYSCTL])
+    if nm_present and su.nm_active():
+        su.run(["nmcli", "general", "reload", "conf"])  # NetworkManager lets go of the tap ports now, not at reboot
+        _nm_wait_unmanaged(cfg)
     su.systemctl("enable", "--now", "systemd-networkd.service")
     su.run(["networkctl", "reload"])
     if tap.mode == "listen" and su.exists(BRIDGE):
@@ -411,6 +450,15 @@ def install(cfg: cfgmod.Config, log=print) -> None:
     sendmod.start(cfg, log)
     su.systemctl("daemon-reexec")  # applies the watchdog setting
     _settle(cfg)
+
+
+def _nm_wait_unmanaged(cfg: cfgmod.Config, seconds: float = 10) -> None:
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        st = su.nm_states()
+        if all(st.get(p, "unmanaged") == "unmanaged" for p in cfg.tap.ports):
+            return
+        time.sleep(0.5)
 
 
 def _settle(cfg: cfgmod.Config, seconds: float = 15) -> None:
@@ -436,10 +484,15 @@ def _user(name: str) -> bool:
 
 def _save_state(state: dict) -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = STATE + ".new"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp, STATE)
+    text = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    if os.path.exists(STATE):
+        try:
+            with open(STATE, encoding="utf-8") as f:
+                json.load(f)
+            shutil.copyfile(STATE, STATE + ".bak")  # the previous good copy
+        except (OSError, ValueError):
+            pass
+    su.write_file(STATE, text, 0o600)
 
 
 def _makedirs(d: str, state: dict) -> None:
@@ -476,13 +529,20 @@ def uninstall(purge: bool, log=print) -> None:
     for f in state.get("files", []):
         _remove(f)
     su.systemctl("daemon-reload")
+    if su.nm_active():
+        su.run(["nmcli", "general", "reload", "conf"])
     su.run(["networkctl", "reload"])
     if su.exists(BRIDGE):
         su.run(["ip", "link", "del", BRIDGE])
     for p, prior in state.get("ports", {}).items():
         if not su.exists(p):
             continue
-        su.run(["tc", "qdisc", "del", "dev", p, "clsact"])
+        if not prior.get("up"):
+            su.run(["ip", "link", "set", p, "down"])  # down before the egress drop goes
+        if prior.get("clsact"):
+            su.run(["tc", "filter", "del", "dev", p, "egress", "pref", "1", "handle", "1", "matchall"])
+        else:
+            su.run(["tc", "qdisc", "del", "dev", p, "clsact"])
         for short, val in prior.get("features", {}).items():
             su.run(["ethtool", "-K", p, short, val])
         if prior.get("eee") == "enabled":
@@ -491,6 +551,8 @@ def uninstall(purge: bool, log=print) -> None:
         if link.get("autoneg") == "on" and su.link_settings(p).get("autoneg") == "off":
             su.run(["ethtool", "-s", p, "autoneg", "on"])
         su.run(["ip", "link", "set", p, "arp", "off" if prior.get("noarp") else "on"])
+        if prior.get("addr_gen_mode") is not None:
+            su.write(f"/proc/sys/net/ipv6/conf/{p}/addr_gen_mode", prior["addr_gen_mode"])
         if prior.get("disable_ipv6") is not None:
             su.write(f"/proc/sys/net/ipv6/conf/{p}/disable_ipv6", prior["disable_ipv6"])
         su.run(["ip", "link", "set", p, "up" if prior.get("up") else "down"])
@@ -504,6 +566,15 @@ def uninstall(purge: bool, log=print) -> None:
     if os.path.isdir(LIB):
         shutil.rmtree(LIB)
     _remove(BIN)
+    # verified component copies, and the state systemd kept for the decoders' dynamic users
+    import glob
+    for d in [f"{STATE_DIR}/components"] + glob.glob("/var/lib/private/goatrope-decode-*"):
+        shutil.rmtree(d, ignore_errors=True)
+    for link in glob.glob("/var/lib/goatrope-decode-*"):
+        _remove(link)
+    if os.path.isdir("/var/lib/private") and not os.listdir("/var/lib/private") \
+            and state.get("var_lib_private_existed") is False:
+        os.rmdir("/var/lib/private")
     kept = []
     rec = state.get("record_directory")
     if os.path.exists(f"{ETC}/goatrope.toml"):
@@ -511,12 +582,20 @@ def uninstall(purge: bool, log=print) -> None:
             _remove(f"{ETC}/goatrope.toml")
         else:
             kept.append(f"{ETC}/goatrope.toml")
-    if rec and os.path.isdir(rec):
-        if purge:
-            shutil.rmtree(rec)
-        elif os.listdir(rec):
-            kept.append(rec)
+    for prev in (f"{ETC}/goatrope.toml.prev",):
+        if os.path.exists(prev):
+            _remove(prev) if purge else kept.append(prev)
+    for d in [x for x in (rec, f"{STATE_DIR}/send") if x and x.startswith(STATE_DIR + "/")]:
+        if os.path.isdir(d):
+            if purge:
+                shutil.rmtree(d)
+            elif os.listdir(d):
+                kept.append(d)
     _remove(STATE)
+    _remove(STATE + ".bak")
+    if purge:
+        for f in (f"{STATE_DIR}/relay.health",):
+            _remove(f)
     # Directories install created, deepest first, when empty.
     for d in sorted(state.get("created_dirs", []), key=len, reverse=True):
         if os.path.isdir(d) and not os.listdir(d):
@@ -536,13 +615,14 @@ def _purge_leftovers(log=print) -> None:
         rec = cfgmod.load(f"{ETC}/goatrope.toml").tap.record.directory
     except (cfgmod.ConfigError, AttributeError):
         pass
-    for d in [x for x in (rec, f"{STATE_DIR}/record", f"{STATE_DIR}/send") if x]:
+    for d in [x for x in (rec, f"{STATE_DIR}/record", f"{STATE_DIR}/send") if x and x.startswith(STATE_DIR + "/")]:
         if os.path.isdir(d):
             shutil.rmtree(d)
             removed.append(d)
-    if os.path.exists(f"{ETC}/goatrope.toml"):
-        _remove(f"{ETC}/goatrope.toml")
-        removed.append(f"{ETC}/goatrope.toml")
+    for f in (f"{ETC}/goatrope.toml", f"{ETC}/goatrope.toml.prev", f"{STATE_DIR}/relay.health"):
+        if os.path.exists(f):
+            _remove(f)
+            removed.append(f)
     for d in (ETC, STATE_DIR):
         if os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
@@ -621,6 +701,15 @@ def check(cfg: cfgmod.Config) -> list[dict]:
         else:
             m = su.master(p)
             _item(items, f"bridge-member:{p}", m == BRIDGE, BRIDGE, m or "none")
+
+    if su.nm_active():
+        st = su.nm_states()
+        for p in tap.ports:
+            _item(items, f"networkmanager-unmanaged:{p}", st.get(p, "unmanaged") == "unmanaged",
+                  "unmanaged", st.get(p, "absent"))
+    for p in tap.ports:
+        stacked = [u for u in su.uppers(p) if u != BRIDGE]
+        _item(items, f"nothing-stacked:{p}", not stacked, "no VLAN or other device on top", ", ".join(stacked) or "none")
 
     if tap.mode == "inline":
         b = f"{su.SYS_NET}/{BRIDGE}/bridge"
