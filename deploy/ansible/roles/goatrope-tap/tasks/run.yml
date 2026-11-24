@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+---
+# One run of `goatrope deploy` from a verified archive, unpacked into a directory only root can
+# write and removed afterwards, so what runs is what was verified.
+#   _gt_src   {src, name, sha256}: a verified archive on the operator's machine; {} for _gt_link
+#   _gt_link  the link on the host that names an installed archive
+#   _gt_dry   true: make every refusal, change nothing
+- name: goatrope-tap | the machine declares its tap and what it records
+  ansible.builtin.assert:
+    that:
+      - tap is defined and tap is mapping
+      - (tap | dict2items | map(attribute='key') | difference(['mode', 'source', 'ports', 'management'])) | length == 0
+      - goatrope_record is defined and goatrope_record is mapping
+    fail_msg: "{{ inventory_hostname }}: the host_vars need tap (mode, ports, management, and source when listening) and goatrope_record (ports, filter, file_mb, files); there is no default. Nothing changed"
+    quiet: true
+
+- name: goatrope-tap | a run directory only root can write
+  ansible.builtin.tempfile:
+    state: directory
+    path: /run
+    prefix: goatrope-deploy.
+  register: _gt_dir
+  check_mode: false
+  changed_when: false
+
+- name: goatrope-tap | run
+  block:
+    - name: goatrope-tap | the file the link names
+      ansible.builtin.command:
+        argv: [readlink, -e, "{{ _gt_link }}"]
+      register: _gt_target
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      when: _gt_src | length == 0
+
+    - name: goatrope-tap | a release file is installed
+      ansible.builtin.assert:
+        that: _gt_target.rc == 0
+        fail_msg: "{{ _gt_link }} names no file: goatrope's release is not installed here. Nothing changed"
+        quiet: true
+      when: _gt_src | length == 0
+
+    - name: goatrope-tap | the installed archive, as its directory names it
+      ansible.builtin.copy:
+        src: "{{ _gt_target.stdout }}"
+        dest: "{{ _gt_dir.path }}/goatrope.tar.gz"
+        remote_src: true
+        mode: "0600"
+      check_mode: false
+      changed_when: false
+      when: _gt_src | length == 0
+
+    - name: goatrope-tap | the verified archive from the operator's machine
+      ansible.builtin.copy:
+        src: "{{ _gt_src.src }}"
+        dest: "{{ _gt_dir.path }}/goatrope.tar.gz"
+        mode: "0600"
+      check_mode: false
+      changed_when: false
+      when: _gt_src | length > 0
+
+    - name: goatrope-tap | read the copy's SHA-256
+      ansible.builtin.stat:
+        path: "{{ _gt_dir.path }}/goatrope.tar.gz"
+        checksum_algorithm: sha256
+      register: _gt_copy
+      check_mode: false
+
+    - name: goatrope-tap | the copy is the verified archive
+      ansible.builtin.assert:
+        that: _gt_copy.stat.checksum == _gt_want
+        fail_msg: "the archive is sha256 {{ _gt_copy.stat.checksum }}, not {{ _gt_want }}: nothing changed"
+        quiet: true
+      vars:
+        _gt_want: "{{ _gt_src.sha256 if _gt_src | length > 0 else (_gt_target.stdout | dirname | basename) }}"
+
+    - name: goatrope-tap | unpack it
+      ansible.builtin.command:
+        argv: [tar, -xzf, "{{ _gt_dir.path }}/goatrope.tar.gz", -C, "{{ _gt_dir.path }}", --strip-components=1, --no-same-owner, --no-same-permissions]
+      changed_when: false
+      check_mode: false
+
+    - name: goatrope-tap | the declaration, from the machine's host_vars
+      ansible.builtin.template:
+        src: goatrope.toml.j2
+        dest: "{{ _gt_dir.path }}/goatrope.toml"
+        mode: "0600"
+      check_mode: false
+      changed_when: false
+
+    # Exit 2: goatrope refused and changed nothing. 3: installed, and the machine does not match.
+    - name: "goatrope-tap | goatrope deploy{{ ' --dry-run' if _gt_dry | bool else '' }}"
+      ansible.builtin.command:
+        argv: "{{ ['/usr/bin/python3', '-I', '-B', _gt_dir.path + '/bin/goatrope', 'deploy', '--config', _gt_dir.path + '/goatrope.toml'] + (['--dry-run'] if _gt_dry | bool else []) }}"
+      register: _gt_run
+      changed_when: "not (_gt_dry | bool) and 'goatrope deploy: changed' in _gt_run.stdout"
+      check_mode: false
+  always:
+    - name: goatrope-tap | remove the run directory
+      ansible.builtin.file:
+        path: "{{ _gt_dir.path }}"
+        state: absent
+      check_mode: false
+      changed_when: false

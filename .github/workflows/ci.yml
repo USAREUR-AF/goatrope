@@ -26,7 +26,7 @@ jobs:
       - name: Every example declaration validates
         run: for f in examples/*.toml; do ./bin/goatrope validate --config "$f"; done
       - name: shellcheck
-        run: shellcheck tests/netns/run.sh tools/build-release.sh
+        run: shellcheck tests/netns/run.sh tests/arm64/run.sh tools/*.sh
       - name: VERSION agrees with the package
         run: test "$(python3 -I -c 'import sys; sys.path.insert(0, "."); import goatrope; print(goatrope.VERSION)')" = "$(cat VERSION)"
 

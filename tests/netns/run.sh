@@ -9,6 +9,8 @@
 #   OUT=<dir> tests/netns/run.sh       where the logs go (default ./test-results)
 #   GOATROPE_TEST_COMPONENTS=<dir>     real component binaries for the "components" phase: goat-xf,
 #                                      packs/, model/, mind, dictionaries/ntp (otherwise not run)
+#   GOATROPE_TEST_ARCHIVE=<file>   "deploy" phase: an archive tools/build-release.sh built (default: the test makes one)
+#   GOATROPE_TEST_ROLES=<dir>      "deploy" phase: the driver's real release-file role (default: a stand-in)
 #
 # Needs Docker on a Linux host. The container is privileged because it creates veth
 # pairs and namespaces; it uses the host kernel, so the kernel under test is the host's.
@@ -59,6 +61,7 @@ for v in "${versions[@]}"; do
     echo "### Ubuntu $v  (host kernel $(uname -r), $(uname -m))" | tee -a "$log"
     docker build -q --build-arg "UBUNTU=$v" -t "goatrope-netns:$v" "$here" >/dev/null
     docker build -q --build-arg "UBUNTU=$v" --build-arg NM=1 -t "goatrope-netns:$v-nm" "$here" >/dev/null
+    docker build -q --build-arg "UBUNTU=$v" --build-arg ANSIBLE=1 -t "goatrope-netns:$v-ansible" "$here" >/dev/null
     c="goatrope-netns-$v"
 
     start "$c" "$v"
@@ -82,6 +85,17 @@ for v in "${versions[@]}"; do
     # NetworkManager installed and managing the wired ports, as on a desktop image.
     start "$c" "$v-nm"
     phase "$c" "$log" networkmanager
+    docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
+    docker rm -f "$c" >/dev/null
+
+    # The deploy play, with Ansible in the container.
+    start "$c" "$v-ansible"
+    [ -z "${GOATROPE_TEST_ROLES:-}" ] || tar -C "$GOATROPE_TEST_ROLES" -cf - --transform 's,^\.,gt-roles,' . | docker exec -i "$c" tar -C /opt --no-same-owner -xf -
+    if [ -n "${GOATROPE_TEST_ARCHIVE:-}" ]; then
+        docker exec "$c" mkdir -p /opt/gt-dist
+        docker cp -q "$GOATROPE_TEST_ARCHIVE" "$c:/opt/gt-dist/"
+    fi
+    phase "$c" "$log" deploy
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 done

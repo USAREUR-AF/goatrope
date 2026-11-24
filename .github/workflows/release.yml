@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # Build, sign and publish a release on a tag goatrope-v<version>.
 #
-# One archive (the code is Python 3 standard library only, so it serves arm64 and
-# amd64) and SHA256SUMS. SHA256SUMS is signed keylessly with cosign (this
-# workflow's OIDC identity, no stored key), and the archive gets a GitHub build
-# provenance attestation, as the sibling repositories do. Verify with:
+# The release is exactly three files:
+#   goatrope-<version>.tar.gz   the code is Python 3 standard library only, so one archive serves
+#                               arm64 and amd64
+#   SHA256SUMS                  the archive's SHA-256
+#   SHA256SUMS.cosign-bundle    the keyless signature over SHA256SUMS by this workflow at the tag,
+#                               in cosign's legacy bundle format
+# The archive also gets a GitHub build provenance attestation, which is not a release file. Verify:
 #
-#   cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-#     --certificate-identity-regexp '^https://github.com/<owner>/goatrope/\.github/workflows/release\.yml@refs/tags/goatrope-v' \
+#   cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
+#     --certificate-identity https://github.com/<owner>/goatrope/.github/workflows/release.yml@refs/tags/goatrope-v<version> \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
-#   sha256sum -c --ignore-missing SHA256SUMS
+#   sha256sum -c SHA256SUMS
 #   gh attestation verify goatrope-<version>.tar.gz --repo <owner>/goatrope
 name: release
 
@@ -45,11 +48,13 @@ jobs:
       - name: Sign SHA256SUMS (keyless)
         working-directory: dist
         run: |
-          cosign sign-blob --yes --new-bundle-format --bundle SHA256SUMS.sigstore.json SHA256SUMS
-          cosign verify-blob --new-bundle-format --bundle SHA256SUMS.sigstore.json \
+          # cosign v2 writes the legacy bundle without --new-bundle-format; v3 does not, so v2 is pinned.
+          cosign sign-blob --yes --bundle SHA256SUMS.cosign-bundle SHA256SUMS
+          cosign verify-blob --bundle SHA256SUMS.cosign-bundle \
             --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
-          sha256sum -c SHA256SUMS
+      - name: The release is exactly the three files
+        run: tools/check-release.sh "${{ steps.v.outputs.version }}"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/goatrope-${{ steps.v.outputs.version }}.tar.gz
@@ -57,6 +62,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "goatrope ${{ steps.v.outputs.version }}" \
-            --notes "See CHANGELOG.md. Verify: sha256sum -c --ignore-missing SHA256SUMS, and cosign verify-blob with SHA256SUMS.sigstore.json (commands in .github/workflows/release.yml)." \
-            dist/goatrope-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "goatrope ${{ steps.v.outputs.version }}" \
+            --notes "See CHANGELOG.md. The commands that verify it are in .github/workflows/release.yml." \
+            "dist/goatrope-${{ steps.v.outputs.version }}.tar.gz" dist/SHA256SUMS dist/SHA256SUMS.cosign-bundle

@@ -70,6 +70,7 @@ listen tap with decode-and-send.
 | Command | Does |
 |---|---|
 | `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, carries a VLAN or other device, holds an address, carries the default route, the operator's session or any established connection (link-local ones included), when the rings (one per recorded port) and file destinations do not fit on disk, or when the state file of an earlier install is unreadable |
+| `goatrope deploy [--dry-run]` | `install`, only when the machine does not already have this software and declaration and match it. With `--dry-run`, makes every refusal and changes nothing. [docs/deploy.md](docs/deploy.md): the Ansible play that runs it from a verified release file |
 | `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each recorder and its ring, each send and decoder, and the check result |
 | `goatrope check [--json]` | compares the machine with the declaration. Exit **0** matches, **3** differs, anything else is an error (2: invalid or unreadable declaration) |
 | `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
@@ -159,11 +160,14 @@ the host's kernel. No hardware is involved. They cover:
   install takes the ports from it at once and leaves the management port alone,
   and uninstall gives them back;
 - the WIP relay (ADR 0002): default deny, refusals, IP forwarding, send errors;
+- `deploy`, in an image with Ansible: the play from a release file. Refusals leave the machine,
+  `current` and the ledger as they were; install, a second run that changes nothing, repair,
+  a changed declaration, a newer release, rollback, and inline with no ping lost on a re-run;
 - `units`: a full disk, HTTP redirects, the reassembly bound, default routes in other
   tables, the state backup, and the operator's own tc filters kept.
 
-`tests/arm64/run.sh 24.04|26.04` runs the same phases, except `components` and
-`networkmanager`, in an emulated arm64 Ubuntu VM
+`tests/arm64/run.sh 24.04|26.04` runs the same phases, except `components`,
+`networkmanager` and `deploy`, in an emulated arm64 Ubuntu VM
 (the Ubuntu arm64 cloud image under qemu-system-aarch64, inside a container), with an
 emulated i6300esb watchdog, so `check` reads a real `/dev/watchdog0`. Emulation shows
 that the arm64 packages behave as the amd64 ones; it says nothing about a Raspberry
@@ -183,9 +187,10 @@ own watchdog, forced link speed (veth cannot be forced), and recording throughpu
 |---|---|
 | `bin/goatrope` | the entry point |
 | `goatrope/` | `config.py` (the declaration), `tap.py`, `send.py`, `relay.py`, `sysutil.py`, `cli.py`; Python 3 standard library only |
+| `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests and their container |
-| `tools/build-release.sh` | the release archive and SHA256SUMS |
+| `tools/` | `build-release.sh` (the archive and SHA256SUMS), `check-release.sh` (the release is exactly its three files) |
 | `docs/` | ADRs, hardware, install card |
 
 ## License

@@ -9,6 +9,7 @@ restores the interface settings it saved before changing them.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -377,13 +378,55 @@ def _install_software() -> None:
     su.write_file(BIN, wrapper, 0o755)
 
 
-def install(cfg: cfgmod.Config, log=print) -> None:
-    prior_state = _load_state()
+def _refuse(cfg: cfgmod.Config, prior_state: dict | None) -> None:
+    """Every refusal install makes; changes nothing."""
     preflight(cfg, prior_state)
     from . import send as sendmod
     bad = sendmod.refuse_tap_routes(cfg)
     if bad:
         raise Refusal("; ".join(bad) + ": decode-and-send never transmits on the tapped link")
+
+
+def _tree(d: str) -> dict[str, str]:
+    """Each file of an installed or unpacked package, by its SHA-256."""
+    out = {}
+    for dirpath, dirnames, names in os.walk(d):
+        dirnames[:] = [n for n in dirnames if n != "__pycache__"]
+        for n in names:
+            if not n.endswith(".pyc"):
+                p = os.path.join(dirpath, n)
+                with open(p, "rb") as f:
+                    out[os.path.relpath(p, d)] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+
+def deploy(cfg: cfgmod.Config, dry_run: bool = False, log=print) -> str:
+    """Bring the machine to this software and this declaration, once. Refuses as install does. A machine
+    already there is left alone: install restarts the recorders, and inline it reconfigures the ports.
+    Returns unchanged, changed or (dry run) would-change."""
+    _refuse(cfg, _load_state())
+    here = os.path.dirname(os.path.abspath(__file__))
+    mine = _tree(here)
+    if "VERSION" not in mine:  # unpacked, it sits beside the package; installed, inside it
+        with open(os.path.join(os.path.dirname(here), "VERSION"), "rb") as f:
+            mine["VERSION"] = hashlib.sha256(f.read()).hexdigest()
+    with open(cfg.path, encoding="utf-8") as f:
+        declared = f.read()
+    there = (_load_state() is not None and os.path.exists(BIN) and _tree(os.path.join(LIB, "goatrope")) == mine
+             and (su.read(f"{ETC}/goatrope.toml") or "") == declared.strip()
+             and all(i["ok"] is not False for i in check(cfg)))
+    if there:
+        return "unchanged"
+    if dry_run:
+        return "would-change"
+    install(cfg, log)
+    return "changed"
+
+
+def install(cfg: cfgmod.Config, log=print) -> None:
+    prior_state = _load_state()
+    _refuse(cfg, prior_state)
+    from . import send as sendmod
     tap = cfg.tap
     nm_present = os.path.isdir("/etc/NetworkManager")
     files = render(cfg, nm_present)

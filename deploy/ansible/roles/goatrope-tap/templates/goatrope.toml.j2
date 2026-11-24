@@ -1,0 +1,19 @@
+{# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+   SPDX-License-Identifier: Apache-2.0 #}
+# Written from the machine's tap declaration by the goatrope-tap role.
+schema = 1
+
+[tap]
+{% for k, v in tap.items() %}
+{{ k }} = {{ v | to_json }}
+{% endfor %}
+{% if goatrope_speed_mbps | int > 0 %}
+speed_mbps = {{ goatrope_speed_mbps | int }}
+{% endif %}
+
+[tap.record]
+{% for k, v in goatrope_record.items() %}
+{{ k }} = {{ v | to_json }}
+{% endfor %}
+
+{{ goatrope_extra_toml }}

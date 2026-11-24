@@ -3,11 +3,12 @@
 """goatrope command line.
 
   goatrope install   [--config PATH]           apply the declaration (refuses, changing nothing, when unsafe)
+  goatrope deploy    [--config PATH] [--dry-run] install only when the machine does not match already
   goatrope status    [--config PATH]           what the machine is doing now
   goatrope check     [--config PATH] [--json]  exit 0: matches the declaration; 3: differs; other: error
   goatrope uninstall [--purge]                 remove everything install wrote and restore the ports
   goatrope validate  [--config PATH]           check the declaration alone, without touching the machine
-  goatrope relay     [--config PATH]           run the relay (WIP; see docs/adr/0003)
+  goatrope relay     [--config PATH]           run the relay (WIP; see docs/adr/0002)
 
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 """
@@ -44,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
         if name == "check":
             p.add_argument("--json", action="store_true")
+    p = sub.add_parser("deploy")
+    p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
+    p.add_argument("--dry-run", action="store_true", help="make every refusal, change nothing")
     p = sub.add_parser("uninstall")
     p.add_argument("--purge", action="store_true", help="also remove the declaration and the recordings")
     p = sub.add_parser("run-send")
@@ -81,6 +85,15 @@ def main(argv: list[str] | None = None) -> int:
             items = tap.check(cfg)
             bad = [i for i in items if i["ok"] is False]
             tap.status(cfg)
+            return EXIT_OK if not bad else EXIT_DIFFERS
+        if a.cmd == "deploy":
+            _need_root()
+            print(tap.banner(cfg.tap))
+            outcome = tap.deploy(cfg, a.dry_run)
+            bad = [i for i in tap.check(cfg) if i["ok"] is False] if outcome == "changed" else []
+            for i in bad:
+                print(f"  DIFF {i['id']}: {i['have']} (want {i['want']})")
+            print(f"goatrope deploy: {outcome}")
             return EXIT_OK if not bad else EXIT_DIFFERS
         if a.cmd == "status":
             return tap.status(cfg)

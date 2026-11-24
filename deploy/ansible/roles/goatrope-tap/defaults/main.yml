@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+---
+# REQUIRED, no defaults: the machine's tap declaration (its host_vars).
+#   tap:
+#     mode: listen            # listen | inline
+#     source: copper-tap      # listen only: copper-tap | bypass-relay | mirror-port
+#     ports: [tap0, tap1]
+#     management: mgmt0
+#
+# REQUIRED, no defaults: what it records.
+#   goatrope_record:
+#     ports: [tap0, tap1]     # inline: one port; listen: one ring per port
+#     filter: ""              # a BPF filter, or "" for every frame
+#     file_mb: 50
+#     files: 40
+#     directory: ...          # optional, /var/lib/goatrope/<name>
+#
+# Optional: the forced link speed (required by goatrope for a copper tap), and more of the
+# declaration as TOML ([[send]], [[decode]]).
+goatrope_speed_mbps: 0
+goatrope_extra_toml: ""
+
+# Where release files are: <root>/<component>/<sha256>/<name>, with the links `current` and
+# `previous` beside them.
+goatrope_release_home: "{{ release_file_root | default('/opt/goat/releases') }}/{{ release_file_component | default('goatrope') }}"

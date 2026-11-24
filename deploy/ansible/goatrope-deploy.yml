@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Deploy goatrope as a release component: the play to name as its deploy_playbook.
+#
+# The driver has fetched and verified the release (checksums file against the pin, its keyless
+# signature, the archive against the checksums file) and passes what it verified, as it does to
+# its release-file play: release_file_component, release_file_ledger, release_file_ref and
+# release_file_files to install; release_file_rollback=true to go back one file.
+#
+#   1. preflight  goatrope from that archive makes every refusal on the host and changes nothing:
+#                 a refused tap leaves `current`, the ledger and the running tap as they were
+#   2. release-file  the driver's own role puts the file in place (not part of this repository)
+#   3. goatrope-tap  goatrope from `current` installs the tap, or does nothing when it matches
+#
+# With neither variable, it converges the host on the file `current` names.
+- name: goatrope | the tap, from its release
+  hosts: "{{ target | mandatory }}"
+  gather_facts: true
+  become: true
+  # One machine at a time, and a failure stops the rest: an inline tap carries its link.
+  serial: 1
+  max_fail_percentage: 0
+  tasks:
+    - name: goatrope | preflight
+      ansible.builtin.include_role:
+        name: goatrope-tap
+        tasks_from: preflight
+
+    - name: goatrope | put the release file in place
+      ansible.builtin.include_role:
+        name: release-file
+      when: (release_file_rollback | default(false) | bool) or (release_file_files | default({}) | length > 0)
+
+    - name: goatrope | install the tap
+      ansible.builtin.include_role:
+        name: goatrope-tap

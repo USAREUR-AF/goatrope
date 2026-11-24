@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+---
+# The file `current` names: install the tap from it, or do nothing when the machine matches.
+- name: goatrope-tap | run goatrope from the installed file
+  ansible.builtin.include_tasks: run.yml
+  vars:
+    _gt_link: "{{ goatrope_release_home }}/current"
+    _gt_src: {}
+    _gt_dry: "{{ ansible_check_mode }}"

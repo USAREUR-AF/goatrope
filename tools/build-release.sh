@@ -17,7 +17,7 @@ mkdir -p "$dist"
 name="goatrope-$v"
 # git archive: exactly the committed tree, with a fixed mtime from the commit.
 git -C "$repo" archive --format=tar --prefix="$name/" HEAD \
-    bin goatrope examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
+    bin goatrope deploy examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
     | gzip -n -9 > "$dist/$name.tar.gz"
 (cd "$dist" && sha256sum "$name.tar.gz" > SHA256SUMS)
 cat "$dist/SHA256SUMS"

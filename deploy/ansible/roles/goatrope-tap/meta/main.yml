@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+---
+galaxy_info:
+  author: U.S. Federal Government
+  description: Install the goatrope tap from its verified release file.
+  license: Apache-2.0
+  min_ansible_version: "2.16"
+dependencies: []

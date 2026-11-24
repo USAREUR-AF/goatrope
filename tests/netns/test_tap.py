@@ -1347,6 +1347,200 @@ def phase_networkmanager() -> None:
 PHASES["networkmanager"] = phase_networkmanager
 
 
+# Stands in for the deploy driver's own release-file role: the file at <root>/<component>/<sha256>/<name>,
+# `current` and `previous` beside it, and a ledger line. GOATROPE_TEST_ROLES puts the real one in /opt/gt-roles.
+RELEASE_FILE_STUB = """
+- ansible.builtin.shell: |
+    set -e; h=/opt/goat/releases/goatrope; L=/var/log/gt-ledger
+    if [ "{{ release_file_rollback | default(false) | bool }}" = True ]; then n=$(readlink $h/previous)
+    else a=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+      n=$h/{{ (release_file_files | default({})).get('amd64', {}).get('sha256', '') }}/{{ (release_file_files | default({})).get('amd64', {}).get('name', '') }}
+      mkdir -p $(dirname $n); cp {{ (release_file_files | default({})).get('amd64', {}).get('src', '') }} $n; fi
+    c=$(readlink $h/current || true); [ -z "$c" ] || [ "$c" = "$n" ] || ln -sfn $c $h/previous
+    ln -sfn $n $h/current; echo "$n" >> $L
+"""
+GT_HOME = "/opt/goat/releases/goatrope"
+
+
+def make_release(version: str, d: str = "/opt/gt-dist") -> dict:
+    """The release archive's layout (tools/build-release.sh), and the file as a driver passes it."""
+    import io
+    import tarfile
+    os.makedirs(d, exist_ok=True)
+    name = f"goatrope-{version}"
+    path = f"{d}/{name}.tar.gz"
+    with tarfile.open(path, "w:gz") as t:
+        for x in ("bin", "goatrope", "deploy", "examples"):
+            t.add(f"{SRC}/{x}", f"{name}/{x}", filter=lambda i: None if "__pycache__" in i.name else i)
+        data = (version + "\n").encode()
+        i = tarfile.TarInfo(f"{name}/VERSION")
+        i.size = len(data)
+        t.addfile(i, io.BytesIO(data))
+    return describe(path)
+
+
+def describe(path: str) -> dict:
+    with open(path, "rb") as f:
+        return {"src": path, "name": os.path.basename(path), "sha256": hashlib.sha256(f.read()).hexdigest()}
+
+
+def play(host_vars: dict, rel: dict | None = None, rollback: bool = False, *extra: str) -> subprocess.CompletedProcess:
+    w = f"{WORK}/ansible"
+    os.makedirs(f"{w}/inventory/host_vars", exist_ok=True)
+    roles = [f"{SRC}/deploy/ansible/roles"]
+    if os.path.isdir("/opt/gt-roles"):
+        roles.append("/opt/gt-roles")
+    else:
+        os.makedirs(f"{w}/roles/release-file/tasks", exist_ok=True)
+        with open(f"{w}/roles/release-file/tasks/main.yml", "w") as f:
+            f.write(RELEASE_FILE_STUB)
+        roles.append(f"{w}/roles")
+    with open(f"{w}/inventory/hosts", "w") as f:
+        f.write("[taps]\ntap-a ansible_connection=local ansible_python_interpreter=/usr/bin/python3\n")
+    with open(f"{w}/inventory/host_vars/tap-a.yml", "w") as f:
+        json.dump(host_vars, f)
+    v: dict = {"target": "taps", "release_file_component": "goatrope", "release_file_ledger": "goatrope"}
+    if rel:
+        v |= {"release_file_ref": f"example-org/goatrope@goatrope-v1@sha256:{'0' * 64}",
+              "release_file_files": {"amd64": rel, "arm64": rel}}  # one archive serves both
+    if rollback:
+        v["release_file_rollback"] = True
+    with open(f"{w}/vars.json", "w") as f:
+        json.dump(v, f)
+    return subprocess.run(["ansible-playbook", "-i", f"{w}/inventory", f"{SRC}/deploy/ansible/goatrope-deploy.yml",
+                           "-e", f"@{w}/vars.json", *extra], capture_output=True, text=True,
+                          env=dict(os.environ, ANSIBLE_ROLES_PATH=":".join(roles), ANSIBLE_NOCOLOR="1", LC_ALL="C.UTF-8"))
+
+
+def recap(p: subprocess.CompletedProcess) -> str:
+    return next((" ".join(ln.split()[2:]) for ln in p.stdout.splitlines() if ln.startswith("tap-a ") and "ok=" in ln), "no recap")
+
+
+def phase_deploy() -> None:
+    """The deploy play, from a release file, as a driver runs it (Ansible in this container, against itself)."""
+    topo_listen()
+    stand_in_watchdog()
+    given = [f for f in sorted(os.listdir("/opt/gt-dist")) if f.endswith(".tar.gz")] if os.path.isdir("/opt/gt-dist") else []
+    real = describe(f"/opt/gt-dist/{given[0]}") if given else None
+    r1 = real or make_release("0.1.0")
+    r2 = make_release("0.1.1")
+    v1 = r1["name"].removeprefix("goatrope-").removesuffix(".tar.gz")
+    print(f"# archive: {'built by tools/build-release.sh' if real else 'built by the test'}; release-file role: "
+          f"{'the real one' if os.path.isdir('/opt/gt-roles') else 'a stand-in'}", flush=True)
+    tap = {"mode": "listen", "source": "mirror-port", "ports": ["tp0", "tp1"], "management": MGMT}
+    rec = {"ports": ["tp0", "tp1"], "filter": "", "file_mb": 5, "files": 4}
+    good = {"tap": tap, "goatrope_record": rec}
+    before = snapshot()
+
+    def link(n="current"):
+        return os.readlink(f"{GT_HOME}/{n}") if os.path.islink(f"{GT_HOME}/{n}") else None
+
+    def ledger():
+        t = ""
+        for f in ("/var/log/gt-ledger", "/var/lib/goat/goatrope/deploy-history.jsonl"):
+            t += open(f).read() if os.path.exists(f) else ""
+        return t
+
+    def refused(name, hv, text, rel=None, rollback=False):
+        pre = (snapshot(), link(), ledger())
+        p = play(hv, rel, rollback)
+        post = (snapshot(), link(), ledger())
+        d = diff(pre[0], post[0])
+        d = [x for x in d if "/var/lib/goatrope/record/" not in x]  # a running recorder's ring
+        left = [x for x in os.listdir("/run") if x.startswith("goatrope-deploy")]
+        result(p.returncode != 0 and text in p.stdout + p.stderr and not d and pre[1:] == post[1:] and not left,
+               f"deploy refused: {name}; the machine, `current` and the ledger are as they were",
+               f"exit {p.returncode}; {'' if text in p.stdout + p.stderr else (p.stdout + p.stderr)[-500:]}; {d[:3]} {left}")
+
+    refused("no release installed and none given", good, "release is not installed here")
+    refused("no tap declaration", {"goatrope_record": rec}, "there is no default", r1)
+    refused("no recording declaration", {"tap": tap}, "there is no default", r1)
+    refused("an unknown tap key", {"tap": tap | {"speed": 1}, "goatrope_record": rec}, "there is no default", r1)
+    refused("no mode", {"tap": {k: v for k, v in tap.items() if k != "mode"}, "goatrope_record": rec}, "goatrope: refused", r1)
+    refused("listen without a source", {"tap": {k: v for k, v in tap.items() if k != "source"}, "goatrope_record": rec}, "goatrope: refused", r1)
+    refused("inline with one port", {"tap": {"mode": "inline", "ports": ["tp0"], "management": MGMT}, "goatrope_record": rec}, "goatrope: refused", r1)
+    refused("management is a port", {"tap": tap | {"ports": ["tp0", MGMT]}, "goatrope_record": rec}, "goatrope: refused", r1)
+    refused("a port that does not exist", {"tap": tap | {"ports": ["tp0", "tp9"]}, "goatrope_record": rec | {"ports": ["tp0"]}}, "no interface tp9", r1)
+    refused("TOML in a value", {"tap": tap, "goatrope_record": rec | {"filter": 'x"\nfiles = 9\n#'}}, "goatrope: refused", r1)
+    refused("more TOML that declares the tap again", good | {"goatrope_extra_toml": "[tap]\nmode = 'inline'"}, "refused", r1)
+    sh("ip addr add 198.51.100.9/24 dev tp0")
+    refused("a port with an address", good, "has address(es) 198.51.100.9/24", r1)
+    sh("ip addr del 198.51.100.9/24 dev tp0")
+    refused("an archive that is not the verified one", good, "nothing changed", r1 | {"sha256": "0" * 64})
+
+    c0, c1 = Capture("feed", "f0", "dep-f0"), Capture("feed", "f1", "dep-f1")
+    p = play(good, r1)
+    result(p.returncode == 0 and "changed=0" not in recap(p), "deploy: listen, installed from the release file",
+           f"{recap(p)} {'' if p.returncode == 0 else (p.stdout + p.stderr)[-900:]}")
+    result((link() or "").endswith(f"/{r1['sha256']}/{r1['name']}") and ledger() != "", "deploy: `current` names the archive", str(link()))
+    def installed_check(name):
+        q = subprocess.run(["goatrope", "check"], capture_output=True, text=True)
+        result(q.returncode == 0, name, f"exit {q.returncode} {[x for x in q.stdout.splitlines() if 'DIFF' in x]} {q.stderr[-200:]}")
+    installed_check("deploy: goatrope check exits 0")
+    f0, f1 = c0.stop(), c1.stop()
+    result(not f0 and not f1, "deploy: nothing sent toward the feed while it installed", f"{len(f0)} + {len(f1)} frames")
+
+    def pids():
+        return sh("systemctl show -p MainPID --value goatrope-record@tp0 goatrope-record@tp1").stdout.split()
+    p0, files0 = pids(), {k: v for k, v in snapshot()["files"].items() if "/record/" not in k and "deploy-history" not in k}
+    p = play(good, None)
+    result(p.returncode == 0 and "changed=0" in recap(p) and pids() == p0, "deploy: a second run changes nothing and restarts no recorder", recap(p))
+    q = play(good, r1)
+    files1 = {k: v for k, v in snapshot()["files"].items() if "/record/" not in k and "deploy-history" not in k}
+    result(q.returncode == 0 and pids() == p0 and files1 == files0,
+           "deploy: the same release again restarts no recorder and changes no file of the tap", recap(q))
+    sh("tc qdisc del dev tp0 clsact")
+    p = play(good, None)
+    result(p.returncode == 0 and "changed=1" in recap(p), "deploy: a removed egress drop is repaired", recap(p))
+    installed_check("deploy: check exits 0 after the repair")
+    pre = snapshot()
+    p = play({"tap": tap, "goatrope_record": rec | {"files": 5}}, None, False, "--check", "-v")
+    d = [x for x in diff(pre, snapshot()) if "/record/" not in x]
+    result(p.returncode == 0 and "would-change" in p.stdout and not d, "deploy: check mode says it would change, and changes nothing", f"{recap(p)} {d}")
+    p = play({"tap": tap, "goatrope_record": rec | {"files": 5}}, None)
+    result(p.returncode == 0 and "files = 5" in open("/etc/goatrope/goatrope.toml").read()
+           and "files = 4" in open("/etc/goatrope/goatrope.toml.prev").read(), "deploy: a changed declaration is applied, the one before kept", recap(p))
+    p = play(good, r2)
+    have = sh("goatrope --version").stdout.strip()
+    result(p.returncode == 0 and have.endswith("0.1.1"), "deploy: a newer release replaces the software", f"{have}; {recap(p)}")
+    sh("ip addr add 198.51.100.9/24 dev tp1")
+    refused("rollback while a port is in use", good, "has address(es)", None, True)
+    sh("ip addr del 198.51.100.9/24 dev tp1")
+    p = play(good, None, True)
+    have = sh("goatrope --version").stdout.strip()
+    result(p.returncode == 0 and have.endswith(v1) and r1["sha256"] in (link() or ""), "deploy: rollback installs the release before", f"{have}; {recap(p)}")
+    installed_check("deploy: check exits 0 after the rollback")
+    cur = link() or ""
+    with open(cur, "ab") as f:
+        f.write(b"x")
+    refused("an installed archive changed on the machine", good, "nothing changed")
+    sh(f"cp {r1['src']} {cur}")
+    p = gr("uninstall", "--purge")
+    # the driver's ledger and release files are its own
+    d = [x for x in diff(before, snapshot()) if "/var/lib/goat:" not in x and "/var/lib/goat/" not in x]
+    result(p.returncode == 0 and not d, "deploy: uninstall --purge leaves nothing of the tap", str(d[:4]))
+
+    topo_inline()
+    inline = {"tap": {"mode": "inline", "ports": ["tp0", "tp1"], "management": MGMT}, "goatrope_record": rec | {"ports": ["tp0"]}}
+    p = play(inline, None)
+    result(p.returncode == 0, "deploy: inline, from the installed file", f"{recap(p)} {'' if p.returncode == 0 else (p.stdout + p.stderr)[-600:]}")
+    installed_check("deploy: inline check exits 0")
+    pg = subprocess.Popen(["ip", "netns", "exec", "a", "ping", "-i", "0.05", "-c", "400", "-q", "192.0.2.2"], stdout=subprocess.PIPE, text=True)
+    time.sleep(1)
+    p = play(inline, None)
+    out = pg.communicate(timeout=60)[0]
+    result(p.returncode == 0 and "changed=0" in recap(p) and " 0% packet loss" in out,
+           "deploy: a second inline run loses no ping through the bridge", f"{recap(p)}; {out.splitlines()[-2] if out else ''}")
+    sh("ip addr add 198.51.100.9/24 dev goatrope0")
+    refused("inline, the bridge has an address", inline, "has address(es)")
+    sh("ip addr del 198.51.100.9/24 dev goatrope0")
+    p = gr("uninstall", "--purge")
+    result(p.returncode == 0 and not os.path.exists("/sys/class/net/goatrope0"), "deploy: inline uninstall")
+
+
+PHASES["deploy"] = phase_deploy
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

@@ -21,7 +21,7 @@ internet access for the packages. Decide the mode:
 
 2. **Unpack and verify the release.**
    ```
-   sha256sum -c --ignore-missing SHA256SUMS
+   sha256sum -c SHA256SUMS
    tar -xzf goatrope-<version>.tar.gz && cd goatrope-<version>
    ```
 

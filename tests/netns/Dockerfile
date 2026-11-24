@@ -20,5 +20,9 @@ RUN if [ "$NM" = 1 ]; then apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && printf '[keyfile]\nunmanaged-devices=interface-name:eth0\n' > /etc/NetworkManager/conf.d/10-test-management.conf \
  && printf 'KERNEL=="tp*", ENV{NM_UNMANAGED}="0"\n' > /etc/udev/rules.d/86-test-nm-manage-tp.rules; fi
+# ANSIBLE=1: Ansible in the container, run against itself, for the deploy phase.
+ARG ANSIBLE=0
+RUN if [ "$ANSIBLE" = 1 ]; then apt-get update \
+ && apt-get install -y --no-install-recommends ansible-core && rm -rf /var/lib/apt/lists/*; fi
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
