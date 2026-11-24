@@ -68,7 +68,7 @@ for v in "${versions[@]}"; do
     docker rm -f "$c" >/dev/null
 
     start "$c" "$v"
-    phase "$c" "$log" listen uninstall send
+    phase "$c" "$log" listen uninstall send relay
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 done

@@ -9,7 +9,7 @@ FROM ubuntu:${UBUNTU}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv iproute2 ethtool tcpdump \
-      python3 iputils-ping kmod util-linux dbus udev \
+      python3 iputils-ping kmod util-linux dbus udev wireguard-tools \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask systemd-resolved.service getty.target console-getty.service 2>/dev/null; true
 STOPSIGNAL SIGRTMIN+3

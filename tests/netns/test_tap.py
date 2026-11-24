@@ -714,6 +714,136 @@ print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv
 PHASES = {"refusals": phase_refusals, "inline": phase_inline, "reboot-verify": phase_reboot_verify,
           "uninstall": lambda: phase_uninstall(True), "listen": phase_listen, "send": phase_send}
 
+RELAY = """schema = 1
+[relay]
+wip = true
+remote_interface = "wg0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "both", protocol = "udp", remote = "10.99.0.2", listen_port = 7000, target = "192.0.2.2", target_port = 7000 },
+  { direction = "remote-to-link", protocol = "udp", remote = "10.99.0.2", listen_port = 7002, target = "192.0.2.2", target_port = 7002 },
+]
+"""
+
+
+def topo_relay() -> None:
+    """remote ns: two WireGuard interfaces (an allowed peer and another peer); link ns: one host on the link."""
+    for ns in ("remote", "linkhost"):
+        sh(f"ip netns del {ns}", check=False)
+        sh(f"ip netns add {ns}")
+        sh(f"ip -n {ns} link set lo up")
+    sh("ip link add u0 type veth peer name u1 && ip link set u1 netns remote")
+    sh("ip addr add 198.51.100.1/24 dev u0 && ip link set u0 up")
+    sh("ip -n remote addr add 198.51.100.2/24 dev u1 && ip -n remote link set u1 up")
+    sh("ip link add r0 type veth peer name l0 && ip link set l0 netns linkhost")
+    sh("ip addr add 192.0.2.50/24 dev r0 && ip link set r0 up")  # IPv6 stays on here: the first run must refuse
+    sh("ip -n linkhost addr add 192.0.2.2/24 dev l0 && ip -n linkhost link set l0 up")
+    keys = {}
+    for k in ("tap", "allowed", "other"):
+        priv = sh("wg genkey").stdout.strip()
+        pub = subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True).stdout.strip()
+        path = f"{WORK}/{k}.key"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, priv.encode() + b"\n")
+        os.close(fd)
+        keys[k] = pub
+    sh("ip link add wg0 type wireguard")
+    # Keys go in on standard input: the host's AppArmor profile for wg may refuse to open key files.
+    sh(f"cat {WORK}/tap.key | wg set wg0 listen-port 51820 private-key /dev/stdin "
+       f"peer {keys['allowed']} allowed-ips 10.99.0.2/32 peer {keys['other']} allowed-ips 10.99.0.3/32")
+    sh("ip addr add 10.99.0.1/24 dev wg0 && ip link set wg0 up")
+    for name, addr, port in (("wga", "10.99.0.2", 51821), ("wgo", "10.99.0.3", 51822)):
+        sh(f"ip -n remote link add {name} type wireguard")
+        key = "allowed" if name == "wga" else "other"
+        sh(f"cat {WORK}/{key}.key | ip netns exec remote wg set {name} listen-port {port} private-key /dev/stdin "
+           f"peer {keys['tap']} endpoint 198.51.100.1:51820 allowed-ips 10.99.0.1/32")
+        sh(f"ip -n remote addr add {addr}/32 dev {name} && ip -n remote link set {name} up")
+    # The other peer reaches the relay port through its own tunnel address.
+    sh("ip -n remote route add 10.99.0.1/32 dev wga metric 1")
+    sh("ip -n remote route add 10.99.0.1/32 dev wgo metric 2")
+
+
+def phase_relay() -> None:
+    topo_relay()
+    write_cfg(RELAY)
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "IPv6 is on" in p.stderr, "relay refused: IPv6 on its link interface", p.stderr.strip()[-120:])
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")
+    cap = Capture("linkhost", "l0", "relay-link")
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
+import socket, json, select
+socks = {}
+for p in (7000, 7001, 7002):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", p)); socks[s] = p
+got = {7000: [], 7001: [], 7002: []}
+end = __import__("time").time() + 12
+while __import__("time").time() < end:
+    r, _, _ = select.select(list(socks), [], [], 0.5)
+    for s in r:
+        d, a = s.recvfrom(65535); got[socks[s]].append([d.decode(), a[0]])
+        if socks[s] == 7000: s.sendto(b"reply-" + d, a)
+print(json.dumps(got))
+"""], stdout=subprocess.PIPE, text=True)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2)
+    sender = """
+import socket, sys, time, json
+src, port, n, tag, dev = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
+s.bind((src, 0)); s.settimeout(0.3)
+replies = 0
+for i in range(n):
+    s.sendto(f"{tag}{i}".encode(), ("10.99.0.1", port))
+    try:
+        if s.recv(65535).startswith(b"reply-"): replies += 1
+    except socket.timeout: pass
+print(replies)
+"""
+    rep = sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7000 20 ok wga", check=False).stdout.strip()
+    sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7002 5 oneway wga", check=False)
+    sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7001 5 unlisted wga", check=False)
+    sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.3 7000 5 otherpeer wgo", check=False)
+    # From the management side, outside the tunnel: the relay's sockets are bound to wg0.
+    sh("python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);[s.sendto(b'outside',('127.0.0.1',7000)) for i in range(3)]\"", check=False)
+    got = json.loads(rx.communicate(timeout=30)[0])
+    relay.terminate()
+    out = relay.communicate(timeout=10)[0]
+    frames = cap.stop()
+    ok7000 = [d for d, a in got["7000"] if d.startswith("ok")]
+    result(len(ok7000) == 20 and all(a == "192.0.2.50" for _, a in got["7000"]),
+           "relay (WIP): an allowed datagram reaches its one target, from the relay's own address", f"{len(ok7000)} of 20")
+    result(rep == "20", "relay (WIP): replies from the target return to the remote machine (direction both)", f"{rep} of 20")
+    result(len(got["7002"]) == 5, "relay (WIP): a one-way rule forwards", f"{len(got['7002'])} of 5")
+    result(not got["7001"], "relay (WIP): a port with no rule forwards nothing", f"{len(got['7001'])}")
+    result(not any(d.startswith("otherpeer") for d, _ in got["7000"]),
+           "relay (WIP): an authenticated peer that is not the rule's remote is denied", "denied" if "denied" in out else out[-200:])
+    result(not any(d.startswith("outside") for d, _ in got["7000"]), "relay (WIP): nothing from outside the tunnel is relayed")
+    bad = []
+    for f in frames:
+        et = f[12:14]
+        if et == b"\x08\x06":
+            continue  # ARP: the relay answers for its own address, as any host on the link does
+        if et == b"\x08\x00" and f[23] == 17 and f[26:30] == bytes([192, 0, 2, 50]) and f[30:34] == bytes([192, 0, 2, 2]) \
+                and int.from_bytes(f[36:38], "big") in (7000, 7002):
+            continue
+        bad.append(f[:40].hex())
+    result(not bad, "relay (WIP): on the link, only ARP and the allowed datagrams were sent", f"{len(frames)} frames, {len(bad)} other: {bad[:3]}")
+    # refusals
+    write_cfg(RELAY.replace('remote_interface = "wg0"', 'remote_interface = "u0"'))
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "not a WireGuard interface" in p.stderr, "relay refused: remote side is not WireGuard", p.stderr.strip()[-120:])
+    write_cfg(RELAY.replace('192.0.2.50/24', '192.0.2.51/24'))
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "does not hold" in p.stderr, "relay refused: its interface does not hold the declared address", p.stderr.strip()[-120:])
+    write_cfg(RELAY.replace('target = "192.0.2.2", target_port = 7000', 'target = "198.51.100.9", target_port = 7000'))
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "is not on the link" in p.stderr, "relay refused: a target that is not on the link", p.stderr.strip()[-120:])
+
+
+PHASES["relay"] = phase_relay
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

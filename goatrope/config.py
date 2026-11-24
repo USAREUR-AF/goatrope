@@ -369,15 +369,15 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
             raise ConfigError(f"{aw} must be a table")
         req = {"direction", "protocol", "remote", "listen_port", "target", "target_port"}
         _keys(a, aw, req, req)
-        if a["direction"] != "remote-to-link":
-            raise ConfigError(f"{aw}.direction: only \"remote-to-link\" is built")
+        if a["direction"] not in ("remote-to-link", "both"):
+            raise ConfigError(f"{aw}.direction must be \"remote-to-link\" or \"both\" (replies from the target only)")
         if a["protocol"] != "udp":
             raise ConfigError(f"{aw}.protocol: only \"udp\" is built")
         target = _addr(a["target"], f"{aw}.target")
         net = ipaddress.ip_interface(link_addr).network
         if ipaddress.ip_address(target) not in net:
             raise ConfigError(f"{aw}.target {target} is not on the link ({net})")
-        rules.append(RelayRule("remote-to-link", _addr(a["remote"], f"{aw}.remote"),
+        rules.append(RelayRule(a["direction"], _addr(a["remote"], f"{aw}.remote"),
                                _int(a, "listen_port", aw, 1, 65535), target,
                                _int(a, "target_port", aw, 1, 65535), "udp"))
     seen = set()
