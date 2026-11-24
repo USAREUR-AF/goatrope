@@ -22,6 +22,8 @@ import struct
 import subprocess
 import sys
 import time
+import http.client
+import urllib.error
 import urllib.request
 
 from . import VERSION, config as cfgmod, sysutil as su
@@ -32,6 +34,37 @@ ETC = "/etc/goatrope"
 HEADER = "# Written by goatrope {v} from {cfg}. goatrope uninstall removes it; do not edit.\n"
 ETH_P_ALL = 0x0003
 PACKET_OUTGOING = 4
+COMPONENTS = "/var/lib/goatrope/components"  # verified copies of pinned binaries, root-owned, executed from here
+MODES: dict[str, int] = {}  # files render() writes with a mode other than 0644
+
+
+def component_path(sha: str) -> str:
+    return f"{COMPONENTS}/{sha}"
+
+
+def install_component(binary: str, sha: str) -> str | None:
+    """Hash binary and copy the same bytes to a root-only place, so what was checked is what runs.
+    Returns the copy's path, or None when the binary is not the pinned one."""
+    try:
+        with open(binary, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != sha:
+        return None
+    dest = component_path(sha)
+    if sha256(dest) != sha:
+        os.makedirs(COMPONENTS, mode=0o755, exist_ok=True)
+        tmp = dest + ".new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o555)
+        try:
+            os.write(fd, data)
+            os.fchmod(fd, 0o555)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, dest)
+    return dest
 
 
 def units(cfg: cfgmod.Config) -> list[str]:
@@ -70,18 +103,36 @@ Wants=goatrope-ports.service
 
 [Service]
 EnvironmentFile={ETC}/decode-%i.env
-ExecStartPre={BIN} verify-component decode %i --config {ETC}/goatrope.toml
-ExecStart=/bin/sh -c 'exec "$MIND" $PORTS --dictionary "$DICTIONARY" --filter "$FILTER"'
+# "+": verification runs as root; it copies the pinned binary to {COMPONENTS}, and the copy runs.
+ExecStartPre=+{BIN} verify-component decode %i --config {ETC}/goatrope.toml
+ExecStart=/bin/sh -c 'exec "$$MIND" $$PORTS --dictionary "$$DICTIONARY" $${{FILTER:+--filter "$$FILTER"}}'
 Restart=always
 RestartSec=5
+# The decoder parses link traffic: its own user, capture capabilities only, a read-only system.
+DynamicUser=yes
+StateDirectory=goatrope-decode-%i
+WorkingDirectory=/var/lib/goatrope-decode-%i
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_PACKET AF_NETLINK AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
 """
         for d in cfg.decodes:
-            files[f"{ETC}/decode-{d.name}.env"] = (
-                h + f"MIND={d.binary}\nPORTS={' '.join(d.ports)}\nDICTIONARY={d.dictionary}\n"
-                f"FILTER={d.filter}\nSUBSCRIBER_CONFIG_PATH={d.subscribers}\n")
+            path = f"{ETC}/decode-{d.name}.env"
+            # single-quoted: the declaration refuses quotes, backslashes and control characters
+            files[path] = (h + f"MIND='{component_path(d.sha256)}'\nPORTS='{' '.join(d.ports)}'\n"
+                           f"DICTIONARY='{d.dictionary}'\nFILTER='{d.filter}'\n"
+                           f"SUBSCRIBER_CONFIG_PATH='{d.subscribers}'\nPUBLISHER_CONFIG_PATH='{d.publishers}'\n")
+            MODES[path] = 0o640
     return files
 
 
@@ -96,6 +147,25 @@ def sha256(path: str) -> str | None:
         return None
 
 
+def destination_devices(host: str) -> tuple[set[str], str | None]:
+    """Every device a destination's addresses leave through, down to the physical port, or an error."""
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_UDP)
+    except (socket.gaierror, UnicodeError) as e:
+        return set(), f"cannot resolve {host}: {e}"
+    devs: set[str] = set()
+    for info in infos:
+        addr = info[4][0]
+        a, _, scope = addr.partition("%")
+        if not scope and len(info[4]) >= 4 and info[4][3]:
+            scope = socket.if_indextoname(info[4][3])
+        found = su.peer_devices(a, scope or None)
+        if not found:
+            return devs, f"no route to {addr}"
+        devs |= found
+    return devs, None
+
+
 def refuse_tap_routes(cfg: cfgmod.Config) -> list[str]:
     """Destinations whose route leaves through a tap port: sending there would transmit on the link."""
     taken = set(cfg.tap_ports()) | {"goatrope0"}
@@ -103,13 +173,12 @@ def refuse_tap_routes(cfg: cfgmod.Config) -> list[str]:
     for s in cfg.sends:
         for d in s.to:
             if d.scheme in ("udp", "tcp", "http", "https") and d.host:
-                try:
-                    addr = str(ipaddress.ip_address(d.host))
-                except ValueError:
-                    addr = socket.gethostbyname(d.host)
-                dev = su.route_dev(addr)
-                if dev in taken:
-                    bad.append(f"[[send]] {s.name}: {d.url} is reached through {dev}, a tap port")
+                devs, err = destination_devices(d.host)
+                if err:
+                    bad.append(f"[[send]] {s.name}: {d.url}: {err}")
+                elif devs & taken:
+                    bad.append(f"[[send]] {s.name}: {d.url} is reached through {', '.join(sorted(devs & taken))}, "
+                               "a tap port")
     return bad
 
 
@@ -164,9 +233,9 @@ def verify_component(cfg: cfgmod.Config, kind: str, name: str) -> int:
         print(f"goatrope: no [[decode]] {name}", file=sys.stderr)
         return 2
     d = items[0]
-    h = sha256(d.binary)
-    if h != d.sha256:
-        print(f"goatrope: {d.binary} is not the pinned first-bite {d.version} (sha256 {h})", file=sys.stderr)
+    if install_component(d.binary, d.sha256) is None:
+        print(f"goatrope: {d.binary} is not the pinned first-bite {d.version} (sha256 {sha256(d.binary)})",
+              file=sys.stderr)
         return 1
     return 0
 
@@ -174,18 +243,25 @@ def verify_component(cfg: cfgmod.Config, kind: str, name: str) -> int:
 # ---------------------------------------------------------------- runtime
 
 class Fragments:
-    """IPv4 reassembly, bounded: 30 s and 256 datagrams in flight."""
+    """IPv4 reassembly, bounded: 30 s, 256 datagrams and 4 MiB in flight. Only fragments whose
+    addresses the match allows are held."""
+    MAX_BYTES = 4 << 20
 
     def __init__(self):
         self.pending: dict[tuple, dict] = {}
+        self.bytes = 0
 
     def add(self, key: tuple, offset: int, more: bool, data: bytes) -> bytes | None:
         now = time.monotonic()
         for k in [k for k, v in self.pending.items() if now - v["t"] > 30]:
-            del self.pending[k]
-        if len(self.pending) > 256:
+            self.bytes -= sum(len(x) for x in self.pending.pop(k)["parts"].values())
+        if len(self.pending) > 256 or self.bytes + len(data) > self.MAX_BYTES or offset + len(data) > 65535:
             self.pending.clear()
+            self.bytes = 0
+            if offset + len(data) > 65535:
+                return None
         e = self.pending.setdefault(key, {"t": now, "parts": {}, "end": None})
+        self.bytes += len(data) - len(e["parts"].get(offset, b""))
         e["parts"][offset] = data
         if not more:
             e["end"] = offset + len(data)
@@ -199,12 +275,13 @@ class Fragments:
             pos = off + len(e["parts"][off])
         if pos != e["end"]:
             return None
-        del self.pending[key]
+        self.bytes -= sum(len(x) for x in self.pending.pop(key)["parts"].values())
         return buf
 
 
-def parse(frame: bytes, frags: Fragments):
-    """(src, dst, sport, dport, payload) of a UDP datagram, or None."""
+def parse(frame: bytes, frags: Fragments, m: cfgmod.Match | None = None):
+    """(src, dst, sport, dport, payload) of a UDP datagram, or None. Fragments of datagrams whose
+    addresses m excludes are dropped before reassembly."""
     if len(frame) < 14:
         return None
     et = struct.unpack_from("!H", frame, 12)[0]
@@ -224,6 +301,8 @@ def parse(frame: bytes, frags: Fragments):
         body = frame[off + ihl:off + total]
         foff, more = (fl & 0x1FFF) * 8, bool(fl & 0x2000)
         if foff or more:
+            if m is not None and ((m.src and m.src != src) or (m.dst and m.dst != dst)):
+                return None
             body = frags.add((src, dst, ident), foff, more, body)
             if body is None:
                 return None
@@ -249,15 +328,26 @@ def matches(m: cfgmod.Match, src, dst, sport, dport) -> bool:
             and (m.src_port is None or m.src_port == sport) and (m.dst_port is None or m.dst_port == dport))
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} refused", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 class Sink:
     def __init__(self, d: cfgmod.Destination, taken: set[str]):
         self.d, self.taken, self.sock, self.fh = d, taken, None, None
 
     def _guard(self):
         if self.d.host:
-            dev = su.route_dev(self.d.host)
-            if dev in self.taken:
-                raise OSError(f"{self.d.url} is reached through tap port {dev}; not sending")
+            devs, err = destination_devices(self.d.host)
+            if err:
+                raise OSError(f"{self.d.url}: {err}; not sending")
+            if devs & self.taken:
+                raise OSError(f"{self.d.url} is reached through tap port {', '.join(sorted(devs & self.taken))}; "
+                              "not sending")
 
     def send(self, payload: bytes, meta: dict) -> None:
         d = self.d
@@ -283,21 +373,32 @@ class Sink:
             req = urllib.request.Request(d.url, data=payload, method="POST",
                                          headers={"Content-Type": "application/octet-stream",
                                                   "X-Goatrope-Feed": meta["feed"]})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                r.read()
+            try:
+                with _OPENER.open(req, timeout=5) as r:
+                    r.read()
+            except http.client.HTTPException as e:
+                raise OSError(f"HTTP: {e!r}") from None
         elif d.scheme == "file":
             if self.fh is None:
-                os.makedirs(os.path.dirname(d.path), exist_ok=True)
-                self.fh = open(d.path, "ab", buffering=0)
+                os.makedirs(os.path.dirname(d.path), mode=0o750, exist_ok=True)
+                fd = os.open(d.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o640)
+                self.fh = os.fdopen(fd, "ab", buffering=0)
             if d.format == "jsonl":
                 rec = dict(meta, payload_hex=payload.hex())
                 self.fh.write((json.dumps(rec, sort_keys=True) + "\n").encode())
             else:
                 self.fh.write(payload)
+            if self.fh.tell() >= d.max_mb * 1_000_000:  # cut: the file and one older file, at most 2 x max_mb
+                self.fh.close()
+                self.fh = None
+                os.replace(d.path, d.path + ".1")
 
 
-def convert(c: cfgmod.Convert, payload: bytes) -> bytes:
-    p = subprocess.run([c.binary, "convert", "--from", c.from_format, "--to", c.to_format],
+def convert(c: cfgmod.Convert, payload: bytes, binary: str | None = None) -> bytes:
+    p = subprocess.run([binary or c.binary, "convert", "--from", c.from_format, "--to", c.to_format,
+                        "--packs", c.packs,
+                        # load only the two packs this conversion needs: a pack is the part before ":"
+                        "--packs-only", ",".join(dict.fromkeys(f.split(":")[0] for f in (c.from_format, c.to_format)))],
                        input=payload.hex().encode() + b"\n", capture_output=True, timeout=10)
     if p.returncode != 0:
         raise ValueError(p.stderr.decode(errors="replace").strip()[:200])
@@ -310,9 +411,13 @@ def run_send(cfg: cfgmod.Config, name: str) -> int:
         print(f"goatrope: no [[send]] {name}", file=sys.stderr)
         return 2
     s = found[0]
-    if s.convert and sha256(s.convert.binary) != s.convert.sha256:
-        print(f"goatrope: {s.convert.binary} is not the pinned goat-transformers {s.convert.version}", file=sys.stderr)
-        return 1
+    conv_bin = None
+    if s.convert:
+        conv_bin = install_component(s.convert.binary, s.convert.sha256)
+        if conv_bin is None:
+            print(f"goatrope: {s.convert.binary} is not the pinned goat-transformers {s.convert.version}",
+                  file=sys.stderr)
+            return 1
     taken = set(cfg.tap_ports()) | {"goatrope0"}
     sinks = [Sink(d, taken) for d in s.to]
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
@@ -327,25 +432,28 @@ def run_send(cfg: cfgmod.Config, name: str) -> int:
     while True:
         now = time.time()
         if now - last_hb >= 2:
-            tmp = health + ".new"
-            with open(tmp, "w") as f:
-                json.dump(dict(counts, time=now), f)
-            os.replace(tmp, health)
             last_hb = now
+            try:
+                tmp = health + ".new"
+                with open(tmp, "w") as f:
+                    json.dump(dict(counts, time=now), f)
+                os.replace(tmp, health)
+            except OSError as e:  # a full disk: keep forwarding; check reports the stale heartbeat
+                print(f"heartbeat: {e}", flush=True)
         try:
             frame, addr = sock.recvfrom(65535)
         except socket.timeout:
             continue
         # In inline mode a bridge port also shows each frame it transmits (pkttype OUTGOING);
         # that is the other direction of the link, so it is kept.
-        got = parse(frame, frags)
+        got = parse(frame, frags, s.match)
         if got is None or not matches(s.match, *got[:4]):
             continue
         src, dst, sport, dport, payload = got
         counts["matched"] += 1
         meta = {"feed": name, "time": round(now, 6), "src": src, "dst": dst, "sport": sport, "dport": dport}
         try:
-            out = convert(s.convert, payload) if s.convert else payload
+            out = convert(s.convert, payload, conv_bin) if s.convert else payload
         except (ValueError, subprocess.TimeoutExpired) as e:
             counts["errors"] += 1
             print(f"convert failed: {e}", flush=True)

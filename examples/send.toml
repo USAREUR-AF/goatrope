@@ -22,11 +22,13 @@ to = [
   "udp://198.51.100.20:5000",
   { url = "tcp://198.51.100.21:5001", framing = "len32be" },
   "http://198.51.100.22:8080/ingest",
-  { url = "file:///var/lib/goatrope/send/feed-a.jsonl", format = "jsonl" },
+  { url = "file:///var/lib/goatrope/send/feed-a.jsonl", format = "jsonl", max_mb = 100 },
 ]
 # Optional: convert each payload with a pinned goat-transformers binary first.
 # convert = { component = "goat-transformers", binary = "/usr/local/bin/goat-xf", version = "X.Y.Z",
-#             sha256 = "<64 hex digits of that release's goat-xf>", from = "<format>", to = "<format>" }
+#             sha256 = "<64 hex digits of that release's goat-xf>", from = "<format>", to = "<format>",
+#             packs = "/usr/local/share/goat-transformers/packs" }
+# goatrope starts goat-xf once per message, loading only the two packs it needs.
 
 # Optional: a pinned first-bite decoder that delivers through its own sinks (Zenoh among them).
 # [[decode]]
@@ -39,3 +41,4 @@ to = [
 # filter = "udp and src host 192.0.2.10"
 # dictionary = "/etc/first-bite/dictionaries/<name>"
 # subscribers = "/etc/first-bite/config/subscribers.yml"
+# publishers = "/etc/first-bite/config/publishers.yml"

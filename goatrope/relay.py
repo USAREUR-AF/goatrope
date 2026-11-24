@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 # SPDX-License-Identifier: Apache-2.0
-"""Relay, WORK IN PROGRESS: the smallest case of docs/adr/0003, a fixed-port UDP forwarder.
+"""Relay, WORK IN PROGRESS: the smallest case of docs/adr/0002, a fixed-port UDP forwarder.
 
 A remote machine reaches the relay through a WireGuard interface. WireGuard
 authenticates the remote machine by its key and binds its tunnel address to that
@@ -49,10 +49,23 @@ def preflight(cfg: cfgmod.Config) -> None:
     if ":" not in r.link_address and su.read(f"/proc/sys/net/ipv6/conf/{r.link_interface}/disable_ipv6") != "1":
         raise RelayRefusal(f"IPv6 is on for {r.link_interface}: the kernel would send neighbor discovery and MLD "
                            "frames on the link. Disable it (net.ipv6.conf.<if>.disable_ipv6 = 1) or declare an IPv6 address")
+    fwd = _forwarding(r)
+    if fwd:
+        raise RelayRefusal(f"IP forwarding is on ({', '.join(fwd)}): the kernel would route between the tunnel "
+                           "and the link, around the relay's allow rules. Turn it off for both interfaces "
+                           "(net.ipv4.conf.<if>.forwarding = 0, net.ipv6.conf.<if>.forwarding = 0); a machine "
+                           "that must route (Docker, a mesh router) cannot be the relay")
     addrs = su.addresses(r.link_interface)
     if r.link_address not in addrs:
         raise RelayRefusal(f"{r.link_interface} does not hold {r.link_address} (it has {', '.join(addrs) or 'none'}); "
                            "configure the relay's own address on its interface first")
+
+
+def _forwarding(r: cfgmod.Relay) -> list[str]:
+    on = [f"{fam} on {i}" for i in (r.remote_interface, r.link_interface) for fam in su.forwarding(i)]
+    if su.read("/proc/sys/net/ipv6/conf/all/forwarding") == "1":
+        on.append("ipv6 on all interfaces")  # IPv6 forwards on the global setting, whatever each interface says
+    return on
 
 
 def _bound(dev: str, addr: str, port: int) -> socket.socket:
@@ -78,7 +91,7 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
         remote_sock = _bound(r.remote_interface, "0.0.0.0" if ":" not in rule.remote else "::", rule.listen_port)
         link_sock = _bound(r.link_interface, link_ip, 0)
         st = {"rule": rule, "remote_sock": remote_sock, "link_sock": link_sock, "peer": None,
-              "to_link": 0, "to_remote": 0, "denied": 0}
+              "to_link": 0, "to_remote": 0, "denied": 0, "send_errors": 0}
         sel.register(remote_sock, selectors.EVENT_READ, ("remote", st))
         sel.register(link_sock, selectors.EVENT_READ, ("link", st))
         state.append(st)
@@ -102,17 +115,27 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
                         last_denied_log = time.monotonic()
                     continue
                 st["peer"] = (src, sport)
-                st["link_sock"].sendto(data, (rule.target, rule.target_port))
-                st["to_link"] += 1
+                try:
+                    st["link_sock"].sendto(data, (rule.target, rule.target_port))
+                    st["to_link"] += 1
+                except OSError:  # dropped and counted; the relay keeps running
+                    st["send_errors"] += 1
             else:
                 if rule.direction != "both" or (src, sport) != (rule.target, rule.target_port) or not st["peer"]:
                     st["denied"] += 1
                     continue
-                st["remote_sock"].sendto(data, st["peer"])
-                st["to_remote"] += 1
+                try:
+                    st["remote_sock"].sendto(data, st["peer"])
+                    st["to_remote"] += 1
+                except OSError:  # the tunnel is down or the peer has no endpoint: dropped and counted
+                    st["send_errors"] += 1
         if time.monotonic() - last >= 2:
             _health(state)
             last = time.monotonic()
+            fwd = _forwarding(r)
+            if fwd:
+                print(f"goatrope relay: stopping: IP forwarding was turned on ({', '.join(fwd)})", file=sys.stderr)
+                return 1
     _health(state)
     return 0
 
@@ -120,8 +143,12 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
 def _health(state: list) -> None:
     os.makedirs(os.path.dirname(HEALTH), exist_ok=True)
     rows = [{"listen_port": s["rule"].listen_port, "target": f"{s['rule'].target}:{s['rule'].target_port}",
-             "to_link": s["to_link"], "to_remote": s["to_remote"], "denied": s["denied"]} for s in state]
-    tmp = HEALTH + ".new"
-    with open(tmp, "w") as f:
-        json.dump({"time": time.time(), "rules": rows}, f)
-    os.replace(tmp, HEALTH)
+             "to_link": s["to_link"], "to_remote": s["to_remote"], "denied": s["denied"],
+             "send_errors": s["send_errors"]} for s in state]
+    try:
+        tmp = HEALTH + ".new"
+        with open(tmp, "w") as f:
+            json.dump({"time": time.time(), "rules": rows}, f)
+        os.replace(tmp, HEALTH)
+    except OSError as e:
+        print(f"health: {e}", flush=True)
