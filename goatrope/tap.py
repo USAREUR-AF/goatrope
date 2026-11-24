@@ -392,7 +392,8 @@ def install(cfg: cfgmod.Config, log=print) -> None:
     state = prior_state or {
         "ports": {},
         "networkd": {"enabled": su.unit_enabled("systemd-networkd.service"),
-                     "active": su.unit_active("systemd-networkd.service")},
+                     "active": su.unit_active("systemd-networkd.service"),
+                     "links": _networkd_links()},
         "created_dirs": [],
         "var_lib_private_existed": os.path.isdir("/var/lib/private"),  # systemd makes it for DynamicUser
     }
@@ -450,6 +451,17 @@ def install(cfg: cfgmod.Config, log=print) -> None:
     sendmod.start(cfg, log)
     su.systemctl("daemon-reexec")  # applies the watchdog setting
     _settle(cfg)
+
+
+def _networkd_links() -> list[str]:
+    """The enable links of systemd-networkd and the units enabled with it, under /etc/systemd/system."""
+    out = []
+    for dirpath, dirnames, names in os.walk("/etc/systemd/system"):
+        for n in dirnames + names:
+            p = os.path.join(dirpath, n)
+            if os.path.islink(p) and os.path.basename(os.readlink(p)).startswith("systemd-network"):
+                out.append(p)
+    return sorted(out)
 
 
 def _nm_wait_unmanaged(cfg: cfgmod.Config, seconds: float = 10) -> None:
@@ -558,7 +570,10 @@ def uninstall(purge: bool, log=print) -> None:
         su.run(["ip", "link", "set", p, "up" if prior.get("up") else "down"])
         su.run(["networkctl", "reconfigure", p])
     nd = state.get("networkd", {})
-    if nd.get("enabled") in ("disabled", "masked"):
+    if "links" in nd:  # netplan enables networkd under /run only, so `disable` alone cannot say what to undo
+        for link in set(_networkd_links()) - set(nd["links"]):
+            _remove(link)
+    elif nd.get("enabled") in ("disabled", "masked"):
         su.systemctl("disable", "systemd-networkd.service")
     if nd.get("active") != "active":
         su.systemctl("stop", "systemd-networkd.service", "systemd-networkd.socket")

@@ -55,7 +55,9 @@ bootcmd:
   - [sh, -c, "systemctl disable ssh.socket; systemctl enable ssh.service || true"]
 runcmd:
   - [sh, -c, "systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true"]
-  - [sh, -c, "apt-get install -y linux-modules-extra-\$(uname -r) && modprobe i6300esb || echo watchdog module not loaded"]
+  # the module does not load by itself after a reboot, so a unit loads it at every boot
+  - [sh, -c, "modprobe -n i6300esb || apt-get install -y linux-modules-extra-\$(uname -r) || true"]
+  - [sh, -c, "printf '[Service]\\nType=oneshot\\nExecStart=/sbin/modprobe i6300esb\\n[Install]\\nWantedBy=sysinit.target\\n[Unit]\\nDefaultDependencies=no\\n' > /etc/systemd/system/test-watchdog.service && systemctl daemon-reload && systemctl enable --now test-watchdog.service || echo watchdog module not loaded"]
   - [touch, /root/ready]
   - [sh, -c, "echo GOATROPE-VM-READY > /dev/console"]
 EOF
@@ -81,7 +83,7 @@ wait_vm() { # seconds; the console marker first, so ssh is not tried while the g
         grep -aq GOATROPE-VM-READY "$w/console.log" 2>/dev/null && break
         sleep 10
     done
-    for _ in $(seq 1 60); do
+    for _ in $(seq 1 180); do  # a reboot under emulation on a busy host takes many minutes
         if vm sh -s 2>/dev/null <<'EOF'
 test -f /root/ready || exit 1
 s=$(systemctl is-system-running)
@@ -92,7 +94,7 @@ EOF
         fi
         sleep 10
     done
-    echo "VM did not come up; console:" >&2; tail -30 "$w/console.log" >&2; return 1
+    echo "VM did not come up; console:" >&2; vm 'systemctl list-jobs --no-pager; systemctl is-system-running' >&2 || true; tail -30 "$w/console.log" >&2; return 1
 }
 rc=0
 phase() { vm "GOATROPE_TEST_REAL_WATCHDOG=1 GOATROPE_TEST_MGMT=\$(ip -o route show default | awk '{print \$5; exit}') python3 -I /src/tests/netns/test_tap.py $*" 2>&1 | tee -a "$log" || rc=1; }
@@ -110,7 +112,7 @@ phase refusals inline
 vm 'systemctl reboot' || true
 sleep 30
 wait_vm 1200
-vm 'systemctl show -p RuntimeWatchdogUSec --value; cat /sys/class/watchdog/watchdog0/state 2>/dev/null || true' | sed 's/^/    after reboot: /' | tee -a "$log"
+vm 'systemctl show -p RuntimeWatchdogUSec --value; ls /dev/watchdog* ; cat /sys/class/watchdog/watchdog0/state 2>/dev/null || true' | sed 's/^/    after reboot: /' | tee -a "$log"
 for _ in 1 2 3 4 5; do  # the guest may still be finishing its boot under emulation
     vm 'python3 -I /src/tests/netns/test_tap.py topo-inline' >/dev/null && break
     sleep 30

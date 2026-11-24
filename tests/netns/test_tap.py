@@ -144,7 +144,7 @@ def snapshot() -> dict:
     files = {}
     for root in ("/etc", "/usr/local", "/var/lib"):
         for dp, dn, fn in os.walk(root):
-            if dp.startswith(("/var/lib/systemd", "/var/lib/dpkg", "/var/lib/apt", "/etc/ld.so.cache")):
+            if dp.startswith(("/var/lib/cloud", "/var/lib/systemd", "/var/lib/dpkg", "/var/lib/apt", "/etc/ld.so.cache")):
                 continue
             for d in dn:
                 p = os.path.join(dp, d)
@@ -783,16 +783,17 @@ to = [{{ url = "file:///var/lib/goatrope/send/bounded.jsonl", format = "jsonl", 
     write_cfg(cfg)
     rx = subprocess.Popen([sys.executable, "-c", """
 import socket, threading, json, http.server, struct, sys
+WAIT = int(sys.argv[1])
 got = {"udp": [], "tcp": [], "http": [], "conv": []}
 def udp(port, key):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", port)); s.settimeout(20)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", port)); s.settimeout(WAIT)
     try:
         while True: got[key].append(s.recv(65535).hex())
     except socket.timeout: pass
 def tcp():
-    l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind(("127.0.0.1", 9102)); l.listen(1); l.settimeout(20)
+    l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind(("127.0.0.1", 9102)); l.listen(1); l.settimeout(WAIT)
     try:
-        c, _ = l.accept(); c.settimeout(10); buf = b""
+        c, _ = l.accept(); c.settimeout(WAIT); buf = b""
         while True:
             d = c.recv(65535)
             if not d: break
@@ -807,11 +808,11 @@ class H(http.server.BaseHTTPRequestHandler):
 srv = http.server.HTTPServer(("127.0.0.1", 9103), H); srv.timeout = 1
 ts = [threading.Thread(target=udp, args=(9101, "udp")), threading.Thread(target=udp, args=(9104, "conv")), threading.Thread(target=tcp)]
 [t.start() for t in ts]
-import time; end = time.time() + 20
+import time; end = time.time() + WAIT
 while time.time() < end: srv.handle_request()
 [t.join() for t in ts]
 print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv"][:1], "sample_udp": got["udp"][:1]}))
-"""], stdout=subprocess.PIPE, text=True)
+""", "120" if REAL_WATCHDOG else "20"], stdout=subprocess.PIPE, text=True)
     time.sleep(1)
     p = gr("install", "--config", CFG)
     result(p.returncode == 0, "install listen with two [[send]] sections", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
@@ -835,7 +836,7 @@ print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv
             " pl=b'BIG'+i.to_bytes(4,'big')+b'b'*1400\n"
             " s.send(frame([192,0,2,10],4000+i,struct.pack('!HHHH',40000,5001,8+len(pl),0)+pl)); time.sleep(0.002)\n")
     sh(f"ip netns exec feed python3 -c \"{code}\"")
-    got = json.loads(rx.communicate(timeout=60)[0])
+    got = json.loads(rx.communicate(timeout=600)[0])
     result(got["udp"] == 101, "send: UDP destination got the 100 matching datagrams and 1 reassembled from 2 fragments",
            f"{got['udp']}")
     result(got["tcp"] == 101, "send: TCP destination (len32be) got the same 101", f"{got['tcp']}")
@@ -1011,13 +1012,14 @@ print(replies)
             primed = 0
         if primed:
             break
-    port = next((ln.split()[3].rsplit(":", 1)[1] for ln in sh("ss -Huan").stdout.splitlines()
-                 if ln.split()[3].startswith(("192.0.2.50:", "192.0.2.50%"))), None)
+    # one reply socket per rule, in no fixed order: send to each, the rule with no target on this port denies it
+    port = [int(ln.split()[3].rsplit(":", 1)[1]) for ln in sh("ss -Huan").stdout.splitlines()
+            if ln.split()[3].startswith(("192.0.2.50:", "192.0.2.50%"))]
     allowed = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/allowed.key").read(), capture_output=True,
                              text=True).stdout.strip()
     sh(f"wg set wg0 peer {allowed} remove")
     sh("ip netns exec linkhost python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
-       f"s.bind(('192.0.2.2',7000));[s.sendto(b'late',('192.0.2.50',{port})) for i in range(3)]\"", check=False)
+       f"s.bind(('192.0.2.2',7000));[s.sendto(b'late',('192.0.2.50',p)) for p in {port} for i in range(3)]\"", check=False)
     time.sleep(3)
     health = json.load(open("/var/lib/goatrope/relay.health"))
     errs = sum(r.get("send_errors", 0) for r in health["rules"])
@@ -1251,6 +1253,30 @@ def phase_units() -> None:
         left = sh("tc filter show dev tp0 egress").stdout.strip()
         return p.returncode == q.returncode == 0 and dropped and before == after and not left, (p.returncode, q.returncode, dropped, before == after, left)
     case("uninstall keeps the operator's own tc filters", clsact)
+
+    def networkd():
+        units = "systemd-networkd.service"
+
+        def links():
+            return sh("find /etc/systemd/system -type l -lname '*/systemd-network*' | sort").stdout.split()
+        had = sh(f"systemctl is-enabled {units}", check=False).stdout.strip()
+        sh(f"systemctl disable {units} && systemctl enable --runtime {units}")  # as netplan leaves it
+        before = links()
+        try:
+            topo_listen()
+            write_cfg(LISTEN)
+            stand_in_watchdog()
+            gr("install", "--config", CFG)
+            during = links()
+            gr("uninstall", "--purge")
+            state = sh(f"systemctl is-enabled {units}", check=False).stdout.strip()
+            return len(during) > len(before) and links() == before and state == "enabled-runtime", \
+                (before, during, links(), state)
+        finally:
+            sh(f"systemctl disable --runtime {units}", check=False)
+            if had == "enabled":
+                sh(f"systemctl enable {units}")
+    case("uninstall leaves networkd enabled as it was (under /run only, as netplan does)", networkd)
 
     def previous():
         topo_listen()
