@@ -55,10 +55,11 @@ behind each one. None has been measured with goatrope.
 Behind any of these, listen mode drops every outgoing frame on the tap ports at
 the kernel's egress hook. The one-way property of the link itself belongs to the
 device: a passive copper tap's outputs carry no traffic back into the link at all.
-A root process that sends with `PACKET_QDISC_BYPASS` skips the egress hook (the
-namespace tests record this), so on a mirror port, where a frame sent could reach
-the switch, the drop is a software guarantee for ordinary processes, not a
-physical one.
+A process with `CAP_NET_RAW` (root has it) that sends with `PACKET_QDISC_BYPASS`
+skips the egress hook (the namespace tests record this), so on a mirror port, where
+a frame sent could reach the switch, the drop is a software guarantee for ordinary
+processes, not a physical one. Where transmission onto the link must be impossible,
+use a passive copper tap or a tap device whose monitor ports cannot transmit.
 
 ## Recording rate
 

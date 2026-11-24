@@ -97,7 +97,10 @@ its own address; replies from that target go back to the remote machine.
 | Its own interface | the link side is a plain interface holding the declared address; never a tap port, the tap's bridge, a bridge member or a tunnel |
 | Never with listen | a listen-mode port can never be a relay interface (refused at validation) |
 | Nothing else sent | IPv6 must be off on the link interface when the relay's address is IPv4; otherwise the kernel sends neighbor discovery and MLD frames |
-| No network bridged | no layer-2 forwarding and no routing between the tunnel and the link; only the listed datagrams are re-sent |
+| No network bridged | no layer-2 forwarding and no routing between the tunnel and the link; only the listed datagrams are re-sent. The relay refuses to start, and stops, while IP forwarding is on for either interface (or IPv6 forwarding globally): the kernel would route between them around the rules |
+| One machine per rule | a target that is the relay's own address, the link's network or broadcast address, or a multicast address is refused |
+| Send errors | a datagram the relay cannot send (tunnel down, peer without an endpoint) is dropped and counted in `send_errors`; the relay keeps running |
+| Replies | replies are accepted from the rule's target address and port. A machine on the link that sends from that address and port to the relay's port is relayed as the target would be: the link is not authenticated, only the tunnel is |
 | Logging | one line per rule at start; denied datagrams logged at most every 10 s; counters per rule in `/var/lib/goatrope/relay.health` |
 
 ## Built (WIP)
@@ -119,7 +122,9 @@ and a veth to a "link" namespace:
 | an authenticated peer that is not the rule's remote | denied, logged |
 | datagrams from outside the tunnel to the relay port | 0 forwarded |
 | frames sent on the link | only ARP and the allowed datagrams |
-| refusals: remote side not WireGuard; link interface without the declared address; a target off the link; IPv6 on the link interface | each refused, exit 2 |
+| refusals: remote side not WireGuard; link interface without the declared address; a target off the link; a broadcast target; IPv6 on the link interface; IP forwarding on | each refused, exit 2 |
+| a reply that cannot be sent (the remote peer removed from the WireGuard interface) | counted; the relay keeps running |
+| IP forwarding turned on while it runs | the relay stops, exit 1 |
 
 Not built: TCP, the address-level proxy, a systemd unit, IPv6 targets beyond
 parsing, and rate limits per rule. Not measured: latency, loss and throughput

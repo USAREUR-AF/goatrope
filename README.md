@@ -69,7 +69,7 @@ listen tap with decode-and-send.
 
 | Command | Does |
 |---|---|
-| `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, holds an address, carries the default route, the operator's session or any established connection, or when the ring does not fit on disk |
+| `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, carries a VLAN or other device, holds an address, carries the default route, the operator's session or any established connection (link-local ones included), when the rings (one per recorded port) and file destinations do not fit on disk, or when the state file of an earlier install is unreadable |
 | `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each recorder and its ring, each send and decoder, and the check result |
 | `goatrope check [--json]` | compares the machine with the declaration. Exit **0** matches, **3** differs, anything else is an error (2: invalid or unreadable declaration) |
 | `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
@@ -84,13 +84,20 @@ listen tap with decode-and-send.
 | the `.network` file systemd-networkd applies to each port is goatrope's | yes | yes |
 | one bridge of exactly the two ports, STP off, forward delay 0, ports forwarding | yes | no bridge holds a port |
 | LLDP frames (group address 01:80:C2:00:00:0E) forwarded across the bridge | yes | n/a |
-| every outgoing frame dropped (tc egress `matchall drop`), ARP off; the port goes up only after the drop is in place | n/a | yes |
+| every outgoing frame from an ordinary process dropped (tc egress `matchall drop`), ARP off; the port goes up only after the drop is in place. **A process with `CAP_NET_RAW` (root has it) that sends with `PACKET_QDISC_BYPASS` skips this drop** (the tests show it) | n/a | yes |
 | GRO, LRO, TSO and GSO off; Energy-Efficient Ethernet off; declared speed | yes | yes |
 | recording on a port, not the bridge device, as a bounded tcpdump ring (`files` x `file_mb`) | yes | one ring per port |
 | boot waits for no tap port (`RequiredForOnline=no`; the port service does not block boot) | yes | yes |
+| NetworkManager, where it runs, manages no tap port (`unmanaged-devices+=`, reloaded at install) | yes | yes |
 | hardware watchdog: `RuntimeWatchdogSec=15s`, and a watchdog device present | yes | yes |
 | bridged frames do not pass through iptables (`bridge-nf-call-*` = 0 where present) | yes | n/a |
 | root filesystem encryption | reported, not required | reported, not required |
+
+**Where transmission onto the link must be impossible, use a physically
+receive-only tap**: a passive copper tap, whose outputs have no path back into the
+link, or a tap device whose monitor ports cannot transmit. Listen mode's egress drop
+is software on the goatrope machine; a process with `CAP_NET_RAW` can get past it, and
+on a mirror port a frame that gets past it reaches the switch.
 
 ## Decode-and-send
 
@@ -98,15 +105,26 @@ A `[[send]]` reads frames on one tap port, receive only, reassembles IPv4
 fragments, keeps the UDP datagrams its `match` names (at least one address or
 port is required), optionally converts each payload with a goat-transformers
 binary pinned by SHA-256, and sends it to each destination: `udp://`, `tcp://`
-(`framing = "len32be"` or `"raw"`), `http(s)://` (one POST per message) or
-`file:///var/lib/goatrope/...` (`format = "jsonl"` or `"raw"`). A destination
-whose route leaves through a tap port is refused at install and at send time:
-decode-and-send never transmits on the tapped link. TCP stream reassembly is not
-built.
+(`framing = "len32be"` or `"raw"`), `http(s)://` (one POST per message, redirects
+refused) or `file:///var/lib/goatrope/...` (`format = "jsonl"` or `"raw"`, and
+`max_mb`: the file is cut there and one older file kept). A destination whose
+route leaves through a tap port, or whose name does not resolve, is refused at
+install and at send time: decode-and-send never transmits on the tapped link. TCP
+stream reassembly is not built.
+
+The converter runs `goat-xf convert --packs <packs> --packs-only <from>,<to>` once
+per message. On an amd64 workstation one such run took 0.14 s with the two packs
+(0.7 s with every pack), so a converted feed is limited to a few messages per
+second.
 
 A `[[decode]]` runs a first-bite `mind` binary pinned by SHA-256 on the declared
-ports, with its own dictionary and its own sinks. Zenoh delivery goes only through
-a component's own sink; goatrope opens no Zenoh session.
+ports, with its own dictionary and its own sinks, as its own dynamic user with
+`CAP_NET_RAW` and `CAP_NET_ADMIN` only and a read-only system. Zenoh delivery goes
+only through a component's own sink; goatrope opens no Zenoh session.
+
+A pinned binary is hashed and copied to `/var/lib/goatrope/components/<sha256>`
+in one read, and the copy is what runs: a binary replaced after the check never
+runs, and `check` reports it.
 
 ## Tests
 
@@ -120,25 +138,40 @@ the host's kernel. No hardware is involved. They cover:
 - listen: every injected frame on each of two ports recorded on that port only, and
   no frame reaching the feed side during install, traffic, attempts to send (ping,
   raw sockets) and service restarts;
-- 25 refusals, each changing nothing;
+- install refusals, each changing nothing: among them a VLAN on a port, a TCP
+  connection or SSH session over a port (link-local ones included), rings that do
+  not fit once there is one per port, a recording directory outside goatrope's own,
+  a newline or quote in the filter, and an unreadable state file;
 - `check` exit codes: 3 before install, 0 after, 3 for each induced difference
   (address, GRO, recorder stopped, STP on, ARP on, egress drop removed, a changed
   component binary), 0 when undone, 2 for an invalid or missing declaration;
 - a container restart with the ports appearing after boot: check returns to 0 and
   traffic passes with no one touching it;
 - `uninstall` leaves only the declaration and recordings; `uninstall --purge` leaves
-  the file tree and port state exactly as before install;
-- decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly,
-  and a converter stand-in pinned by hash (not goat-transformers itself);
-- the WIP relay (ADR 0002).
+  the file tree and port state (IPv6 address generation included) exactly as before
+  install;
+- decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, a
+  file destination cut at `max_mb`, and a converter stand-in pinned by hash;
+- `components`, when `GOATROPE_TEST_COMPONENTS` names a directory holding them: the
+  real goat-transformers `goat-xf` converting in a `[[send]]`, and the real
+  first-bite `mind` decoding in a `[[decode]]` as its own user;
+- `networkmanager`, in an image with NetworkManager managing the wired ports:
+  install takes the ports from it at once and leaves the management port alone,
+  and uninstall gives them back;
+- the WIP relay (ADR 0002): default deny, refusals, IP forwarding, send errors.
 
-Known limits the tests record: a root process sending with `PACKET_QDISC_BYPASS`
-skips the listen-mode egress drop; stopping a recorder can lose up to the last
-second of frames that tcpdump had not yet written.
+`tests/arm64/run.sh 24.04|26.04` runs the same phases in an emulated arm64 Ubuntu VM
+(the Ubuntu arm64 cloud image under qemu-system-aarch64, inside a container), with an
+emulated i6300esb watchdog, so `check` reads a real `/dev/watchdog0`. Emulation shows
+that the arm64 packages behave as the amd64 ones; it says nothing about a Raspberry
+Pi's timing or its USB adapters.
 
-Not tested: real hardware, real watchdog devices (a stand-in file is used), forced
-link speed (veth cannot be forced), arm64 (the host is amd64), first-bite and
-goat-transformers binaries, and recording throughput.
+Known limits the tests record: a process with `CAP_NET_RAW` sending with
+`PACKET_QDISC_BYPASS` skips the listen-mode egress drop; stopping a recorder can
+lose up to the last second of frames that tcpdump had not yet written.
+
+Not tested: real hardware (a Raspberry Pi, USB adapters, a passive tap), the Pi's
+own watchdog, forced link speed (veth cannot be forced), and recording throughput.
 
 ## Layout
 
