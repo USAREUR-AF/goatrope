@@ -8,6 +8,8 @@
 #   tests/arm64/run.sh 24.04|26.04
 #   IMAGES=<dir>  where the cloud images are kept (default ~/.cache/goatrope-arm64)
 #   OUT=<dir>     where the logs go (default ./test-results)
+#   WATCHDOG_ACTION=none|reset  what qemu does when the watchdog expires (default none: it is
+#                 logged to ubuntu-<v>-arm64.qemu.log; emulated daemon-reloads can take over 10 s)
 #
 # Slow: emulation runs several times slower than the hardware. It shows that the arm64
 # packages (Python, tcpdump, iproute2, systemd) behave as the amd64 ones do; it does not
@@ -63,7 +65,7 @@ runcmd:
 EOF
 
 docker build -q -t goatrope-qemu-arm64 "$here" >/dev/null
-docker run -d --name "$c" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.img:ro" goatrope-qemu-arm64 sh -c '
+docker run -d --name "$c" -e WATCHDOG_ACTION="${WATCHDOG_ACTION:-none}" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.img:ro" goatrope-qemu-arm64 sh -c '
   set -e
   qemu-img create -q -f qcow2 -F qcow2 -b /base.img /w/disk.qcow2 16G
   cloud-localds --network-config /w/network-config /w/seed.img /w/user-data /w/meta-data
@@ -73,7 +75,7 @@ docker run -d --name "$c" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.i
     -drive if=pflash,format=raw,file=/w/vars.fd \
     -drive if=virtio,file=/w/disk.qcow2 -drive if=virtio,format=raw,file=/w/seed.img \
     -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0,romfile= \
-    -device i6300esb -watchdog-action reset -trace watchdog_perform_action \
+    -device i6300esb -watchdog-action "$WATCHDOG_ACTION" -trace watchdog_perform_action \
     -display none -serial file:/w/console.log' >/dev/null
 
 vm() { docker exec -i "$c" ssh -o LogLevel=ERROR -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \

@@ -19,7 +19,7 @@ measured with goatrope.
 | Tap ports | two wired Ethernet ports: the built-in port and a USB 3 adapter, or two USB 3 adapters |
 | Management | a third interface: Wi-Fi, or a third Ethernet port (a USB adapter) on a separate network. A wired management port with DHCP is easier to reach than Wi-Fi when the machine is moved |
 | Storage | room for the recording ring you declare (`files` x `file_mb`), with 10% to spare; `install` refuses a ring that does not fit |
-| Watchdog | the Pi's hardware watchdog (`/dev/watchdog0`); `check` fails without a watchdog device. goatrope has not yet been run on a Pi, so the device's presence under Ubuntu is unverified here |
+| Watchdog | the Pi's hardware watchdog (`/dev/watchdog0`); `check` fails without a watchdog device. goatrope has not yet been run on a Pi, so the device's presence under Ubuntu is unverified here. A machine too slow for systemd to feed it within 15 s is reset: time `systemctl daemon-reload` on the hardware first (0.3 s in an amd64 VM; 13 s in an emulated arm64 one, which the watchdog did reset) |
 | Packages | `tcpdump`, `ethtool`, `iproute2`, `systemd-networkd` (part of Ubuntu Server) |
 
 **Inline on a Pi is fail-closed.** In inline mode the Pi bridges its two ports and
