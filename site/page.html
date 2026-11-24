@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goatrope</title>
-<meta name="description" content="One small computer with two Ethernet ports: a tap, a relay, or one end of a wormhole between sites.">
+<meta name="description" content="One small computer with two Ethernet ports: a tap that records the link, or a relay onto it.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%23093f46' stroke-width='11'/%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%2338a59d' stroke-width='8' stroke-dasharray='5 3'/%3E%3C/svg%3E">
 <style>
 /* Laid rope on a sea-fog ground. Rope is the one ornament: the name is tied in it, links are made of
@@ -115,11 +115,11 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
   <h1>{{wordmark}}</h1>
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
-    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap, a relay, or one end of a wormhole between sites. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. A wormhole that joins distant sites is in progress, and is not in 0.1.0. One file declares what it does. It runs with nothing else of ours installed.</p></div>
     <div class="acts"><a class="btn main" href="https://github.com/USAREUR-AF/goatrope">See it on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
-    <figcaption><b>The wormhole, work in progress.</b> Each end answers on its own link for the machines at the other. The two sensor sites above use the same subnet and the same sensor address, and the controller still reaches each at an address of its own. Addresses are documentation addresses. Do not use it to control real equipment yet.</figcaption></figure>
+    <figcaption><b>The wormhole, work in progress, not in 0.1.0.</b> Each end answers on its own link for the machines at the other. The two sensor sites above use the same subnet and the same sensor address, and the controller still reaches each at an address of its own. Addresses are documentation addresses. Do not use it to control real equipment yet.</figcaption></figure>
 </div></div>
 
 <div class="wrap"><div class="strip">
@@ -131,7 +131,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
 
 <section id="roles"><div class="wrap">
   <h2>Three roles on one link</h2>
-  <p class="sub">Each role is off unless the file declares it. The wormhole above is the fourth, for links that are far apart.</p>
+  <p class="sub">Each role is off unless the file declares it.</p>
   <div class="roles">
     <div>{{role-tap}}<h3>Tap</h3><p>Records the link to a bounded ring of capture files, inline or from a copy.</p><p class="st">Built. Tested in network namespaces on Ubuntu 24.04 and 26.04.</p></div>
     <div>{{role-send}}<h3>Decode and send</h3><p>Takes the tap's copy, keeps the datagrams you name, and delivers them. It never sends on the tapped link.</p><p class="st">Built. Tested the same way.</p></div>
@@ -158,7 +158,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
       <div class="box" data-box="command"><header>On the machine<button class="copybtn" type="button" data-copy="cmd">Copy</button></header><pre id="cmd" data-box="command"><span class="ln">sudo ./bin/goatrope install --config /etc/goatrope/goatrope.toml</span></pre></div>
       <ol class="steps" style="margin-top:24px">
         <li>Ubuntu Server 24.04 or 26.04, reached over a third interface. <code>sudo apt-get install -y tcpdump ethtool</code></li>
-        <li>Download <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">release 0.1.0</a>, check it with <code>sha256sum -c SHA256SUMS</code>, unpack it, and change into its directory.</li>
+        <li>Download <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">release 0.1.0</a>, check its signature with the <code>cosign</code> command in <a href="https://github.com/USAREUR-AF/goatrope/blob/main/.github/workflows/release.yml">release.yml</a> and its contents with <code>sha256sum -c SHA256SUMS</code>, unpack it, and change into its directory.</li>
         <li>Fill in the declaration from <a href="https://github.com/USAREUR-AF/goatrope/blob/main/examples/listen-copper-tap.toml">an example</a>.</li>
         <li>Cable the link, then run the command above.</li>
         <li><code>sudo goatrope check</code> exits 0 when the machine matches the file, and 3 when anything differs.</li>
@@ -178,7 +178,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
     <p class="cap"><a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/hardware.md">hardware.md</a> has the tap devices and their limits.</p></div>
   <div><h2>Safety properties</h2>
     <ul class="safe">
-      <li><b>Default deny.</b> The relay and the wormhole carry only what a rule names. Both refuse to run while the kernel would route around them.</li>
+      <li><b>Default deny.</b> The relay carries only what a rule names, and refuses to run while the kernel would route around it.</li>
       <li><b>No egress from a listen port.</b> The drop is in place before the port goes up, and <code>check</code> reads it.</li>
       <li><b>A refusal changes nothing.</b> Tests compare the files and ports before and after each one.</li>
       <li><b>Pinned components.</b> A decoder or converter is hashed and copied in one read, and the copy is what runs.</li>
@@ -187,7 +187,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
     </ul></div>
 </div></div></section>
 </main>
-<footer><div class="wrap"><p>Written by U.S. Federal government employees. Public domain in the U.S., Apache License 2.0 elsewhere.</p><p><a href="https://github.com/USAREUR-AF/goatrope/blob/main/README.md">README</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/adr/0001-goatrope-is-its-own-repository.md">Why it is its own repository</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/SECURITY.md">Report a vulnerability</a></p></div></footer>
+<footer><div class="wrap"><p>Portions written by U.S. Federal government employees within the scope of their employment are in the public domain in the United States. Apache License 2.0.</p><p><a href="https://github.com/USAREUR-AF/goatrope/blob/main/README.md">README</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/adr/0001-goatrope-is-its-own-repository.md">Why it is its own repository</a> &nbsp; <a href="https://github.com/USAREUR-AF/goatrope/blob/main/SECURITY.md">Report a vulnerability</a></p></div></footer>
 <script>
 (function () {
   document.documentElement.classList.add('js');
