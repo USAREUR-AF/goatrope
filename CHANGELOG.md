@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- landing page (site/) and its Pages workflow.
+
 ## 0.1.0 (2026-11-24)
 
 - tap: inline and listen modes; install, status, check (exit 0 / 3), uninstall.

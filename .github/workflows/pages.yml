@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# The landing page (site/index.html) on GitHub Pages. A pull request checks it. A push to main checks
+# it and deploys it when Pages is enabled with Settings > Pages > Source set to "GitHub Actions";
+# until then it passes with a notice and nothing is deployed.
+name: pages
+
+on:
+  pull_request:
+    paths: ['site/**', 'tests/netns/test_tap.py', 'goatrope/**', '.github/workflows/pages.yml']
+  push:
+    branches: [main]
+    paths: ['site/**', 'tests/netns/test_tap.py', 'goatrope/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      deploy: ${{ steps.pages.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: The page is current, and its numbers, quotes and links hold
+        run: python3 -I site/build.py --check
+      - name: Nothing is cut off at 1440 or 390 px
+        run: |
+          mkdir _site && cp site/index.html _site/
+          python3 site/fitcheck.py _site index.html
+      - name: Is GitHub Pages enabled
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          deploy=false
+          if [ "$EVENT" != pull_request ] && [ "$REF" = refs/heads/main ]; then
+            if gh api "repos/${GITHUB_REPOSITORY}/pages" > /dev/null 2>&1; then deploy=true
+            else echo "::notice::GitHub Pages is not enabled; the page was checked and not deployed."; fi
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+      - if: steps.pages.outputs.deploy == 'true'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - if: steps.pages.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.deploy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
