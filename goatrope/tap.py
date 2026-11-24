@@ -349,8 +349,8 @@ def _load_state() -> dict | None:
         except (OSError, ValueError):
             continue
     raise Refusal(f"{STATE} is unreadable or empty (a power cut during install?) and has no readable "
-                  f"previous copy; goatrope will not guess what to restore. Inspect it, then remove it and "
-                  "restore the ports by hand, or reinstall over it")
+                  f"previous copy; goatrope will not guess what to restore. Inspect it, restore the "
+                  "ports by hand, then remove it")
 
 
 def _install_software() -> None:

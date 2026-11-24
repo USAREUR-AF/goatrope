@@ -41,13 +41,23 @@ def write_file(path: str, content: str, mode: int = 0o644) -> None:
     tmp = os.path.join(d, f".{os.path.basename(path)}.goatrope-new")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
     try:
-        os.write(fd, content.encode("utf-8"))
+        write_all(fd, content.encode("utf-8"))
         os.fchmod(fd, mode)
         os.fsync(fd)
+    except OSError:
+        os.unlink(tmp)  # a full disk: the old file stays, and no half-written one is left beside it
+        raise
     finally:
         os.close(fd)
     os.replace(tmp, path)
     fsync_dir(d)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """os.write may write less than asked (a disk that fills); the next call then raises ENOSPC."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
 
 
 def fsync_dir(d: str) -> None:

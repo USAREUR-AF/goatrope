@@ -73,10 +73,14 @@ def result(ok: bool | None, name: str, detail: str = "") -> None:
         FAILED.append(name)
 
 
+# The management interface: eth0 in the container; a VM keeps its NIC's own name and sets this.
+MGMT = os.environ.get("GOATROPE_TEST_MGMT", "eth0")
+
+
 def write_cfg(text: str, path: str = CFG) -> str:
     os.makedirs(WORK, exist_ok=True)
     with open(path, "w") as f:
-        f.write(text)
+        f.write(text.replace('"eth0"', f'"{MGMT}"'))
     return path
 
 
@@ -368,7 +372,7 @@ def phase_refusals() -> None:
     held = []
 
     def hold_tcp():
-        mgmt = sh("ip -4 -o addr show dev eth0").stdout.split()[3].split("/")[0]
+        mgmt = sh(f"ip -4 -o addr show dev {MGMT}").stdout.split()[3].split("/")[0]
         sh("sysctl -qw net.ipv6.conf.tp0.disable_ipv6=1; ip link set tp0 up")
         sh(f"ip route add 192.0.2.1/32 dev tp0 src {mgmt}")
         sh(f"ip -n a route add {mgmt}/32 dev a0")
@@ -389,7 +393,7 @@ def phase_refusals() -> None:
             proc.kill()
             proc.wait()
         held.clear()
-        mgmt = sh("ip -4 -o addr show dev eth0").stdout.split()[3].split("/")[0]
+        mgmt = sh(f"ip -4 -o addr show dev {MGMT}").stdout.split()[3].split("/")[0]
         sh("ip route del 192.0.2.1/32 dev tp0", check=False)
         sh(f"ip -n a route del {mgmt}/32 dev a0", check=False)
         sh("ip link set tp0 down; sysctl -qw net.ipv6.conf.tp0.disable_ipv6=0")
@@ -1139,6 +1143,128 @@ PHASES["components"] = phase_components
 def nm_states() -> dict[str, str]:
     out = sh("nmcli -t -f DEVICE,STATE device", check=False).stdout
     return dict(ln.rsplit(":", 1) for ln in out.splitlines() if ":" in ln)
+
+
+def phase_units() -> None:
+    """Fixes that need no tap: each case calls the code directly. A crash is that case's failure."""
+    sys.path.insert(0, SRC)
+    import http.server
+    import threading
+    from goatrope import config as cm, send as sm, sysutil as su, tap as tm
+
+    def case(name, fn):
+        try:
+            ok, detail = fn()
+        except Exception as e:
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        result(bool(ok), "units: " + name, str(detail)[:300])
+
+    def full_disk():
+        os.makedirs("/mnt/small", exist_ok=True)
+        sh("mount -t tmpfs -o size=64k tmpfs /mnt/small")
+        try:
+            su.write_file("/mnt/small/f", "good")
+            try:
+                su.write_file("/mnt/small/f", "x" * 200000)
+                return False, "no error"
+            except OSError as e:
+                left = os.listdir("/mnt/small")
+                return open("/mnt/small/f").read() == "good" and left == ["f"], f"errno {e.errno}, {left}"
+        finally:
+            sh("umount /mnt/small")
+    case("a full disk leaves the old file whole", full_disk)
+
+    def redirect():
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302); self.send_header("Location", "http://127.0.0.1:9206/x"); self.end_headers()
+
+            def do_GET(self):
+                hits.append(1); self.send_response(200); self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 9206), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        d = cm.Destination("http://127.0.0.1:9206/in", "http", "127.0.0.1", 9206, "/in", None, None)
+        try:
+            sm.Sink(d, set()).send(b"x", {"feed": "f"})
+            return False, f"followed, {len(hits)} GET"
+        except OSError as e:
+            return not hits, e
+        finally:
+            srv.shutdown()
+    case("an HTTP redirect is refused", redirect)
+
+    def fragments():
+        f = sm.Fragments()
+        for i in range(250):
+            for j in range(40):
+                f.add(("a", "b", i), j * 1480, True, b"x" * 1480)
+        held = sum(len(x) for e in f.pending.values() for x in e["parts"].values())
+        return held <= 4 << 20, f"{held} bytes held of {250 * 40 * 1480} sent"
+    case("fragment reassembly holds at most 4 MiB", fragments)
+
+    def routes():
+        sh("ip link add dr0 type dummy && ip addr add 203.0.113.1/24 dev dr0 && ip link set dr0 up")
+        sh("ip link add dr1 type dummy && ip addr add 203.0.113.129/25 dev dr1 && ip link set dr1 up")
+        try:
+            sh("ip route add default dev dr0 table 77")
+            a = su.default_route_devs()
+            sh("ip route add default table 78 nexthop dev dr0 nexthop dev dr1")
+            b = su.default_route_devs()
+            return "dr0" in a and "dr1" in b, (a, b)
+        finally:
+            sh("ip link del dr0; ip link del dr1", check=False)
+    case("default routes in other tables and ECMP next hops are seen", routes)
+
+    def backup():
+        os.makedirs("/var/lib/goatrope")
+        try:
+            tm._save_state({"ports": {"a": 1}})
+            tm._save_state({"ports": {"a": 2}})
+            open(tm.STATE, "w").close()
+            return tm._load_state() == {"ports": {"a": 1}}, "previous copy used"
+        finally:
+            shutil.rmtree("/var/lib/goatrope")
+    case("an empty state file falls back to the previous copy", backup)
+
+    def dashes():
+        c = cm.parse(INLINE.replace('filter = ""', 'filter = "-c1"'))
+        a = tm.recorder_argv(c, "tp0")
+        r = subprocess.run(["tcpdump", "-d", "-i", "lo"] + a[a.index("--"):], capture_output=True, text=True)
+        return r.returncode != 0 and "syntax error" in r.stderr, r.stderr.strip()[-120:]
+    case("a filter that looks like an option reaches tcpdump as a filter", dashes)
+
+    def clsact():
+        topo_listen()
+        sh("tc qdisc add dev tp0 clsact && tc filter add dev tp0 ingress pref 9 matchall action pass")
+        before = sh("tc filter show dev tp0 ingress").stdout
+        write_cfg(LISTEN)
+        stand_in_watchdog()
+        p = gr("install", "--config", CFG)
+        dropped = "drop" in sh("tc filter show dev tp0 egress").stdout
+        q = gr("uninstall", "--purge")
+        after = sh("tc filter show dev tp0 ingress").stdout
+        left = sh("tc filter show dev tp0 egress").stdout.strip()
+        return p.returncode == q.returncode == 0 and dropped and before == after and not left, (p.returncode, q.returncode, dropped, before == after, left)
+    case("uninstall keeps the operator's own tc filters", clsact)
+
+    def previous():
+        topo_listen()
+        write_cfg(LISTEN)
+        gr("install", "--config", CFG)
+        write_cfg(LISTEN.replace("files = 4", "files = 5"))
+        gr("install", "--config", CFG)
+        kept = open("/etc/goatrope/goatrope.toml.prev").read()
+        gr("uninstall", "--purge")
+        return "files = 4" in kept and not os.path.exists("/etc/goatrope"), "kept, then purged"
+    case("a replaced declaration is kept as .prev", previous)
+
+
+PHASES["units"] = phase_units
 
 
 def phase_networkmanager() -> None:

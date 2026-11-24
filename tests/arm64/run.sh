@@ -38,8 +38,7 @@ cat > "$w/network-config" <<'EOF'
 version: 2
 ethernets:
   mgmt:
-    match: {driver: virtio_net}
-    set-name: eth0
+    match: {name: "en*"}
     dhcp4: true
 EOF
 cat > "$w/user-data" <<EOF
@@ -52,7 +51,8 @@ package_update: true
 packages: [tcpdump, ethtool, python3, iputils-ping, wireguard-tools, dbus]
 bootcmd:
   # sshd as a plain service: socket activation stops accepting after a burst of early connections
-  - [sh, -c, "systemctl disable --now ssh.socket; systemctl enable ssh.service; systemctl start ssh.service || true"]
+  # (enable only: starting a unit from inside cloud-init waits on cloud-init itself)
+  - [sh, -c, "systemctl disable ssh.socket; systemctl enable ssh.service || true"]
 runcmd:
   - [sh, -c, "systemctl disable --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true"]
   - [sh, -c, "apt-get install -y linux-modules-extra-\$(uname -r) && modprobe i6300esb || echo watchdog module not loaded"]
@@ -74,7 +74,7 @@ docker run -d --name "$c" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.i
     -device i6300esb -watchdog-action reset \
     -display none -serial file:/w/console.log' >/dev/null
 
-vm() { docker exec -i "$c" ssh -q -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+vm() { docker exec -i "$c" ssh -o LogLevel=ERROR -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
          -o ConnectTimeout=120 -o ServerAliveInterval=30 root@127.0.0.1 "$@"; }
 wait_vm() { # seconds; the console marker first, so ssh is not tried while the guest is still booting
     for _ in $(seq 1 $(($1 / 10))); do
@@ -95,7 +95,7 @@ EOF
     echo "VM did not come up; console:" >&2; tail -30 "$w/console.log" >&2; return 1
 }
 rc=0
-phase() { vm "GOATROPE_TEST_REAL_WATCHDOG=1 python3 -I /src/tests/netns/test_tap.py $*" 2>&1 | tee -a "$log" || rc=1; }
+phase() { vm "GOATROPE_TEST_REAL_WATCHDOG=1 GOATROPE_TEST_MGMT=\$(ip -o route show default | awk '{print \$5; exit}') python3 -I /src/tests/netns/test_tap.py $*" 2>&1 | tee -a "$log" || rc=1; }
 
 wait_vm 2400
 tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ -cf - . | vm 'mkdir -p /src && tar -C /src --no-same-owner -xf - && chmod -R go+rX /src'
@@ -110,10 +110,13 @@ phase refusals inline
 vm 'systemctl reboot' || true
 sleep 30
 wait_vm 1200
-vm 'systemctl show -p RuntimeWatchdogUSec --value; cat /sys/class/watchdog/watchdog0/state 2>/dev/null' | sed 's/^/    after reboot: /' | tee -a "$log"
-vm 'python3 -I /src/tests/netns/test_tap.py topo-inline' >/dev/null
+vm 'systemctl show -p RuntimeWatchdogUSec --value; cat /sys/class/watchdog/watchdog0/state 2>/dev/null || true' | sed 's/^/    after reboot: /' | tee -a "$log"
+for _ in 1 2 3 4 5; do  # the guest may still be finishing its boot under emulation
+    vm 'python3 -I /src/tests/netns/test_tap.py topo-inline' >/dev/null && break
+    sleep 30
+done
 phase reboot-verify uninstall
-phase listen uninstall send relay uninstall
+phase listen uninstall send relay uninstall units
 vm 'cat /root/gt/results.jsonl' > "$out/ubuntu-$v-arm64.results.jsonl" 2>/dev/null || true
 echo "log: $log"
 exit $rc

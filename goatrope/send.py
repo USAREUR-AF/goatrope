@@ -58,7 +58,7 @@ def install_component(binary: str, sha: str) -> str | None:
         tmp = dest + ".new"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o555)
         try:
-            os.write(fd, data)
+            su.write_all(fd, data)
             os.fchmod(fd, 0o555)
             os.fsync(fd)
         finally:

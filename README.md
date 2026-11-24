@@ -158,9 +158,12 @@ the host's kernel. No hardware is involved. They cover:
 - `networkmanager`, in an image with NetworkManager managing the wired ports:
   install takes the ports from it at once and leaves the management port alone,
   and uninstall gives them back;
-- the WIP relay (ADR 0002): default deny, refusals, IP forwarding, send errors.
+- the WIP relay (ADR 0002): default deny, refusals, IP forwarding, send errors;
+- `units`: a full disk, HTTP redirects, the reassembly bound, default routes in other
+  tables, the state backup, and the operator's own tc filters kept.
 
-`tests/arm64/run.sh 24.04|26.04` runs the same phases in an emulated arm64 Ubuntu VM
+`tests/arm64/run.sh 24.04|26.04` runs the same phases, except `components` and
+`networkmanager`, in an emulated arm64 Ubuntu VM
 (the Ubuntu arm64 cloud image under qemu-system-aarch64, inside a container), with an
 emulated i6300esb watchdog, so `check` reads a real `/dev/watchdog0`. Emulation shows
 that the arm64 packages behave as the amd64 ones; it says nothing about a Raspberry
