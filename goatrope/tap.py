@@ -9,6 +9,7 @@ restores the interface settings it saved before changing them.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -628,7 +629,6 @@ def uninstall(purge: bool, log=print) -> None:
         shutil.rmtree(LIB)
     _remove(BIN)
     # verified component copies, and the state systemd kept for the decoders' dynamic users
-    import glob
     for d in [f"{STATE_DIR}/components"] + glob.glob("/var/lib/private/goatrope-decode-*"):
         shutil.rmtree(d, ignore_errors=True)
     for link in glob.glob("/var/lib/goatrope-decode-*"):
@@ -655,7 +655,7 @@ def uninstall(purge: bool, log=print) -> None:
     _remove(STATE)
     _remove(STATE + ".bak")
     if purge:
-        for f in (f"{STATE_DIR}/relay.health",):
+        for f in [f"{STATE_DIR}/relay.health"] + glob.glob(f"{STATE_DIR}/wormhole-*.health"):
             _remove(f)
     # Directories install created, deepest first, when empty.
     for d in sorted(state.get("created_dirs", []), key=len, reverse=True):
@@ -680,7 +680,8 @@ def _purge_leftovers(log=print) -> None:
         if os.path.isdir(d):
             shutil.rmtree(d)
             removed.append(d)
-    for f in (f"{ETC}/goatrope.toml", f"{ETC}/goatrope.toml.prev", f"{STATE_DIR}/relay.health"):
+    for f in (f"{ETC}/goatrope.toml", f"{ETC}/goatrope.toml.prev", f"{STATE_DIR}/relay.health",
+              *glob.glob(f"{STATE_DIR}/wormhole-*.health")):
         if os.path.exists(f):
             _remove(f)
             removed.append(f)

@@ -9,6 +9,7 @@
   goatrope uninstall [--purge]                 remove everything install wrote and restore the ports
   goatrope validate  [--config PATH]           check the declaration alone, without touching the machine
   goatrope relay     [--config PATH]           run the relay (WIP; see docs/adr/0002)
+  goatrope wormhole  [--config PATH]           run the wormhole (WIP; see docs/adr/0003)
 
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 """
@@ -40,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--version", action="version", version=f"goatrope {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("install", "status", "check", "validate", "relay", "apply-ports"):
+    for name in ("install", "status", "check", "validate", "relay", "wormhole", "apply-ports"):
         p = sub.add_parser(name)
         p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
         if name == "check":
@@ -75,8 +76,12 @@ def main(argv: list[str] | None = None) -> int:
             from . import relay
             _need_root()
             return relay.run(cfg)
+        if a.cmd == "wormhole":
+            from . import wormhole
+            _need_root()
+            return wormhole.run(cfg)
         if cfg.tap is None:
-            print("goatrope: this declaration has no [tap]; only `goatrope relay` applies", file=sys.stderr)
+            print("goatrope: this declaration has no [tap]; only `goatrope relay` or `goatrope wormhole` applies", file=sys.stderr)
             return EXIT_REFUSED
         if a.cmd == "install":
             _need_root()

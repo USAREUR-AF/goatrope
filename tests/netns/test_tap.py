@@ -1541,6 +1541,452 @@ def phase_deploy() -> None:
 PHASES["deploy"] = phase_deploy
 
 
+# ---------------------------------------------------------------- wormhole (ADR 0003)
+
+# One controller site and two sensor sites whose links use the SAME subnet and the same machine address.
+WH_CTL = """schema = 1
+[wormhole]
+wip = true
+link_interface = "wc"
+link_address = "192.0.2.50/24"
+[[wormhole.peer]]
+name = "sensor-1"
+interface = "wg1"
+address = "10.99.1.2"
+heartbeat_port = 7100
+claim = ["192.0.2.101"]
+out = [
+  { protocol = "udp", from = "192.0.2.10", at = "192.0.2.101", port = 6000, tunnel_port = 7201, replies = true },
+  { protocol = "tcp", from = "192.0.2.10", at = "192.0.2.101", port = 6001, tunnel_port = 7202 },
+]
+in = [
+  { protocol = "udp", tunnel_port = 7203, as = "192.0.2.101", to = "192.0.2.10", port = 6100, replies = false },
+  { protocol = "tcp", tunnel_port = 7204, as = "192.0.2.101", to = "192.0.2.10", port = 6101 },
+]
+[[wormhole.peer]]
+name = "sensor-2"
+interface = "wg2"
+address = "10.99.2.2"
+heartbeat_port = 7100
+claim = ["192.0.2.102"]
+out = [
+  { protocol = "udp", from = "192.0.2.10", at = "192.0.2.102", port = 6000, tunnel_port = 7201, replies = true },
+  { protocol = "tcp", from = "192.0.2.10", at = "192.0.2.102", port = 6001, tunnel_port = 7202 },
+]
+in = [
+  { protocol = "udp", tunnel_port = 7203, as = "192.0.2.102", to = "192.0.2.10", port = 6100, replies = false },
+  { protocol = "tcp", tunnel_port = 7204, as = "192.0.2.102", to = "192.0.2.10", port = 6101 },
+]
+"""
+
+WH_SENSOR = """schema = 1
+[wormhole]
+wip = true
+link_interface = "ws@N@"
+link_address = "198.51.100.50/24"
+[[wormhole.peer]]
+name = "controller"
+interface = "wg0"
+address = "10.99.@N@.1"
+heartbeat_port = 7100
+claim = ["198.51.100.200"]
+in = [
+  { protocol = "udp", tunnel_port = 7201, as = "198.51.100.200", to = "198.51.100.10", port = 6000, replies = true },
+  { protocol = "tcp", tunnel_port = 7202, as = "198.51.100.200", to = "198.51.100.10", port = 6001 },
+]
+out = [
+  { protocol = "udp", from = "198.51.100.10", at = "198.51.100.200", port = 6100, tunnel_port = 7203, replies = false },
+  { protocol = "tcp", from = "198.51.100.10", at = "198.51.100.200", port = 6101, tunnel_port = 7204 },
+]
+"""
+
+WH_HOST = r"""
+import socket, sys, threading, json, hashlib
+addr, name, ports = sys.argv[1], sys.argv[2], [int(x) for x in sys.argv[3].split(",")]
+log = open(sys.argv[4], "a", buffering=1)
+def udp(p):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(1, 2, 1); s.bind((addr, p))
+    while True:
+        d, a = s.recvfrom(65535)
+        if not d.startswith(b"lat"): log.write(json.dumps(["udp", p, list(a), len(d), d[:40].decode()]) + "\n")
+        s.sendto(name.encode() + b":" + d, a)
+def one(c, a, p):
+    c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    h, n = hashlib.sha256(), 0
+    first = c.recv(4, socket.MSG_WAITALL)
+    if first == b"echo":
+        try:
+            while (d := c.recv(65536)): c.sendall(d)
+        except ConnectionResetError: pass
+        c.close(); return
+    h.update(first); n = len(first)
+    while (d := c.recv(65536)): h.update(d); n += len(d)
+    log.write(json.dumps(["tcp", p, list(a), n, h.hexdigest()]) + "\n")
+    c.sendall(name.encode() + b":" + h.hexdigest().encode()); c.close()
+def tcp(p):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((addr, p)); s.listen(8)
+    while True:
+        c, a = s.accept(); threading.Thread(target=one, args=(c, a, p), daemon=True).start()
+for p in ports:
+    threading.Thread(target=udp if p % 2 == 0 else tcp, args=(p,), daemon=True).start()
+threading.Event().wait()
+"""
+
+WH_CLIENT = r"""
+import socket, sys, time, json, os, hashlib
+what, src, dst, port = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+if what == "udp":  # <size> [source port]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(1, 2, 1); s.bind((src, int(sys.argv[6]) if len(sys.argv) > 6 else 0)); s.settimeout(1.5)
+    d = (b"hello" + b"x" * 65536)[:int(sys.argv[5])]
+    s.sendto(d, (dst, port))
+    try:
+        r, a = s.recvfrom(65535); print(json.dumps([r[:7].decode(), len(r), list(a)]))
+    except (TimeoutError, OSError) as e: print(json.dumps([type(e).__name__]))
+elif what == "tcp":  # <bytes>
+    s = socket.socket(); s.settimeout(60); s.bind((src, 0))
+    try:
+        s.connect((dst, port)); d = os.urandom(int(sys.argv[5])); s.sendall(d); s.shutdown(socket.SHUT_WR); r = b""
+        while (x := s.recv(4096)): r += x
+        print(json.dumps([r.decode(), hashlib.sha256(d).hexdigest()]))
+    except OSError as e: print(json.dumps([type(e).__name__, str(e)]))
+elif what == "lat":  # <count>: round trips in microseconds
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((src, 0)); s.connect((dst, port)); s.settimeout(2); t = []; lost = 0
+    for i in range(int(sys.argv[5])):
+        a = time.perf_counter_ns(); s.send(b"lat%d" % i)
+        try: s.recv(2048); t.append((time.perf_counter_ns() - a) / 1000)
+        except TimeoutError: lost += 1
+        time.sleep(0.002)
+    print(json.dumps([t, lost]))
+elif what == "lattcp":
+    s = socket.socket(); s.bind((src, 0)); s.connect((dst, port)); s.settimeout(5); t = []
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1); s.sendall(b"echo"); time.sleep(0.2)
+    for i in range(int(sys.argv[5])):
+        a = time.perf_counter_ns(); s.sendall(b"x" * 64); n = 0
+        while n < 64: n += len(s.recv(64 - n))
+        t.append((time.perf_counter_ns() - a) / 1000); time.sleep(0.002)
+    print(json.dumps([t, 0]))
+elif what == "hold":  # a TCP connection kept open; prints when it ends
+    s = socket.socket(); s.bind((src, 0)); s.connect((dst, port)); s.sendall(b"echoabc"); s.recv(3); print("open", flush=True); s.settimeout(40); t = time.time()
+    try: r = s.recv(10); print("eof" if not r else "data", round(time.time() - t, 1))
+    except OSError as e: print(type(e).__name__, round(time.time() - t, 1))
+"""
+
+
+def topo_wormhole() -> None:
+    for ns in ("gc", "gs1", "gs2", "ctl", "sen1", "sen2"):
+        sh(f"ip netns del {ns}", check=False)
+        sh(f"ip netns add {ns} && ip -n {ns} link set lo up")
+        sh(f"ip netns exec {ns} sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0 net.ipv6.conf.default.disable_ipv6=1")
+    # each site's link
+    for gw, ifn, gwaddr, host, hif, haddr in (("gc", "wc", "192.0.2.50", "ctl", "c0", "192.0.2.10"),
+                                              ("gs1", "ws1", "198.51.100.50", "sen1", "s0", "198.51.100.10"),
+                                              ("gs2", "ws2", "198.51.100.50", "sen2", "s0", "198.51.100.10")):
+        sh(f"ip -n {gw} link add {ifn} type veth peer name {hif} netns {host}")
+        sh(f"ip -n {gw} addr add {gwaddr}/24 dev {ifn} && ip -n {gw} link set {ifn} up")
+        sh(f"ip -n {host} addr add {haddr}/24 dev {hif} && ip -n {host} link set {hif} up")
+    sh("ip -n ctl addr add 192.0.2.11/24 dev c0")  # a second machine on the controller's link, with no rule
+    # the network between the sites, and one WireGuard interface per pair
+    for n in (1, 2):
+        sh(f"ip -n gc link add u{n} type veth peer name u0 netns gs{n}")
+        sh(f"ip -n gc addr add 203.0.113.{n * 4 + 1}/30 dev u{n} && ip -n gc link set u{n} up")
+        sh(f"ip -n gs{n} addr add 203.0.113.{n * 4 + 2}/30 dev u0 && ip -n gs{n} link set u0 up")
+        k = [sh("wg genkey").stdout.strip() for _ in range(2)]
+        pub = [subprocess.run(["wg", "pubkey"], input=x, capture_output=True, text=True).stdout.strip() for x in k]
+        for ns, wg, priv, peer, addr, far, lp, ep in (
+                ("gc", f"wg{n}", k[0], pub[1], f"10.99.{n}.1", f"10.99.{n}.2", 51820 + n, f"203.0.113.{n * 4 + 2}:51820"),
+                (f"gs{n}", "wg0", k[1], pub[0], f"10.99.{n}.2", f"10.99.{n}.1", 51820, f"203.0.113.{n * 4 + 1}:{51820 + n}")):
+            sh(f"ip -n {ns} link add {wg} type wireguard")
+            subprocess.run(["ip", "netns", "exec", ns, "wg", "set", wg, "listen-port", str(lp), "private-key", "/dev/stdin",
+                            "peer", peer, "endpoint", ep, "allowed-ips", f"{far}/32"], input=priv + "\n", text=True, check=True)
+            sh(f"ip -n {ns} addr add {addr}/32 dev {wg} && ip -n {ns} link set {wg} up && ip -n {ns} route add {far}/32 dev {wg}")
+
+
+def phase_wormhole() -> None:
+    topo_wormhole()
+    files = {}
+    for ns, text in (("gc", WH_CTL), ("gs1", WH_SENSOR.replace("@N@", "1")), ("gs2", WH_SENSOR.replace("@N@", "2"))):
+        files[ns] = write_cfg(text, f"{WORK}/wh-{ns}.toml")
+    for n, t in (("host", WH_HOST), ("client", WH_CLIENT)):
+        with open(f"{WORK}/wh-{n}.py", "w") as f:
+            f.write(t)
+    link_if = {"gc": "wc", "gs1": "ws1", "gs2": "ws2"}
+
+    # -- declarations that are refused
+    def bad(name, old, new, text, base=WH_CTL):
+        assert old in base, (name, old)
+        write_cfg(base.replace(old, new, 1))
+        p = gr("validate", "--config", CFG)
+        result(p.returncode == 2 and text in p.stderr, f"wormhole refused: {name}", p.stderr.strip()[-160:])
+    bad("wip is not true", "wip = true", "wip = false", "wip must be true")
+    bad("a claim off the link", 'claim = ["192.0.2.101"]', 'claim = ["198.51.100.1"]', "not one machine's address on the link")
+    bad("a claim of its own address", 'claim = ["192.0.2.101"]', 'claim = ["192.0.2.50"]', "own link address")
+    bad("a claim of the broadcast address", 'claim = ["192.0.2.101"]', 'claim = ["192.0.2.255"]', "not one machine's address")
+    bad("one address claimed for two peers", 'claim = ["192.0.2.102"]', 'claim = ["192.0.2.101"]', "claimed twice")
+    bad("two pairs on one WireGuard interface", 'interface = "wg2"', 'interface = "wg1"', "interface of its own")
+    bad("a rule at an address the peer does not claim", 'at = "192.0.2.101", port = 6000', 'at = "192.0.2.102", port = 6000', "not one of this peer's claims")
+    bad("a rule from a machine off the link", 'from = "192.0.2.10", at = "192.0.2.101", port = 6000', 'from = "198.51.100.10", at = "192.0.2.101", port = 6000', "not one machine's address on the link")
+    bad("a rule to a claim", 'to = "192.0.2.10", port = 6100', 'to = "192.0.2.102", port = 6100', "is a claim")
+    bad("a tunnel port used twice", "tunnel_port = 7203", "tunnel_port = 7100", "used twice")
+    bad("UDP with no statement about replies", ", replies = true", "", "replies")
+    bad("TCP replies", "tunnel_port = 7202 }", "tunnel_port = 7202, replies = true }", "replies is for udp")
+    bad("another protocol", 'protocol = "tcp"', 'protocol = "icmp"', '"udp" or "tcp"')
+    bad("a relay on the same machine", "[wormhole]", RELAY.split("schema = 1")[1] + "[wormhole]", "not run on one machine")
+    bad("a listen-mode tap port as its link", "[wormhole]", LISTEN.split("schema = 1")[1].replace("tp0", "wc") + "[wormhole]", "is a tap port")
+
+    def ns_gr(ns, *a):
+        return subprocess.run(["ip", "netns", "exec", ns] + GR + list(a), capture_output=True, text=True, timeout=30)
+
+    def refused(name, text):
+        p = ns_gr("gc", "wormhole", "--config", files["gc"])
+        result(p.returncode == 2 and text in p.stderr, f"wormhole refused: {name}", p.stderr.strip()[-160:])
+    refused("ARP answered on every interface", "arp_ignore")
+    for ns in ("gc", "gs1", "gs2"):
+        sh(f"ip netns exec {ns} sysctl -qw net.ipv4.conf.all.arp_ignore=1")
+    sh("ip netns exec gc sysctl -qw net.ipv6.conf.wc.disable_ipv6=0")
+    refused("IPv6 on its link", "IPv6 is on")
+    sh("ip netns exec gc sysctl -qw net.ipv6.conf.wc.disable_ipv6=1 net.ipv4.conf.wg1.forwarding=1")
+    refused("IP forwarding on", "IP forwarding is on")
+    sh("ip netns exec gc sysctl -qw net.ipv4.conf.wg1.forwarding=0")
+    sh("ip -n gc addr add 192.0.2.101/24 dev wc")
+    refused("a claim already configured on the machine", "already holds 192.0.2.101")
+    sh("ip -n gc addr del 192.0.2.101/24 dev wc")
+    key = sh("ip netns exec gc wg show wg1 peers").stdout.strip()
+    sh(f"ip netns exec gc wg set wg1 peer {key} allowed-ips 10.99.1.0/24")
+    refused("a WireGuard peer allowed more than its one address", "allowed only 10.99.1.2/32")
+    sh(f"ip netns exec gc wg set wg1 peer {key} allowed-ips 10.99.1.2/32")
+
+    # -- run
+    logs = {h: f"{WORK}/wh-{h}.log" for h in ("ctl", "sen1", "sen2")}
+    procs = {}
+    for h, addr, ports in (("ctl", "192.0.2.10", "6100,6101"), ("sen1", "198.51.100.10", "6000,6001,6002"), ("sen2", "198.51.100.10", "6000,6001")):
+        open(logs[h], "w").close()
+        procs[h] = subprocess.Popen(["ip", "netns", "exec", h, sys.executable, f"{WORK}/wh-host.py", addr, h, ports, logs[h]])
+
+    def start(ns):
+        for x in (f"/var/lib/goatrope/wormhole-{link_if[ns]}.health",):  # the last run's says nothing about this one
+            if os.path.exists(x):
+                os.unlink(x)
+        procs[ns] = subprocess.Popen(["ip", "netns", "exec", ns] + GR + ["wormhole", "--config", files[ns]],
+                                     stdout=open(f"{WORK}/wh-{ns}.out", "a"), stderr=subprocess.STDOUT)
+
+    def health(ns):
+        try:
+            with open(f"/var/lib/goatrope/wormhole-{link_if[ns]}.health") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {"claims": {}, "rules": [], "peers": {}}
+
+    def held(ns, n, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if sum(c["state"] == "held" for c in health(ns)["claims"].values()) == n:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def client(ns, *a):
+        out = sh(f"ip netns exec {ns} {sys.executable} {WORK}/wh-client.py " + " ".join(map(str, a)), check=False)
+        try:
+            return json.loads(out.stdout)
+        except ValueError:
+            return [out.stderr[-200:]]
+
+    def arping(ns, dev, target, src, want):
+        """Does anyone answer ARP for target?"""
+        code = (f"import socket,struct,time;s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x806));s.bind(('{dev}',0x806));"
+                f"m=bytes.fromhex(open('/sys/class/net/{dev}/address').read().strip().replace(':',''));s.settimeout(0.3);"
+                f"s.send(b'\\xff'*6+m+b'\\x08\\x06'+struct.pack('!HHBBH',1,2048,6,4,1)+m+socket.inet_aton('{src}')+b'\\0'*6+socket.inet_aton('{target}'))\n"
+                "end=time.time()+1;ok=0\nwhile time.time()<end:\n try:\n  f=s.recv(100)\n"
+                f"  ok|=f[20:22]==b'\\0\\x02' and f[28:32]==socket.inet_aton('{target}')\n except TimeoutError: pass\nprint(int(ok))")
+        return sh(f"ip netns exec {ns} {sys.executable} -c \"{code}\"").stdout.strip() == ("1" if want else "0")
+
+    caps = {"ctl": Capture("ctl", "c0", "wh-c"), "sen1": Capture("sen1", "s0", "wh-s1")}
+    start("gc")
+    time.sleep(8)
+    h = health("gc")
+    result(all(c["state"] == "waiting" for c in h["claims"].values()) and len(h["claims"]) == 2
+           and arping("ctl", "c0", "192.0.2.101", "192.0.2.10", False),
+           "wormhole: nothing is claimed while the far ends are not heard", str(h["claims"]))
+    start("gs1")
+    start("gs2")
+    ok = held("gc", 2, 25) and held("gs1", 1, 15) and held("gs2", 1, 15)
+    result(ok, "wormhole: both ends claim their addresses once each hears the other", str([health(n)["claims"] for n in link_if]))
+    if not ok:
+        for n in link_if:
+            print(open(f"{WORK}/wh-{n}.out").read()[-800:], flush=True)
+
+    r1, r2 = client("ctl", "udp", "192.0.2.10", "192.0.2.101", 6000, 20, 4321), client("ctl", "udp", "192.0.2.10", "192.0.2.102", 6000, 20, 4321)
+    result(r1 == ["sen1:he", 25, ["192.0.2.101", 6000]] and r2 == ["sen2:he", 25, ["192.0.2.102", 6000]],
+           "wormhole: UDP reaches each of two sensors that have the same address, and each reply comes from its own claim", f"{r1} {r2}")
+    time.sleep(0.5)
+    seen = [json.loads(x) for x in open(logs["sen1"])]
+    result(seen and seen[-1][2] == ["198.51.100.200", 4321], "wormhole: the sensor sees the controller at its address on the sensor's own link, with its own source port", str(seen))
+    r = client("ctl", "udp", "192.0.2.10", "192.0.2.101", 6000, 4000)
+    result(r[0] == "sen1:he" and r[1] == 4005, "wormhole: a 4000-byte datagram crosses (larger than the link and tunnel MTU)", str(r))
+    r = client("ctl", "udp", "192.0.2.10", "192.0.2.101", 6000, 20, 6100)
+    time.sleep(0.5)
+    last = [json.loads(x) for x in open(logs["sen1"])][-1]
+    result(r[0] == "sen1:he" and last[2] == ["198.51.100.200", 6100], "wormhole: a source port that a rule also listens on is kept", f"{r} {last[2]}")
+    for n in (1, 2):
+        client(f"sen{n}", "udp", "198.51.100.10", "198.51.100.200", 6100, 10)
+    time.sleep(0.5)
+    src = [json.loads(x)[2][0] for x in open(logs["ctl"])]
+    result(src == ["192.0.2.101", "192.0.2.102"], "wormhole: a datagram from each sensor reaches the controller, from that sensor's claim", str(src))
+    t1 = client("ctl", "tcp", "192.0.2.10", "192.0.2.101", 6001, 5_000_000)
+    t2 = client("ctl", "tcp", "192.0.2.10", "192.0.2.102", 6001, 5_000_000)
+    t3 = client("sen2", "tcp", "198.51.100.10", "198.51.100.200", 6101, 1_000_000)
+    result(t1 == [f"sen1:{t1[-1]}", t1[-1]] and t2 == [f"sen2:{t2[-1]}", t2[-1]] and t3 == [f"ctl:{t3[-1]}", t3[-1]],
+           "wormhole: TCP both ways, 5 MB to each sensor and 1 MB back intact, half-close carried across", str([t1[0][:12], t2[0][:12], t3[0][:12]]))
+
+    # -- default deny
+    d = [client("ctl", "udp", "192.0.2.11", "192.0.2.101", 6000, 9), client("ctl", "udp", "192.0.2.10", "192.0.2.101", 6002, 9)]
+    d += [client("ctl", "tcp", "192.0.2.11", "192.0.2.101", 6001, 9), client("ctl", "tcp", "192.0.2.10", "192.0.2.101", 6009, 9)]
+    n0 = len(open(logs["sen1"]).readlines())
+    g = client("ctl", "udp", "192.0.2.10", "192.0.2.50", 6000, 9)
+    ping = sh("ip netns exec ctl ping -c 2 -W 1 198.51.100.10", check=False).returncode
+    result(all(len(x) < 3 and ":" not in x[0] for x in d + [g]) and ping != 0 and len(open(logs["sen1"]).readlines()) == n0,
+           "wormhole: another machine, another port, the machine's own address and a routed packet carry nothing across", str(d + [g, ping]))
+    time.sleep(2.5)
+    den = sum(x["denied"] for x in health("gc")["rules"])
+    result(den == 2, "wormhole: what it denied is counted", f"{den}")
+    frames = {k: c.stop() for k, c in caps.items()}
+    macs = {"ctl": sh("ip netns exec gc cat /sys/class/net/wc/address").stdout.strip(), "sen1": sh("ip netns exec gs1 cat /sys/class/net/ws1/address").stdout.strip()}
+    for k, claim in (("ctl", b"\xc0\x00\x02\x65"), ("sen1", b"\xc6\x33\x64\xc8")):
+        mine = [f for f in frames[k] if f[6:12] == bytes.fromhex(macs[k].replace(":", ""))]
+        arp = [f for f in mine if f[12:14] == b"\x08\x06"]
+        pr = [f for f in arp if f[28:32] == b"\0\0\0\0" and f[38:42] == claim]
+        an = [f for f in arp if f[28:32] == claim and f[38:42] == claim]
+        other = [f for f in mine if f[12:14] not in (b"\x08\x06", b"\x08\x00") or (f[12:14] == b"\x08\x00" and f[23] not in (1, 6, 17))]
+        icmp = [f for f in mine if f[12:14] == b"\x08\x00" and f[23] == 1 and f[34] != 3]
+        result(len(pr) >= 3 and an and arp.index(pr[2]) < arp.index(an[0]), f"wormhole: three ARP probes before the first announcement on the {k} link", f"{len(pr)} probes, {len(an)} announcements")
+        result(not other and not icmp, f"wormhole: the {k} link sees only ARP, UDP, TCP and port-unreachable from it", f"{len(mine)} frames, {len(other)} + {len(icmp)} other")
+
+    # -- latency
+    import statistics
+    med = lambda v: statistics.median(v)
+    p99 = lambda v: sorted(v)[int(len(v) * 0.99) - 1]
+    # The machine under the tests is shared, so the paths are measured in turn, round by round.
+    legs = [("gc", "192.0.2.50", "ctl", "192.0.2.10"), ("gs1", "10.99.1.2", "gc", "10.99.1.1"), ("sen1", "198.51.100.10", "gs1", "198.51.100.50")]
+    srv = [subprocess.Popen(["ip", "netns", "exec", x[0], sys.executable, f"{WORK}/wh-host.py", x[1], "leg", "6500", "/dev/null"]) for x in legs]
+    time.sleep(0.6)
+    diffs, tdiffs, thru, tcp, each, lost = [], [], [], [], [[], [], []], 0
+    for _ in range(20):
+        v = [client(x[2], "lat", x[3], x[1], 6500, 100)[0] for x in legs]
+        u, n = client("ctl", "lat", "192.0.2.10", "192.0.2.101", 6000, 100)
+        t = client("ctl", "lattcp", "192.0.2.10", "192.0.2.101", 6001, 100)[0]
+        base = sum(med(x) for x in v)
+        diffs.append(med(u) - base)
+        tdiffs.append(med(t) - base)
+        thru += u
+        tcp += t
+        lost += n
+        for k in range(3):
+            each[k] += v[k]
+    for x in srv:
+        x.terminate()
+        x.wait()
+    q = lambda v: f"median {med(v):.0f} (rounds {min(v):.0f} to {max(v):.0f})"
+    result(lost == 0 and len(thru) == 2000, "wormhole: round trips with no loss, 2000 of 2000",
+           f"us: UDP added {q(diffs)}; UDP round trip median {med(thru):.0f}, p99 {p99(thru):.0f}; TCP added {q(tdiffs)}, median {med(tcp):.0f}, "
+           f"p99 {p99(tcp):.0f}; legs alone median {' + '.join(f'{med(x):.0f}' for x in each)}, p99 {', '.join(f'{p99(x):.0f}' for x in each)}; load {os.getloadavg()[0]:.0f}")
+    # goatrope's own share: each datagram timestamped entering and leaving each machine, on one clock, before
+    # encryption and after decryption. The time WireGuard and the network take is not in it.
+    import tempfile
+    d = tempfile.mkdtemp()
+    os.chmod(d, 0o777)
+    dumps = [subprocess.Popen(["ip", "netns", "exec", n, "tcpdump", "-i", "any", "-n", "-U", "-s", "200", "-Z", "root", "-w", f"{d}/{n}.pcap", "udp"],
+                              stderr=subprocess.DEVNULL) for n in ("gc", "gs1")]
+    time.sleep(2)
+    client("ctl", "lat", "192.0.2.10", "192.0.2.101", 6000, 1000)
+    time.sleep(2)
+    for x in dumps:
+        x.terminate()
+        x.wait()
+    hops = []
+    for n in ("gc", "gs1"):
+        raw = open(f"{d}/{n}.pcap", "rb").read()
+        pos, seen_at = 24, {}
+        while pos + 16 <= len(raw):
+            sec, usec, cap, _ = struct.unpack("<IIII", raw[pos:pos + 16])
+            f = raw[pos + 16:pos + 16 + cap]
+            pos += 16 + cap
+            i = f.rfind(b"lat")
+            if i > 0 and f[i + 3:].isdigit():
+                seen_at.setdefault((f[i - 5:i] == b"sen1:", f[i + 3:]), []).append(sec * 1_000_000 + usec)
+        hops.append([v[1] - v[0] for v in seen_at.values() if len(v) == 2])
+    own = 2 * med(hops[0]) + 2 * med(hops[1])
+    result(all(len(h) > 1900 for h in hops), "wormhole: what each machine adds to a datagram, entering to leaving",
+           f"us: controller end median {med(hops[0]):.0f}, p99 {p99(hops[0]):.0f}, max {max(hops[0])} (n {len(hops[0])}); sensor end median {med(hops[1]):.0f}, "
+           f"p99 {p99(hops[1]):.0f}, max {max(hops[1])} (n {len(hops[1])}); four passes of a round trip {own:.0f}; load {os.getloadavg()[0]:.0f}")
+    shutil.rmtree(d)
+    sh("ip netns exec gc tc qdisc add dev u1 root netem delay 25ms && ip netns exec gs1 tc qdisc add dev u0 root netem delay 25ms")
+    far, lost = client("ctl", "lat", "192.0.2.10", "192.0.2.101", 6000, 200)
+    result(lost == 0 and 50_000 < med(far) < 56_000, "wormhole: a network that adds 50 ms to the round trip adds 50 ms", f"median {med(far) / 1000:.2f} ms, p99 {p99(far) / 1000:.2f} ms")
+    sh("ip netns exec gc tc qdisc del dev u1 root && ip netns exec gs1 tc qdisc del dev u0 root")
+
+    # -- the tunnel goes down, and comes back
+    hold = subprocess.Popen(["ip", "netns", "exec", "ctl", sys.executable, f"{WORK}/wh-client.py", "hold", "192.0.2.10", "192.0.2.101", "6001"], stdout=subprocess.PIPE, text=True)
+    hold.stdout.readline()
+    sh("ip -n gc link set u1 down")
+    t0 = time.monotonic()
+    gone = None
+    while time.monotonic() - t0 < 12:
+        if "192.0.2.101" not in sh("ip -n gc -4 addr show dev wc").stdout:
+            gone = time.monotonic() - t0
+            break
+        time.sleep(0.1)
+    end = hold.communicate(timeout=50)[0].split()
+    result(gone is not None and gone < 6 and arping("ctl", "c0", "192.0.2.101", "192.0.2.10", False)
+           and arping("ctl", "c0", "192.0.2.102", "192.0.2.10", True) and client("ctl", "udp", "192.0.2.10", "192.0.2.102", 6000, 9)[0] == "sen2:he",
+           "wormhole: when one pair's tunnel drops its claim stops answering ARP, and the other pair carries on", f"gone after {gone and round(gone, 1)} s")
+    result(end[:1] == ["ConnectionResetError"], "wormhole: an open TCP connection through it is reset", str(end))
+    sh("ip -n gc link set u1 up && ip -n gc route replace 203.0.113.4/30 dev u1", check=False)
+    t0 = time.monotonic()
+    back = held("gc", 2, 40) and held("gs1", 1, 20)
+    took = time.monotonic() - t0
+    result(back and client("ctl", "udp", "192.0.2.10", "192.0.2.101", 6000, 9)[0] == "sen1:he", "wormhole: the tunnel returns and so does the sensor", f"after {took:.1f} s")
+
+    # -- a real machine takes a claimed address
+    sh("ip -n sen2 link set s0 down && ip -n sen2 addr add 198.51.100.200/24 dev s0 && ip -n sen2 link set s0 up")
+    sh("ip netns exec sen2 ping -c 1 -W 1 -I 198.51.100.200 198.51.100.50", check=False)
+    time.sleep(3)
+    st = health("gs2")["claims"].get("198.51.100.200", {})
+    result("conflict" in st.get("state", "") and "198.51.100.200" not in sh("ip -n gs2 -4 addr show dev ws2").stdout,
+           "wormhole: it gives an address up as soon as a real machine uses it", str(st))
+    procs["gs2"].terminate()
+    procs["gs2"].wait(timeout=10)
+    start("gs2")
+    time.sleep(14)
+    st = health("gs2")["claims"].get("198.51.100.200", {})
+    result("conflict" in st.get("state", ""), "wormhole: it never claims an address a real machine answers for", str(st))
+    sh("ip -n sen2 addr del 198.51.100.200/24 dev s0")
+
+    # -- the process dies, is stopped, or the kernel would route
+    procs["gs1"].kill()
+    procs["gs1"].wait()
+    t0 = time.monotonic()
+    while "198.51.100.200" in sh("ip -n gs1 -4 addr show dev ws1").stdout and time.monotonic() - t0 < 20:
+        time.sleep(0.2)
+    took = time.monotonic() - t0
+    result(took < 11, "wormhole: killed outright, its claim ends by itself", f"after {took:.1f} s")
+    start("gs1")
+    result(held("gs1", 1, 25) and held("gc", 2 if health("gs2")["claims"] else 1, 25), "wormhole: started again, it claims again", str(health("gs1")["claims"]))
+    procs["gs1"].terminate()
+    rc = procs["gs1"].wait(timeout=10)
+    result(rc == 0 and "198.51.100.200" not in sh("ip -n gs1 -4 addr show dev ws1").stdout, "wormhole: stopped, it releases its claim at once", f"exit {rc}")
+    sh("ip netns exec gc sysctl -qw net.ipv4.conf.wc.forwarding=1")
+    rc = procs["gc"].wait(timeout=12)
+    result(rc == 1 and "192.0.2.10" not in sh("ip -n gc -4 addr show dev wc").stdout, "wormhole: it stops, and releases its claims, when IP forwarding is turned on", f"exit {rc}")
+    for p in procs.values():
+        if p.poll() is None:
+            p.kill()
+    for ns in ("gc", "gs1", "gs2", "ctl", "sen1", "sen2"):
+        sh(f"ip netns del {ns}", check=False)
+
+
+PHASES["wormhole"] = phase_wormhole
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

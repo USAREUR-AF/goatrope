@@ -121,12 +121,45 @@ class Relay:
 
 
 @dataclass
+class WormRule:
+    """out: from a machine on this link, at a claimed address, into the tunnel. in: out of the tunnel,
+    as a claimed address, to a machine on this link."""
+    protocol: str
+    port: int
+    tunnel_port: int
+    replies: bool
+    from_: str = ""
+    at: str = ""
+    as_: str = ""
+    to: str = ""
+
+
+@dataclass
+class WormPeer:
+    name: str
+    interface: str
+    address: str
+    heartbeat_port: int
+    claims: list[str]
+    out: list[WormRule]
+    in_: list[WormRule]
+
+
+@dataclass
+class Wormhole:
+    link_interface: str
+    link_address: str
+    peers: list[WormPeer]
+
+
+@dataclass
 class Config:
     path: str
     tap: Tap | None
     sends: list[Send] = field(default_factory=list)
     decodes: list[Decode] = field(default_factory=list)
     relay: Relay | None = None
+    wormhole: Wormhole | None = None
 
     def tap_ports(self) -> list[str]:
         return list(self.tap.ports) if self.tap else []
@@ -418,16 +451,119 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
     return Relay(True, remote_if, link_if, link_addr, rules)
 
 
+def _wormhole(d: dict, tap: Tap | None) -> Wormhole:
+    w = "[wormhole]"
+    if not isinstance(d, dict):
+        raise ConfigError(f"{w} must be a table")
+    req = {"wip", "link_interface", "link_address", "peer"}
+    _keys(d, w, req, req)
+    if d["wip"] is not True:
+        raise ConfigError(f"{w}.wip must be true: the wormhole is work in progress and transmits on the link")
+    link_if = _ifname(d["link_interface"], f"{w}.link_interface")
+    try:
+        link = ipaddress.IPv4Interface(d["link_address"])
+        if "/" not in d["link_address"] or link.network.num_addresses < 4:
+            raise ValueError
+    except (ValueError, TypeError):
+        raise ConfigError(f"{w}.link_address must be an IPv4 address with a prefix, e.g. 192.0.2.50/24") from None
+    net = link.network
+
+    def on_link(v, where: str) -> str:
+        a = ipaddress.ip_address(_addr(v, where))
+        if a not in net or a in (net.network_address, net.broadcast_address) or a.is_multicast:
+            raise ConfigError(f"{where} {a} is not one machine's address on the link ({net})")
+        if a == link.ip:
+            raise ConfigError(f"{where} {a} is this machine's own link address")
+        return str(a)
+
+    peers, claimed, tun_ifs, names = [], set(), set(), set()
+    if not isinstance(d["peer"], list) or not d["peer"]:
+        raise ConfigError(f"{w} needs at least one [[wormhole.peer]]")
+    for j, p in enumerate(d["peer"]):
+        pw = f"{w}.peer[{j}]"
+        if not isinstance(p, dict):
+            raise ConfigError(f"{pw} must be a table")
+        preq = {"name", "interface", "address", "heartbeat_port", "claim"}
+        _keys(p, pw, preq | {"out", "in"}, preq)
+        name = _str(p, "name", pw)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", name) or name in names:
+            raise ConfigError(f"{pw}.name must be lowercase letters, digits and dashes, and used once")
+        names.add(name)
+        ifn = _ifname(p["interface"], f"{pw}.interface")
+        if ifn in tun_ifs or ifn == link_if:
+            raise ConfigError(f"{pw}.interface {ifn} is used twice: each pair has a WireGuard interface of its own")
+        tun_ifs.add(ifn)
+        address = ipaddress.ip_address(_addr(p["address"], f"{pw}.address"))
+        if address.version != 4 or address in net:
+            raise ConfigError(f"{pw}.address must be the far end's IPv4 tunnel address, not one on the link ({net})")
+        if not isinstance(p["claim"], list) or not p["claim"]:
+            raise ConfigError(f"{pw}.claim must list at least one address of this link")
+        claims = [on_link(c, f"{pw}.claim") for c in p["claim"]]
+        for c in claims:
+            if c in claimed:
+                raise ConfigError(f"{pw}.claim {c} is claimed twice")
+            claimed.add(c)
+        hb = _int(p, "heartbeat_port", pw, 1, 65535)
+        rules: dict[str, list[WormRule]] = {"out": [], "in": []}
+        for side, req in (("out", {"protocol", "from", "at", "port", "tunnel_port"}),
+                          ("in", {"protocol", "tunnel_port", "as", "to", "port"})):
+            if not isinstance(p.get(side, []), list):
+                raise ConfigError(f"{pw}.{side} must be a list of rules")
+            for k, r in enumerate(p.get(side, [])):
+                rw = f"{pw}.{side}[{k}]"
+                if not isinstance(r, dict):
+                    raise ConfigError(f"{rw} must be a table")
+                _keys(r, rw, req | {"replies"}, req | ({"replies"} if r.get("protocol") == "udp" else set()))
+                if r["protocol"] not in ("udp", "tcp"):
+                    raise ConfigError(f"{rw}.protocol must be \"udp\" or \"tcp\"")
+                if r["protocol"] == "tcp" and "replies" in r:
+                    raise ConfigError(f"{rw}.replies is for udp; a TCP connection carries both ways")
+                if r["protocol"] == "udp" and not isinstance(r["replies"], bool):
+                    raise ConfigError(f"{rw}.replies must be true or false")
+                rule = WormRule(r["protocol"], _int(r, "port", rw, 1, 65535), _int(r, "tunnel_port", rw, 1, 65535),
+                                r.get("replies", True))
+                claim, host = ("at", "from") if side == "out" else ("as", "to")
+                c = _addr(r[claim], f"{rw}.{claim}")
+                if c not in claims:
+                    raise ConfigError(f"{rw}.{claim} {c} is not one of this peer's claims")
+                setattr(rule, "at" if side == "out" else "as_", c)
+                setattr(rule, "from_" if side == "out" else "to", on_link(r[host], f"{rw}.{host}"))
+                rules[side].append(rule)
+        if not rules["out"] and not rules["in"]:
+            raise ConfigError(f"{pw} has no rule; everything else is denied")
+        ports = [(r.protocol, r.tunnel_port) for r in rules["in"]]
+        if len(set(ports)) != len(ports) or ("udp", hb) in ports:
+            raise ConfigError(f"{pw}.in: a tunnel_port is used twice (the heartbeat's included)")
+        ats = [(r.protocol, r.at, r.port) for r in rules["out"]]
+        if len(set(ats)) != len(ats):
+            raise ConfigError(f"{pw}.out: two rules listen at the same address, protocol and port")
+        peers.append(WormPeer(name, ifn, str(address), hb, claims, rules["out"], rules["in"]))
+    for p in peers:
+        for r in p.out + p.in_:
+            h = r.from_ or r.to
+            if h in claimed:
+                raise ConfigError(f"{w}: {h} is a claim; a rule's own machine is a real one on this link")
+    if tap is not None:
+        for n in [link_if] + sorted(tun_ifs):
+            if n in tap.ports or n == "goatrope0":
+                raise ConfigError(f"{w}: {n} is a tap port: the wormhole transmits, from its own interface, never through a tap")
+        if tap.management == link_if:
+            raise ConfigError(f"{w}.link_interface is the management interface")
+    return Wormhole(link_if, str(link), peers)
+
+
 def parse(text: str, path: str = DEFAULT_PATH) -> Config:
     try:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise ConfigError(f"{path}: not valid TOML: {e}") from None
-    _keys(doc, path, {"schema", "tap", "send", "decode", "relay"}, {"schema"})
+    _keys(doc, path, {"schema", "tap", "send", "decode", "relay", "wormhole"}, {"schema"})
     if doc["schema"] != 1:
         raise ConfigError(f"{path}: schema must be 1")
-    if not any(k in doc for k in ("tap", "relay")):
-        raise ConfigError(f"{path}: declares no role; declare [tap] or [relay]")
+    if not any(k in doc for k in ("tap", "relay", "wormhole")):
+        raise ConfigError(f"{path}: declares no role; declare [tap], [relay] or [wormhole]")
+    if "relay" in doc and "wormhole" in doc:
+        raise ConfigError(f"{path}: [relay] and [wormhole] are not run on one machine yet")
     tap = _tap(doc["tap"]) if "tap" in doc else None
     sends = [_send(s, i, tap) for i, s in enumerate(doc.get("send", []))]
     decodes = [_decode(d, i, tap) for i, d in enumerate(doc.get("decode", []))]
@@ -435,7 +571,8 @@ def parse(text: str, path: str = DEFAULT_PATH) -> Config:
     if len(set(names)) != len(names):
         raise ConfigError(f"{path}: a [[send]] or [[decode]] name is used twice")
     relay = _relay(doc["relay"], tap) if "relay" in doc else None
-    return Config(path, tap, sends, decodes, relay)
+    worm = _wormhole(doc["wormhole"], tap) if "wormhole" in doc else None
+    return Config(path, tap, sends, decodes, relay, worm)
 
 
 def load(path: str) -> Config:

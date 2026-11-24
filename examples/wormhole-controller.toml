@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# The controller site's end of a wormhole (WORK IN PROGRESS, docs/adr/0003). Two sensor sites;
+# their links may use the same subnet. Addresses are documentation addresses, and every name and
+# number is yours to replace.
+schema = 1
+
+[wormhole]
+wip = true
+link_interface = "enxLINK"              # the controller's link: an interface of its own, never a tap port
+link_address = "192.0.2.50/24"          # this machine's own address there
+
+[[wormhole.peer]]
+name = "sensor-1"
+interface = "wg1"                       # a WireGuard interface for this pair alone
+address = "10.99.1.2"                   # the far machine's tunnel address, the peer's only allowed-ip
+heartbeat_port = 7100
+claim = ["192.0.2.101"]                 # sensor 1's address on this link
+out = [                                 # controller to sensor
+  { protocol = "udp", from = "192.0.2.10", at = "192.0.2.101", port = 6000, tunnel_port = 7201, replies = true },
+  { protocol = "tcp", from = "192.0.2.10", at = "192.0.2.101", port = 6001, tunnel_port = 7202 },
+]
+in = [                                  # sensor to controller
+  { protocol = "udp", tunnel_port = 7203, as = "192.0.2.101", to = "192.0.2.10", port = 6100, replies = false },
+]
+
+[[wormhole.peer]]
+name = "sensor-2"
+interface = "wg2"
+address = "10.99.2.2"
+heartbeat_port = 7100
+claim = ["192.0.2.102"]
+out = [
+  { protocol = "tcp", from = "192.0.2.10", at = "192.0.2.102", port = 6001, tunnel_port = 7202 },
+]

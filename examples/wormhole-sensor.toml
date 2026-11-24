@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# One sensor site's end of a wormhole (WORK IN PROGRESS, docs/adr/0003). Its tunnel ports pair with
+# the controller site's: an `out` rule there names the tunnel port of an `in` rule here.
+schema = 1
+
+[wormhole]
+wip = true
+link_interface = "enxLINK"
+link_address = "198.51.100.50/24"
+
+[[wormhole.peer]]
+name = "controller"
+interface = "wg0"
+address = "10.99.1.1"
+heartbeat_port = 7100
+claim = ["198.51.100.200"]              # the controller's address on this link
+in = [
+  { protocol = "udp", tunnel_port = 7201, as = "198.51.100.200", to = "198.51.100.10", port = 6000, replies = true },
+  { protocol = "tcp", tunnel_port = 7202, as = "198.51.100.200", to = "198.51.100.10", port = 6001 },
+]
+out = [
+  { protocol = "udp", from = "198.51.100.10", at = "198.51.100.200", port = 6100, tunnel_port = 7203, replies = false },
+]

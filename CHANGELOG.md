@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- wormhole: WIP address-level proxy at both ends (ADR 0003), UDP and TCP.
+
 ## 0.1.0 (2026-11-24)
 
 - tap: inline and listen modes; install, status, check (exit 0 / 3), uninstall.
