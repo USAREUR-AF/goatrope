@@ -13,7 +13,10 @@ a="goatrope-$v.tar.gz"
 want=$(printf '%s\n' SHA256SUMS SHA256SUMS.cosign-bundle "$a" | LC_ALL=C sort)
 have=$(find . -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
 [ "$have" = "$want" ] || { printf 'the release holds:\n%s\nnot:\n%s\n' "$have" "$want" >&2; exit 1; }
-grep -qxE "[0-9a-f]{64}  $a" SHA256SUMS && [ "$(wc -l < SHA256SUMS)" = 1 ] || { echo "SHA256SUMS does not list $a alone" >&2; exit 1; }
+if ! grep -qxE "[0-9a-f]{64}  $a" SHA256SUMS || [ "$(wc -l < SHA256SUMS)" != 1 ]; then
+  echo "SHA256SUMS does not list $a alone" >&2
+  exit 1
+fi
 sha256sum --quiet -c SHA256SUMS
 python3 -I - <<'PY'
 import base64, json
