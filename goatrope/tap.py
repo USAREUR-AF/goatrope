@@ -573,6 +573,9 @@ def uninstall(purge: bool, log=print) -> None:
     if "links" in nd:  # netplan enables networkd under /run only, so `disable` alone cannot say what to undo
         for link in set(_networkd_links()) - set(nd["links"]):
             _remove(link)
+            d = os.path.dirname(link)
+            if d != "/etc/systemd/system" and not os.listdir(d):
+                os.rmdir(d)  # as systemctl disable does
     elif nd.get("enabled") in ("disabled", "masked"):
         su.systemctl("disable", "systemd-networkd.service")
     if nd.get("active") != "active":

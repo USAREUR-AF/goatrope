@@ -144,8 +144,10 @@ def snapshot() -> dict:
     files = {}
     for root in ("/etc", "/usr/local", "/var/lib"):
         for dp, dn, fn in os.walk(root):
-            if dp.startswith(("/var/lib/cloud", "/var/lib/systemd", "/var/lib/dpkg", "/var/lib/apt", "/etc/ld.so.cache")):
+            if dp.startswith(("/var/lib/systemd", "/var/lib/dpkg", "/var/lib/apt", "/etc/ld.so.cache")):
                 continue
+            if REAL_WATCHDOG and dp == "/var/lib":  # in the VM, its other services write here while the tests run
+                dn[:] = [d for d in dn if d == "private" or d.startswith("goatrope")]
             for d in dn:
                 p = os.path.join(dp, d)
                 files[p] = "dir"
@@ -809,10 +811,13 @@ srv = http.server.HTTPServer(("127.0.0.1", 9103), H); srv.timeout = 1
 ts = [threading.Thread(target=udp, args=(9101, "udp")), threading.Thread(target=udp, args=(9104, "conv")), threading.Thread(target=tcp)]
 [t.start() for t in ts]
 import time; end = time.time() + WAIT
-while time.time() < end: srv.handle_request()
-[t.join() for t in ts]
-print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv"][:1], "sample_udp": got["udp"][:1]}))
-""", "120" if REAL_WATCHDOG else "20"], stdout=subprocess.PIPE, text=True)
+def full(): return all(len(got[k]) >= n for k, n in (("udp", 101), ("tcp", 101), ("http", 101), ("conv", 151)))
+while time.time() < end and not full(): srv.handle_request()
+settle = time.time() + 3  # anything past the expected count still shows
+while time.time() < settle: srv.handle_request()
+print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv"][:1], "sample_udp": got["udp"][:1]}), flush=True)
+import os; os._exit(0)
+""", "900" if REAL_WATCHDOG else "30"], stdout=subprocess.PIPE, text=True)
     time.sleep(1)
     p = gr("install", "--config", CFG)
     result(p.returncode == 0, "install listen with two [[send]] sections", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
@@ -836,7 +841,7 @@ print(json.dumps({k: len(v) for k, v in got.items()} | {"sample_conv": got["conv
             " pl=b'BIG'+i.to_bytes(4,'big')+b'b'*1400\n"
             " s.send(frame([192,0,2,10],4000+i,struct.pack('!HHHH',40000,5001,8+len(pl),0)+pl)); time.sleep(0.002)\n")
     sh(f"ip netns exec feed python3 -c \"{code}\"")
-    got = json.loads(rx.communicate(timeout=600)[0])
+    got = json.loads(rx.communicate(timeout=1200)[0])
     result(got["udp"] == 101, "send: UDP destination got the 100 matching datagrams and 1 reassembled from 2 fragments",
            f"{got['udp']}")
     result(got["tcp"] == 101, "send: TCP destination (len32be) got the same 101", f"{got['tcp']}")

@@ -167,7 +167,8 @@ the host's kernel. No hardware is involved. They cover:
 (the Ubuntu arm64 cloud image under qemu-system-aarch64, inside a container), with an
 emulated i6300esb watchdog, so `check` reads a real `/dev/watchdog0`. Emulation shows
 that the arm64 packages behave as the amd64 ones; it says nothing about a Raspberry
-Pi's timing or its USB adapters.
+Pi's timing or its USB adapters. In the VM the uninstall comparison covers, under
+`/var/lib`, goatrope's own directories only.
 
 Known limits the tests record: a process with `CAP_NET_RAW` sending with
 `PACKET_QDISC_BYPASS` skips the listen-mode egress drop; stopping a recorder can

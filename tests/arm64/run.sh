@@ -27,7 +27,7 @@ w="$(mktemp -d "$out/arm64-$v.XXXX")"
 c="goatrope-arm64-$v"
 log="$out/ubuntu-$v-arm64.log"
 : > "$log"
-trap 'cp "$w/console.log" "$out/ubuntu-$v-arm64.console.log" 2>/dev/null; docker rm -f "$c" >/dev/null 2>&1 || true; rm -rf "$w"' EXIT
+trap 'cp "$w/console.log" "$out/ubuntu-$v-arm64.console.log" 2>/dev/null; docker logs "$c" > "$out/ubuntu-$v-arm64.qemu.log" 2>&1; docker rm -f "$c" >/dev/null 2>&1 || true; rm -rf "$w"' EXIT
 
 ssh-keygen -q -t ed25519 -N '' -f "$w/key"
 cat > "$w/meta-data" <<EOF
@@ -73,7 +73,7 @@ docker run -d --name "$c" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.i
     -drive if=pflash,format=raw,file=/w/vars.fd \
     -drive if=virtio,file=/w/disk.qcow2 -drive if=virtio,format=raw,file=/w/seed.img \
     -netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n0,romfile= \
-    -device i6300esb -watchdog-action reset \
+    -device i6300esb -watchdog-action reset -trace watchdog_perform_action \
     -display none -serial file:/w/console.log' >/dev/null
 
 vm() { docker exec -i "$c" ssh -o LogLevel=ERROR -i /w/key -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
