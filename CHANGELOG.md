@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-24)
 
 - tap: inline and listen modes; install, status, check (exit 0 / 3), uninstall.
 - decode-and-send: UDP, TCP, HTTP and file destinations; pinned goat-transformers
