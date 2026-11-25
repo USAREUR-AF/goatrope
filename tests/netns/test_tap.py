@@ -428,6 +428,25 @@ link_interface = "r0"
 link_address = "192.0.2.50/24"
 allow = [{ direction = "remote-to-link", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000 }]
 """, "wip must be true")
+    refused("relay reply_from_any_port on a one-way rule", ok_cfg + """
+[relay]
+wip = true
+remote_interface = "eth0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [{ direction = "remote-to-link", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000, reply_from_any_port = true }]
+""", "needs direction")
+    refused("relay link_port used by two rules", ok_cfg + """
+[relay]
+wip = true
+remote_interface = "eth0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "both", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000, link_port = 7100 },
+  { direction = "both", protocol = "udp", remote = "198.51.100.5", listen_port = 7001, target = "192.0.2.3", target_port = 7000, link_port = 7100 },
+]
+""", "link_port 7100 is used twice")
     refused("send destination reached through a tap port", ok_cfg + """
 [[send]]
 name = "s"
@@ -876,8 +895,10 @@ remote_interface = "wg0"
 link_interface = "r0"
 link_address = "192.0.2.50/24"
 allow = [
-  { direction = "both", protocol = "udp", remote = "10.99.0.2", listen_port = 7000, target = "192.0.2.2", target_port = 7000 },
+  { direction = "both", protocol = "udp", remote = "10.99.0.2", listen_port = 7000, target = "192.0.2.2", target_port = 7000, link_port = 7100 },
   { direction = "remote-to-link", protocol = "udp", remote = "10.99.0.2", listen_port = 7002, target = "192.0.2.2", target_port = 7002 },
+  { direction = "both", protocol = "udp", remote = "10.99.0.2", listen_port = 7003, target = "192.0.2.2", target_port = 7003, reply_from_any_port = true },
+  { direction = "both", protocol = "udp", remote = "10.99.0.2", listen_port = 7004, target = "192.0.2.2", target_port = 7004 },
 ]
 """
 
@@ -934,15 +955,17 @@ def phase_relay() -> None:
     rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
 import socket, json, select
 socks = {}
-for p in (7000, 7001, 7002):
+for p in (7000, 7001, 7002, 7003, 7004):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", p)); socks[s] = p
-got = {7000: [], 7001: [], 7002: []}
-end = __import__("time").time() + 12
+other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); other.bind(("192.0.2.2", 7013))  # replies from another port
+got = {7000: [], 7001: [], 7002: [], 7003: [], 7004: []}
+end = __import__("time").time() + 14
 while __import__("time").time() < end:
     r, _, _ = select.select(list(socks), [], [], 0.5)
     for s in r:
-        d, a = s.recvfrom(65535); got[socks[s]].append([d.decode(), a[0]])
+        d, a = s.recvfrom(65535); got[socks[s]].append([d.decode(), a[0], a[1]])
         if socks[s] == 7000: s.sendto(b"reply-" + d, a)
+        if socks[s] in (7003, 7004): other.sendto(b"reply-" + d, a)
 print(json.dumps(got))
 """], stdout=subprocess.PIPE, text=True)
     relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -963,6 +986,8 @@ print(replies)
     rep = sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7000 20 ok wga", check=False).stdout.strip()
     sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7002 5 oneway wga", check=False)
     sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7001 5 unlisted wga", check=False)
+    rep_any = sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7003 5 anyport wga", check=False).stdout.strip()
+    rep_exact = sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.2 7004 5 exactport wga", check=False).stdout.strip()
     sh(f"ip netns exec remote python3 -c '{sender}' 10.99.0.3 7000 5 otherpeer wgo", check=False)
     # From the management side, outside the tunnel: the relay's sockets are bound to wg0.
     sh("python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);[s.sendto(b'outside',('127.0.0.1',7000)) for i in range(3)]\"", check=False)
@@ -970,22 +995,27 @@ print(replies)
     relay.terminate()
     out = relay.communicate(timeout=10)[0]
     frames = cap.stop()
-    ok7000 = [d for d, a in got["7000"] if d.startswith("ok")]
-    result(len(ok7000) == 20 and all(a == "192.0.2.50" for _, a in got["7000"]),
+    ok7000 = [d for d, a, _ in got["7000"] if d.startswith("ok")]
+    result(len(ok7000) == 20 and all(a == "192.0.2.50" for _, a, _ in got["7000"]),
            "relay (WIP): an allowed datagram reaches its one target, from the relay's own address", f"{len(ok7000)} of 20")
+    result(bool(got["7000"]) and all(p == 7100 for _, _, p in got["7000"]),
+           "relay (WIP): a rule with link_port sends from that port", str(sorted({p for _, _, p in got["7000"]})))
+    result(rep_any == "5", "relay (WIP): reply_from_any_port returns replies the target sends from another port", f"{rep_any} of 5")
+    result(rep_exact == "0" and len(got["7004"]) == 5,
+           "relay (WIP): without reply_from_any_port, a reply from another port is denied", f"{rep_exact} of 5 returned")
     result(rep == "20", "relay (WIP): replies from the target return to the remote machine (direction both)", f"{rep} of 20")
     result(len(got["7002"]) == 5, "relay (WIP): a one-way rule forwards", f"{len(got['7002'])} of 5")
     result(not got["7001"], "relay (WIP): a port with no rule forwards nothing", f"{len(got['7001'])}")
-    result(not any(d.startswith("otherpeer") for d, _ in got["7000"]),
+    result(not any(d.startswith("otherpeer") for d, _, _ in got["7000"]),
            "relay (WIP): an authenticated peer that is not the rule's remote is denied", "denied" if "denied" in out else out[-200:])
-    result(not any(d.startswith("outside") for d, _ in got["7000"]), "relay (WIP): nothing from outside the tunnel is relayed")
+    result(not any(d.startswith("outside") for d, _, _ in got["7000"]), "relay (WIP): nothing from outside the tunnel is relayed")
     bad = []
     for f in frames:
         et = f[12:14]
         if et == b"\x08\x06":
             continue  # ARP: the relay answers for its own address, as any host on the link does
         if et == b"\x08\x00" and f[23] == 17 and f[26:30] == bytes([192, 0, 2, 50]) and f[30:34] == bytes([192, 0, 2, 2]) \
-                and int.from_bytes(f[36:38], "big") in (7000, 7002):
+                and int.from_bytes(f[36:38], "big") in (7000, 7002, 7003, 7004):
             continue
         bad.append(f[:40].hex())
     result(not bad, "relay (WIP): on the link, only ARP and the allowed datagrams were sent", f"{len(frames)} frames, {len(bad)} other: {bad[:3]}")

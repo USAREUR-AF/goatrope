@@ -112,7 +112,11 @@ address of that site's relay and a port. Sensor sites may reuse the same link
 addresses, because the controller never sees them: it sees one mesh address per
 site. A sensor that answers whatever address last spoke to it sees the relay's link
 address and answers the relay, which returns the datagram to the controller
-(direction `both`). `examples/relay-over-mesh.toml` is this case. No address-level
+(direction `both`). Two rule options fit sensors of this kind: `link_port` sends to the
+sensor from a fixed port on the relay's address, for a protocol where both ends use one
+known port; `reply_from_any_port` accepts the sensor's answers from any source port on
+the target address, for a sensor that answers from another port than it listens on.
+`examples/relay-over-mesh.toml` is this case. No address-level
 proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
 
 ## What the relay requires and refuses
@@ -122,7 +126,8 @@ proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
 | Off unless declared | no `[relay]` table, no relay; `wip = true` is required while it is WIP |
 | Remote authentication | the remote side must be an existing WireGuard interface (the site mesh's, or one the operator made; see Transport). WireGuard authenticates each peer by its key and accepts from a peer only the tunnel addresses listed for it, so the source address inside the tunnel names an authenticated machine. A rule names that address |
 | Default deny | each rule names direction, protocol, remote tunnel address, tunnel port, target address and target port; everything else is dropped and counted |
-| Directions | `remote-to-link`, or `both`: replies are accepted only from the rule's target address and port, and go only to the remote machine that last used the rule |
+| Directions | `remote-to-link`, or `both`: replies are accepted only from the rule's target address and port (any port of that address with `reply_from_any_port = true`, which needs `both`), and go only to the remote machine that last used the rule |
+| Link port | the relay sends to the target from a free port on its link address, or from `link_port` when a rule sets it; two rules may not set the same `link_port` |
 | Its own interface | the link side is a plain interface holding the declared address; never a tap port, the tap's bridge, a bridge member or a tunnel |
 | Never with listen | a listen-mode port can never be a relay interface (refused at validation) |
 | Nothing else sent | IPv6 must be off on the link interface when the relay's address is IPv4; otherwise the kernel sends neighbor discovery and MLD frames |
@@ -147,11 +152,14 @@ and a veth to a "link" namespace:
 | 20 datagrams from the allowed tunnel address reach the one target, from the relay's address | 20 of 20 |
 | replies from the target return to the remote machine (`both`) | 20 of 20 |
 | a `remote-to-link` rule forwards | 5 of 5 |
+| a rule with `link_port` sends from that port | every datagram |
+| `reply_from_any_port`: replies the target sends from another port return | 5 of 5 |
+| without it, replies from another port are denied | 0 of 5 |
 | a tunnel port with no rule | 0 forwarded |
 | an authenticated peer that is not the rule's remote | denied, logged |
 | datagrams from outside the tunnel to the relay port | 0 forwarded |
 | frames sent on the link | only ARP and the allowed datagrams |
-| refusals: remote side not WireGuard; link interface without the declared address; a target off the link; a broadcast target; IPv6 on the link interface; IP forwarding on | each refused, exit 2 |
+| refusals: `reply_from_any_port` on a one-way rule; one `link_port` on two rules; remote side not WireGuard; link interface without the declared address; a target off the link; a broadcast target; IPv6 on the link interface; IP forwarding on | each refused, exit 2 |
 | a reply that cannot be sent (the remote peer removed from the WireGuard interface) | counted; the relay keeps running |
 | IP forwarding turned on while it runs | the relay stops, exit 1 |
 

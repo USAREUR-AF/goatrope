@@ -89,14 +89,15 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
     state = []
     for rule in r.rules:
         remote_sock = _bound(r.remote_interface, "0.0.0.0" if ":" not in rule.remote else "::", rule.listen_port)
-        link_sock = _bound(r.link_interface, link_ip, 0)
+        link_sock = _bound(r.link_interface, link_ip, rule.link_port)
         st = {"rule": rule, "remote_sock": remote_sock, "link_sock": link_sock, "peer": None,
               "to_link": 0, "to_remote": 0, "denied": 0, "send_errors": 0}
         sel.register(remote_sock, selectors.EVENT_READ, ("remote", st))
         sel.register(link_sock, selectors.EVENT_READ, ("link", st))
         state.append(st)
         print(f"goatrope relay (WIP): {rule.remote} -> {r.remote_interface}:{rule.listen_port} => "
-              f"{link_ip} -> {rule.target}:{rule.target_port} on {r.link_interface} ({rule.direction})", flush=True)
+              f"{link_ip}:{link_sock.getsockname()[1]} -> {rule.target}:{rule.target_port} on {r.link_interface} "
+              f"({rule.direction}{', replies from any port' if rule.reply_from_any_port else ''})", flush=True)
     start = last = time.monotonic()
     last_denied_log = 0.0
     while max_seconds is None or time.monotonic() - start < max_seconds:
@@ -121,7 +122,8 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
                 except OSError:  # dropped and counted; the relay keeps running
                     st["send_errors"] += 1
             else:
-                if rule.direction != "both" or (src, sport) != (rule.target, rule.target_port) or not st["peer"]:
+                from_target = src == rule.target and (rule.reply_from_any_port or sport == rule.target_port)
+                if rule.direction != "both" or not from_target or not st["peer"]:
                     st["denied"] += 1
                     continue
                 try:

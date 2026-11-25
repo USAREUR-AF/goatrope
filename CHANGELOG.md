@@ -3,6 +3,9 @@
 ## Unreleased
 
 - landing page (site/) and its Pages workflow.
+- relay: uses the site's existing WireGuard mesh interface and creates no tunnel (ADR 0002, Transport).
+- relay: per-rule `link_port` (send to the target from a fixed port) and `reply_from_any_port`
+  (accept the target's replies from any source port).
 
 ## 0.1.0 (2026-11-24)
 

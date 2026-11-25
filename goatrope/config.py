@@ -109,6 +109,8 @@ class RelayRule:
     target: str
     target_port: int
     protocol: str
+    link_port: int = 0                 # send to the target from this port on the link address; 0 = any free port
+    reply_from_any_port: bool = False  # accept replies from the target address on any source port
 
 
 @dataclass
@@ -393,7 +395,7 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
         if not isinstance(a, dict):
             raise ConfigError(f"{aw} must be a table")
         req = {"direction", "protocol", "remote", "listen_port", "target", "target_port"}
-        _keys(a, aw, req, req)
+        _keys(a, aw, req | {"link_port", "reply_from_any_port"}, req)
         if a["direction"] not in ("remote-to-link", "both"):
             raise ConfigError(f"{aw}.direction must be \"remote-to-link\" or \"both\" (replies from the target only)")
         if a["protocol"] != "udp":
@@ -407,14 +409,24 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
                 or t.is_multicast:
             raise ConfigError(f"{aw}.target {target} is the relay's own, the network, a broadcast or a multicast "
                               "address; a rule names one machine")
+        any_port = a.get("reply_from_any_port", False)
+        if not isinstance(any_port, bool):
+            raise ConfigError(f"{aw}.reply_from_any_port must be true or false")
+        if any_port and a["direction"] != "both":
+            raise ConfigError(f"{aw}.reply_from_any_port needs direction \"both\"")
         rules.append(RelayRule(a["direction"], _addr(a["remote"], f"{aw}.remote"),
                                _int(a, "listen_port", aw, 1, 65535), target,
-                               _int(a, "target_port", aw, 1, 65535), "udp"))
-    seen = set()
+                               _int(a, "target_port", aw, 1, 65535), "udp",
+                               _int(a, "link_port", aw, 1, 65535) if "link_port" in a else 0, any_port))
+    seen, seen_link = set(), set()
     for rule in rules:
         if rule.listen_port in seen:
             raise ConfigError(f"{w}.allow: listen_port {rule.listen_port} is used twice")
         seen.add(rule.listen_port)
+        if rule.link_port:
+            if rule.link_port in seen_link:
+                raise ConfigError(f"{w}.allow: link_port {rule.link_port} is used twice")
+            seen_link.add(rule.link_port)
     return Relay(True, remote_if, link_if, link_addr, rules)
 
 

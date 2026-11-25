@@ -9,6 +9,8 @@ remote_interface = "wt0"          # the mesh's kernel WireGuard interface
 link_interface = "eth1"           # the sensor's network, an interface of its own
 link_address = "192.0.2.50/24"    # the relay's address on that network
 allow = [
-  # the controller's mesh address; the sensor answers the relay, the relay answers the controller
-  { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000 },
+  # the controller's mesh address; the sensor answers the relay, the relay answers the controller.
+  # link_port: the relay sends to the sensor from port 40000, as a controller on the sensor's
+  # network would. reply_from_any_port: the sensor may answer from a port other than 40000.
+  { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000, link_port = 40000, reply_from_any_port = true },
 ]
