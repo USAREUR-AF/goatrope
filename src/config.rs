@@ -120,6 +120,7 @@ pub struct Send {
 #[derive(Debug, Clone)]
 pub struct Decode {
     pub name: String,
+    #[allow(dead_code)] // the one decoder component today; kept as declared
     pub component: String,
     pub binary: String,
     pub sha256: String,
@@ -138,6 +139,7 @@ pub struct RelayRule {
     pub listen_port: u16,
     pub target: String,
     pub target_port: u16,
+    #[allow(dead_code)] // "udp", the one protocol built; kept as declared
     pub protocol: String,
 }
 
@@ -179,10 +181,7 @@ pub struct Config {
 
 impl Config {
     pub fn tap_ports(&self) -> Vec<String> {
-        self.tap
-            .as_ref()
-            .map(|t| t.ports.clone())
-            .unwrap_or_default()
+        self.tap.as_ref().map(|t| t.ports.clone()).unwrap_or_default()
     }
 }
 
@@ -203,22 +202,12 @@ pub fn pyrepr(v: &Value) -> String {
         Value::Boolean(b) => if *b { "True" } else { "False" }.into(),
         Value::Datetime(d) => d.to_string(),
         Value::Array(a) => format!("[{}]", a.iter().map(pyrepr).collect::<Vec<_>>().join(", ")),
-        Value::Table(t) => format!(
-            "{{{}}}",
-            t.iter()
-                .map(|(k, v)| format!("{}: {}", pystr(k), pyrepr(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Value::Table(t) => format!("{{{}}}", t.iter().map(|(k, v)| format!("{}: {}", pystr(k), pyrepr(v))).collect::<Vec<_>>().join(", ")),
     }
 }
 
 pub fn pystr(s: &str) -> String {
-    let q = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let q = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::with_capacity(s.len() + 2);
     out.push(q);
     for c in s.chars() {
@@ -231,9 +220,7 @@ pub fn pystr(s: &str) -> String {
                 out.push('\\');
                 out.push(c)
             }
-            c if (c as u32) < 32 || c as u32 == 127 => {
-                out.push_str(&format!("\\x{:02x}", c as u32))
-            }
+            c if (c as u32) < 32 || c as u32 == 127 => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -244,35 +231,22 @@ pub fn pystr(s: &str) -> String {
 // ---------------------------------------------------------------- field readers
 
 fn keys(table: &Table, where_: &str, allowed: &[&str], required: &[&str]) -> R<()> {
-    let mut unknown: Vec<&str> = table
-        .keys()
-        .map(|k| k.as_str())
-        .filter(|k| !allowed.contains(k))
-        .collect();
+    let mut unknown: Vec<&str> = table.keys().map(|k| k.as_str()).filter(|k| !allowed.contains(k)).collect();
     unknown.sort();
     if !unknown.is_empty() {
         return err(format!("{where_}: unknown key(s) {}", unknown.join(", ")));
     }
-    let mut missing: Vec<&str> = required
-        .iter()
-        .copied()
-        .filter(|k| !table.contains_key(*k))
-        .collect();
+    let mut missing: Vec<&str> = required.iter().copied().filter(|k| !table.contains_key(*k)).collect();
     missing.sort();
     if !missing.is_empty() {
-        return err(format!(
-            "{where_}: missing required key(s) {}; there is no default",
-            missing.join(", ")
-        ));
+        return err(format!("{where_}: missing required key(s) {}; there is no default", missing.join(", ")));
     }
     Ok(())
 }
 
 fn plain(v: &str, where_: &str) -> R<()> {
     if v.chars().any(|c| (c as u32) < 32 || c as u32 == 127) {
-        return err(format!(
-            "{where_} contains a control character (a newline, tab or similar)"
-        ));
+        return err(format!("{where_} contains a control character (a newline, tab or similar)"));
     }
     if v.chars().any(|c| c == '\'' || c == '"' || c == '\\') {
         return err(format!("{where_} contains a quote or a backslash"));
@@ -293,9 +267,7 @@ fn string(table: &Table, key: &str, where_: &str) -> R<String> {
 fn int(table: &Table, key: &str, where_: &str, lo: i64, hi: i64) -> R<i64> {
     match table.get(key) {
         Some(Value::Integer(v)) if lo <= *v && *v <= hi => Ok(*v),
-        _ => err(format!(
-            "{where_}.{key} must be a whole number from {lo} to {hi}"
-        )),
+        _ => err(format!("{where_}.{key} must be a whole number from {lo} to {hi}")),
     }
 }
 
@@ -305,9 +277,7 @@ pub fn is_ifname(s: &str) -> bool {
     !b.is_empty()
         && b.len() <= 15
         && b[0].is_ascii_alphanumeric()
-        && b[1..]
-            .iter()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
+        && b[1..].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'))
 }
 
 fn is_name(s: &str) -> bool {
@@ -316,9 +286,7 @@ fn is_name(s: &str) -> bool {
     !b.is_empty()
         && b.len() <= 32
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
-        && b[1..]
-            .iter()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        && b[1..].iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
 fn ifname(v: &Value, where_: &str) -> R<String> {
@@ -360,9 +328,7 @@ impl Iface {
         let max = if ip.is_ipv4() { 32 } else { 128 };
         let prefix = match p {
             None => max,
-            Some(p) if !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && p.len() <= 3 => {
-                p.parse::<u8>().ok()?
-            }
+            Some(p) if !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) && p.len() <= 3 => p.parse::<u8>().ok()?,
             Some(_) => return None,
         };
         if prefix > max {
@@ -389,11 +355,7 @@ impl Iface {
     fn mask(&self) -> u128 {
         let w = self.width();
         let host = w - self.prefix as u32;
-        let all = if w == 128 {
-            u128::MAX
-        } else {
-            (1u128 << w) - 1
-        };
+        let all = if w == 128 { u128::MAX } else { (1u128 << w) - 1 };
         if host == 0 {
             all
         } else if host >= 128 {
@@ -404,8 +366,7 @@ impl Iface {
     }
 
     pub fn contains(&self, other: IpAddr) -> bool {
-        self.ip.is_ipv4() == other.is_ipv4()
-            && (Self::bits(self.ip) & self.mask()) == (Self::bits(other) & self.mask())
+        self.ip.is_ipv4() == other.is_ipv4() && (Self::bits(self.ip) & self.mask()) == (Self::bits(other) & self.mask())
     }
 
     pub fn num_addresses(&self) -> u128 {
@@ -430,11 +391,7 @@ impl Iface {
     }
 
     pub fn broadcast_address(&self) -> IpAddr {
-        let all = if self.width() == 128 {
-            u128::MAX
-        } else {
-            (1u128 << self.width()) - 1
-        };
+        let all = if self.width() == 128 { u128::MAX } else { (1u128 << self.width()) - 1 };
         self.ip_of((Self::bits(self.ip) & self.mask()) | (all & !self.mask()))
     }
 
@@ -454,11 +411,7 @@ fn port_list(v: &Value, where_: &str, lo: usize, hi: usize) -> R<Vec<String>> {
     let a = match v {
         Value::Array(a) if lo <= a.len() && a.len() <= hi => a,
         _ => {
-            let n = if lo == hi {
-                format!("exactly {lo}")
-            } else {
-                format!("{lo} to {hi}")
-            };
+            let n = if lo == hi { format!("exactly {lo}") } else { format!("{lo} to {hi}") };
             return err(format!("{where_} must list {n} interface(s)"));
         }
     };
@@ -472,11 +425,7 @@ fn port_list(v: &Value, where_: &str, lo: usize, hi: usize) -> R<Vec<String>> {
 
 fn sha(table: &Table, where_: &str) -> R<String> {
     let v = string(table, "sha256", where_)?;
-    if v.len() != 64
-        || !v
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    {
+    if v.len() != 64 || !v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
         return err(format!("{where_}.sha256 must be 64 lowercase hex digits"));
     }
     Ok(v)
@@ -494,80 +443,36 @@ fn as_table<'a>(v: &'a Value, where_: &str) -> R<&'a Table> {
 fn tap(v: &Value) -> R<Tap> {
     let w = "[tap]";
     let t = as_table(v, w)?;
-    keys(
-        t,
-        w,
-        &[
-            "mode",
-            "ports",
-            "management",
-            "source",
-            "speed_mbps",
-            "record",
-        ],
-        &["mode", "ports", "management", "record"],
-    )?;
+    keys(t, w, &["mode", "ports", "management", "source", "speed_mbps", "record"], &["mode", "ports", "management", "record"])?;
     let mode = match &t["mode"] {
         Value::String(s) if s == "inline" || s == "listen" => s.clone(),
-        other => {
-            return err(format!(
-                "{w}.mode must be \"inline\" or \"listen\", not {}",
-                pyrepr(other)
-            ))
-        }
+        other => return err(format!("{w}.mode must be \"inline\" or \"listen\", not {}", pyrepr(other))),
     };
     let (ports, source) = if mode == "inline" {
-        let ports = port_list(
-            &t["ports"],
-            &format!("{w}.ports (inline bridges two ports)"),
-            2,
-            2,
-        )?;
+        let ports = port_list(&t["ports"], &format!("{w}.ports (inline bridges two ports)"), 2, 2)?;
         if t.contains_key("source") {
-            return err(format!(
-                "{w}.source is for listen mode; an inline tap is the device on the link"
-            ));
+            return err(format!("{w}.source is for listen mode; an inline tap is the device on the link"));
         }
         (ports, None)
     } else {
-        let ports = port_list(
-            &t["ports"],
-            &format!("{w}.ports (listen takes one port, or two for a passive tap's two outputs)"),
-            1,
-            2,
-        )?;
+        let ports = port_list(&t["ports"], &format!("{w}.ports (listen takes one port, or two for a passive tap's two outputs)"), 1, 2)?;
         let Some(src) = t.get("source") else {
-            return err(format!(
-                "{w}.source is required in listen mode: one of {}",
-                SOURCES.join(", ")
-            ));
+            return err(format!("{w}.source is required in listen mode: one of {}", SOURCES.join(", ")));
         };
         match src {
             Value::String(s) if SOURCES.contains(&s.as_str()) => (ports, Some(s.clone())),
-            other => {
-                return err(format!(
-                    "{w}.source must be one of {}, not {}",
-                    SOURCES.join(", "),
-                    pyrepr(other)
-                ))
-            }
+            other => return err(format!("{w}.source must be one of {}, not {}", SOURCES.join(", "), pyrepr(other))),
         }
     };
     let mgmt = ifname(&t["management"], &format!("{w}.management"))?;
     if ports.contains(&mgmt) {
-        return err(format!(
-            "{w}.management ({mgmt}) is also a tap port; manage the machine over another interface"
-        ));
+        return err(format!("{w}.management ({mgmt}) is also a tap port; manage the machine over another interface"));
     }
     let mut speed = None;
     if let Some(s) = t.get("speed_mbps") {
         match s {
             Value::Integer(n) if [10, 100, 1000, 2500, 5000, 10000].contains(n) => speed = Some(*n),
-            _ => {
-                return err(format!(
-                    "{w}.speed_mbps must be 10, 100, 1000, 2500, 5000 or 10000"
-                ))
-            }
+            _ => return err(format!("{w}.speed_mbps must be 10, 100, 1000, 2500, 5000 or 10000")),
         }
     }
     if source.as_deref() == Some("copper-tap") && speed.is_none() {
@@ -577,18 +482,8 @@ fn tap(v: &Value) -> R<Tap> {
     }
     let rw = "[tap.record]";
     let r = as_table(&t["record"], rw)?;
-    keys(
-        r,
-        rw,
-        &["ports", "filter", "file_mb", "files", "directory"],
-        &["ports", "filter", "file_mb", "files"],
-    )?;
-    let rports = port_list(
-        &r["ports"],
-        &format!("{rw}.ports"),
-        1,
-        if mode == "inline" { 1 } else { 2 },
-    )?;
+    keys(r, rw, &["ports", "filter", "file_mb", "files", "directory"], &["ports", "filter", "file_mb", "files"])?;
+    let rports = port_list(&r["ports"], &format!("{rw}.ports"), 1, if mode == "inline" { 1 } else { 2 })?;
     for p in &rports {
         if !ports.contains(p) {
             return err(format!("{rw}.ports: {p} is not one of [tap].ports"));
@@ -600,10 +495,8 @@ fn tap(v: &Value) -> R<Tap> {
         Some(Value::String(s)) => Some(s.clone()),
         Some(_) => None,
     };
-    let ok_dir = directory
-        .as_deref()
-        .and_then(|d| d.strip_prefix("/var/lib/goatrope/"))
-        .filter(|n| is_name(n) && !RESERVED_DIRS.contains(n));
+    let ok_dir =
+        directory.as_deref().and_then(|d| d.strip_prefix("/var/lib/goatrope/")).filter(|n| is_name(n) && !RESERVED_DIRS.contains(n));
     if ok_dir.is_none() {
         return err(format!(
             "{rw}.directory must be /var/lib/goatrope/<name> (lowercase letters, digits, hyphens; not {}): goatrope gives it to tcpdump and --purge deletes it",
@@ -639,9 +532,7 @@ pub fn urlsplit(url: &str) -> Url {
         Some(i)
             if i > 0
                 && url.as_bytes()[0].is_ascii_alphabetic()
-                && url[..i]
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')) =>
+                && url[..i].bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')) =>
         {
             (url[..i].to_ascii_lowercase(), &url[i + 1..])
         }
@@ -678,12 +569,7 @@ pub fn urlsplit(url: &str) -> Url {
             }
         }
     }
-    Url {
-        scheme,
-        hostname,
-        port,
-        path,
-    }
+    Url { scheme, hostname, port, path }
 }
 
 fn destination(u: &Value, where_: &str) -> R<Destination> {
@@ -709,15 +595,8 @@ fn destination(u: &Value, where_: &str) -> R<Destination> {
         "udp" | "tcp" => {
             let port = match (&s.hostname, &s.port) {
                 (Some(_), Some(Ok(p))) => *p,
-                (_, Some(Err(_))) => {
-                    return err(format!("{where_}: {url}: Port out of range 0-65535"))
-                }
-                _ => {
-                    return err(format!(
-                        "{where_}: {url} needs an address and a port, e.g. {}://192.0.2.1:5000",
-                        s.scheme
-                    ))
-                }
+                (_, Some(Err(_))) => return err(format!("{where_}: {url}: Port out of range 0-65535")),
+                _ => return err(format!("{where_}: {url} needs an address and a port, e.g. {}://192.0.2.1:5000", s.scheme)),
             };
             let host = s.hostname.clone().unwrap();
             addr(&Value::String(host.clone()), where_)?;
@@ -728,9 +607,7 @@ fn destination(u: &Value, where_: &str) -> R<Destination> {
                 None => None,
             };
             if s.scheme == "tcp" && !matches!(framing_s.as_deref(), Some("len32be") | Some("raw")) {
-                return err(format!(
-                    "{where_}: a tcp destination needs framing = \"len32be\" or \"raw\""
-                ));
+                return err(format!("{where_}: a tcp destination needs framing = \"len32be\" or \"raw\""));
             }
             if s.scheme == "udp" && framing.is_some() {
                 return err(format!("{where_}: framing is for tcp destinations"));
@@ -754,44 +631,23 @@ fn destination(u: &Value, where_: &str) -> R<Destination> {
                 return err(format!("{where_}: {url} has no host"));
             };
             if t.contains_key("framing") || t.contains_key("format") {
-                return err(format!(
-                    "{where_}: an HTTP destination posts each message; no framing or format"
-                ));
+                return err(format!("{where_}: an HTTP destination posts each message; no framing or format"));
             }
             let port = match s.port {
                 Some(Ok(p)) => Some(p),
                 Some(Err(_)) => return err(format!("{where_}: {url}: Port out of range 0-65535")),
                 None => None,
             };
-            let path = if s.path.is_empty() {
-                "/".to_string()
-            } else {
-                s.path.clone()
-            };
-            Ok(Destination {
-                url,
-                scheme: s.scheme,
-                host: Some(host),
-                port,
-                path: Some(path),
-                framing: None,
-                format: None,
-                max_mb: None,
-            })
+            let path = if s.path.is_empty() { "/".to_string() } else { s.path.clone() };
+            Ok(Destination { url, scheme: s.scheme, host: Some(host), port, path: Some(path), framing: None, format: None, max_mb: None })
         }
         "file" => {
             if !s.path.starts_with("/var/lib/goatrope/") || s.path.contains("..") {
-                return err(format!(
-                    "{where_}: a file destination must be under /var/lib/goatrope/"
-                ));
+                return err(format!("{where_}: a file destination must be under /var/lib/goatrope/"));
             }
             let fmt = match get("format") {
                 Some(Value::String(f)) if f == "jsonl" || f == "raw" => f.clone(),
-                _ => {
-                    return err(format!(
-                        "{where_}: a file destination needs format = \"jsonl\" or \"raw\""
-                    ))
-                }
+                _ => return err(format!("{where_}: a file destination needs format = \"jsonl\" or \"raw\"")),
             };
             if t.contains_key("framing") {
                 return err(format!("{where_}: framing is for tcp destinations"));
@@ -813,12 +669,8 @@ fn destination(u: &Value, where_: &str) -> R<Destination> {
                 max_mb: Some(max_mb),
             })
         }
-        "zenoh" => err(format!(
-            "{where_}: goatrope sends no Zenoh itself; use a [[decode]] component's own sink"
-        )),
-        _ => err(format!(
-            "{where_}: {url} is not udp://, tcp://, http(s):// or file://"
-        )),
+        "zenoh" => err(format!("{where_}: goatrope sends no Zenoh itself; use a [[decode]] component's own sink")),
+        _ => err(format!("{where_}: {url} is not udp://, tcp://, http(s):// or file://")),
     }
 }
 
@@ -833,23 +685,14 @@ fn opt_port(m: &Table, key: &str, where_: &str) -> R<Option<u16>> {
 fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
     let w0 = format!("[[send]] #{}", i + 1);
     let s = as_table(v, &w0)?;
-    keys(
-        s,
-        &w0,
-        &["name", "port", "match", "convert", "to"],
-        &["name", "port", "match", "to"],
-    )?;
+    keys(s, &w0, &["name", "port", "match", "convert", "to"], &["name", "port", "match", "to"])?;
     let name = string(s, "name", &w0)?;
     if !is_name(&name) {
-        return err(format!(
-            "{w0}.name is lowercase letters, digits and hyphens"
-        ));
+        return err(format!("{w0}.name is lowercase letters, digits and hyphens"));
     }
     let w = format!("[[send]] {name}");
     let Some(tap) = tap else {
-        return err(format!(
-            "{w}: decode-and-send reads a tap's copy; declare [tap] first"
-        ));
+        return err(format!("{w}: decode-and-send reads a tap's copy; declare [tap] first"));
     };
     let port = ifname(&s["port"], &format!("{w}.port"))?;
     if !tap.ports.contains(&port) {
@@ -857,35 +700,17 @@ fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
     }
     let mw = format!("{w}.match");
     let m = as_table(&s["match"], &mw)?;
-    keys(
-        m,
-        &mw,
-        &["protocol", "src", "dst", "src_port", "dst_port"],
-        &["protocol"],
-    )?;
+    keys(m, &mw, &["protocol", "src", "dst", "src_port", "dst_port"], &["protocol"])?;
     if m["protocol"].as_str() != Some("udp") {
-        return err(format!(
-            "{w}.match.protocol: only \"udp\" is built (TCP stream reassembly is not)"
-        ));
+        return err(format!("{w}.match.protocol: only \"udp\" is built (TCP stream reassembly is not)"));
     }
-    if !["src", "dst", "src_port", "dst_port"]
-        .iter()
-        .any(|k| m.contains_key(*k))
-    {
-        return err(format!(
-            "{w}.match names nothing but the protocol; declare at least one address or port"
-        ));
+    if !["src", "dst", "src_port", "dst_port"].iter().any(|k| m.contains_key(*k)) {
+        return err(format!("{w}.match names nothing but the protocol; declare at least one address or port"));
     }
     let matcher = Match {
         protocol: "udp".into(),
-        src: m
-            .get("src")
-            .map(|v| addr(v, &format!("{w}.match.src")))
-            .transpose()?,
-        dst: m
-            .get("dst")
-            .map(|v| addr(v, &format!("{w}.match.dst")))
-            .transpose()?,
+        src: m.get("src").map(|v| addr(v, &format!("{w}.match.src"))).transpose()?,
+        dst: m.get("dst").map(|v| addr(v, &format!("{w}.match.dst"))).transpose()?,
         src_port: opt_port(m, "src_port", &mw)?,
         dst_port: opt_port(m, "dst_port", &mw)?,
     };
@@ -893,20 +718,10 @@ fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
     if let Some(c) = s.get("convert") {
         let cw = format!("{w}.convert");
         let c = as_table(c, &cw)?;
-        let req = [
-            "component",
-            "binary",
-            "sha256",
-            "version",
-            "from",
-            "to",
-            "packs",
-        ];
+        let req = ["component", "binary", "sha256", "version", "from", "to", "packs"];
         keys(c, &cw, &req, &req)?;
         if c["component"].as_str() != Some("goat-transformers") {
-            return err(format!(
-                "{cw}.component: only \"goat-transformers\" converts"
-            ));
+            return err(format!("{cw}.component: only \"goat-transformers\" converts"));
         }
         convert = Some(Convert {
             binary: string(c, "binary", &cw)?,
@@ -921,51 +736,26 @@ fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
         Value::Array(a) if !a.is_empty() => a,
         _ => return err(format!("{w}.to must list at least one destination")),
     };
-    let to = to
-        .iter()
-        .enumerate()
-        .map(|(j, d)| destination(d, &format!("{w}.to[{j}]")))
-        .collect::<R<Vec<_>>>()?;
-    Ok(Send {
-        name,
-        port,
-        matcher,
-        convert,
-        to,
-    })
+    let to = to.iter().enumerate().map(|(j, d)| destination(d, &format!("{w}.to[{j}]"))).collect::<R<Vec<_>>>()?;
+    Ok(Send { name, port, matcher, convert, to })
 }
 
 fn decode(v: &Value, i: usize, tap: Option<&Tap>) -> R<Decode> {
     let w0 = format!("[[decode]] #{}", i + 1);
     let d = as_table(v, &w0)?;
     // publishers: first-bite's record socket is an address and port, so it is declared, not defaulted
-    let req = [
-        "name",
-        "component",
-        "binary",
-        "sha256",
-        "version",
-        "ports",
-        "filter",
-        "dictionary",
-        "subscribers",
-        "publishers",
-    ];
+    let req = ["name", "component", "binary", "sha256", "version", "ports", "filter", "dictionary", "subscribers", "publishers"];
     keys(d, &w0, &req, &req)?;
     let name = string(d, "name", &w0)?;
     if !is_name(&name) {
-        return err(format!(
-            "{w0}.name is lowercase letters, digits and hyphens"
-        ));
+        return err(format!("{w0}.name is lowercase letters, digits and hyphens"));
     }
     let w = format!("[[decode]] {name}");
     if d["component"].as_str() != Some("first-bite") {
         return err(format!("{w}.component: only \"first-bite\" decodes"));
     }
     let Some(tap) = tap else {
-        return err(format!(
-            "{w}: a decoder reads a tap's copy; declare [tap] first"
-        ));
+        return err(format!("{w}: a decoder reads a tap's copy; declare [tap] first"));
     };
     let ports = port_list(&d["ports"], &format!("{w}.ports"), 1, 2)?;
     for p in &ports {
@@ -991,9 +781,7 @@ fn decode(v: &Value, i: usize, tap: Option<&Tap>) -> R<Decode> {
 pub fn is_wg_key(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 44
-        && b[..42]
-            .iter()
-            .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
+        && b[..42].iter().all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
         && b"AEIMQUYcgkosw480".contains(&b[42])
         && b[43] == b'='
 }
@@ -1014,10 +802,7 @@ fn endpoint(v: &Value, where_: &str) -> R<String> {
         Some((h, p)) => (h, true, p),
         None => ("", false, s.as_str()),
     };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     let name_msg = format!(
         "{where_}: {} must be an IP address and a port; a name is not accepted, because the boundary point is fixed by the declaration",
         pyrepr(v)
@@ -1031,72 +816,39 @@ fn endpoint(v: &Value, where_: &str) -> R<String> {
         _ => return err(name_msg),
     };
     if !sep || !(1..=65535).contains(&n) {
-        return err(format!(
-            "{where_}: {} must end in a port from 1 to 65535",
-            pyrepr(v)
-        ));
+        return err(format!("{where_}: {} must end in a port from 1 to 65535", pyrepr(v)));
     }
-    Ok(if ip.is_ipv6() {
-        format!("[{ip}]:{n}")
-    } else {
-        format!("{ip}:{n}")
-    })
+    Ok(if ip.is_ipv6() { format!("[{ip}]:{n}") } else { format!("{ip}:{n}") })
 }
 
 fn boundary(v: &Value, w: &str) -> R<Boundary> {
     let t = as_table(v, w)?;
-    let req = [
-        "listen_port",
-        "private_key_file",
-        "address",
-        "peer_public_key",
-        "peer_endpoint",
-        "peer_address",
-    ];
+    let req = ["listen_port", "private_key_file", "address", "peer_public_key", "peer_endpoint", "peer_address"];
     let mut allowed = req.to_vec();
     allowed.extend(["preshared_key_file", "keepalive_s"]);
     keys(t, w, &allowed, &req)?;
     let port = int(t, "listen_port", w, 1024, 65535)?;
     if port == NETBIRD_PORT {
-        return err(format!(
-            "{w}.listen_port {NETBIRD_PORT} is the mesh's own WireGuard port; choose another"
-        ));
+        return err(format!("{w}.listen_port {NETBIRD_PORT} is the mesh's own WireGuard port; choose another"));
     }
     let a = match &t["address"] {
         Value::String(s) => Iface::parse(s),
         _ => None,
     };
     let Some(a) = a else {
-        return err(format!(
-            "{w}.address must be an address with a prefix, e.g. 10.200.0.2/30"
-        ));
+        return err(format!("{w}.address must be an address with a prefix, e.g. 10.200.0.2/30"));
     };
     let peer = addr(&t["peer_address"], &format!("{w}.peer_address"))?;
     let pip = parse_ip(&peer).unwrap();
     if !a.contains(pip) || pip == a.ip {
-        return err(format!(
-            "{w}.peer_address {peer} must be another address in {}",
-            a.network()
-        ));
+        return err(format!("{w}.peer_address {peer} must be another address in {}", a.network()));
     }
     match &t["peer_public_key"] {
         Value::String(k) if is_wg_key(k) => {}
-        _ => {
-            return err(format!(
-                "{w}.peer_public_key must be a WireGuard public key (44 base64 characters)"
-            ))
-        }
+        _ => return err(format!("{w}.peer_public_key must be a WireGuard public key (44 base64 characters)")),
     }
-    let psk = if t.contains_key("preshared_key_file") {
-        abs_file(t, "preshared_key_file", w)?
-    } else {
-        String::new()
-    };
-    let ka = if t.contains_key("keepalive_s") {
-        int(t, "keepalive_s", w, 0, 65535)?
-    } else {
-        0
-    };
+    let psk = if t.contains_key("preshared_key_file") { abs_file(t, "preshared_key_file", w)? } else { String::new() };
+    let ka = if t.contains_key("keepalive_s") { int(t, "keepalive_s", w, 0, 65535)? } else { 0 };
     Ok(Boundary {
         listen_port: port as u16,
         private_key_file: abs_file(t, "private_key_file", w)?,
@@ -1115,22 +867,8 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     keys(
         r,
         w,
-        &[
-            "wip",
-            "transport",
-            "boundary",
-            "remote_interface",
-            "link_interface",
-            "link_address",
-            "allow",
-        ],
-        &[
-            "wip",
-            "remote_interface",
-            "link_interface",
-            "link_address",
-            "allow",
-        ],
+        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow"],
+        &["wip", "remote_interface", "link_interface", "link_address", "allow"],
     )?;
     let transport = match r.get("transport") {
         None => "mesh".to_string(),
@@ -1142,31 +880,19 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         }
     };
     if transport == "boundary" && !r.contains_key("boundary") {
-        return err(format!(
-            "{w}: transport \"boundary\" needs a [relay.boundary] table"
-        ));
+        return err(format!("{w}: transport \"boundary\" needs a [relay.boundary] table"));
     }
     if transport == "mesh" && r.contains_key("boundary") {
-        return err(format!(
-            "{w}: [relay.boundary] applies only with transport = \"boundary\""
-        ));
+        return err(format!("{w}: [relay.boundary] applies only with transport = \"boundary\""));
     }
-    let bnd = if transport == "boundary" {
-        Some(boundary(&r["boundary"], &format!("{w}.boundary"))?)
-    } else {
-        None
-    };
+    let bnd = if transport == "boundary" { Some(boundary(&r["boundary"], &format!("{w}.boundary"))?) } else { None };
     if r["wip"].as_bool() != Some(true) {
-        return err(format!(
-            "{w}.wip must be true: the relay is work in progress and transmits on the link"
-        ));
+        return err(format!("{w}.wip must be true: the relay is work in progress and transmits on the link"));
     }
     let remote_if = ifname(&r["remote_interface"], &format!("{w}.remote_interface"))?;
     let link_if = ifname(&r["link_interface"], &format!("{w}.link_interface"))?;
     if remote_if == link_if {
-        return err(format!(
-            "{w}: remote_interface and link_interface must differ"
-        ));
+        return err(format!("{w}: remote_interface and link_interface must differ"));
     }
     if let Some(tap) = tap {
         for name in [&remote_if, &link_if] {
@@ -1188,30 +914,17 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         _ => None,
     };
     let Some(link) = link else {
-        return err(format!(
-            "{w}.link_address must be an address with a prefix, e.g. 192.0.2.50/24"
-        ));
+        return err(format!("{w}.link_address must be an address with a prefix, e.g. 192.0.2.50/24"));
     };
     let allow = match &r["allow"] {
         Value::Array(a) if !a.is_empty() => a,
-        _ => {
-            return err(format!(
-                "{w}.allow must list at least one rule; everything else is denied"
-            ))
-        }
+        _ => return err(format!("{w}.allow must list at least one rule; everything else is denied")),
     };
     let mut rules = Vec::new();
     for (j, a) in allow.iter().enumerate() {
         let aw = format!("{w}.allow[{j}]");
         let a = as_table(a, &aw)?;
-        let req = [
-            "direction",
-            "protocol",
-            "remote",
-            "listen_port",
-            "target",
-            "target_port",
-        ];
+        let req = ["direction", "protocol", "remote", "listen_port", "target", "target_port"];
         keys(a, &aw, &req, &req)?;
         let direction = match a["direction"].as_str() {
             Some(d) if d == "remote-to-link" || d == "both" => d.to_string(),
@@ -1223,15 +936,9 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         let target = addr(&a["target"], &format!("{aw}.target"))?;
         let t = parse_ip(&target).unwrap();
         if !link.contains(t) {
-            return err(format!(
-                "{aw}.target {target} is not on the link ({})",
-                link.network()
-            ));
+            return err(format!("{aw}.target {target} is not on the link ({})", link.network()));
         }
-        if t == link.ip
-            || (link.num_addresses() > 2
-                && (t == link.network_address() || t == link.broadcast_address()))
-            || t.is_multicast()
+        if t == link.ip || (link.num_addresses() > 2 && (t == link.network_address() || t == link.broadcast_address())) || t.is_multicast()
         {
             return err(format!(
                 "{aw}.target {target} is the relay's own, the network, a broadcast or a multicast address; a rule names one machine"
@@ -1249,10 +956,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     let mut seen = BTreeSet::new();
     for rule in &rules {
         if !seen.insert(rule.listen_port) {
-            return err(format!(
-                "{w}.allow: listen_port {} is used twice",
-                rule.listen_port
-            ));
+            return err(format!("{w}.allow: listen_port {} is used twice", rule.listen_port));
         }
     }
     if let Some(b) = &bnd {
@@ -1265,14 +969,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             }
         }
     }
-    Ok(Relay {
-        remote_interface: remote_if,
-        link_interface: link_if,
-        link_address: link.to_string(),
-        rules,
-        transport,
-        boundary: bnd,
-    })
+    Ok(Relay { remote_interface: remote_if, link_interface: link_if, link_address: link.to_string(), rules, transport, boundary: bnd })
 }
 
 pub fn parse(text: &str, path: &str) -> R<Config> {
@@ -1280,19 +977,12 @@ pub fn parse(text: &str, path: &str) -> R<Config> {
         Ok(d) => d,
         Err(e) => return err(format!("{path}: not valid TOML: {}", e.message())),
     };
-    keys(
-        &doc,
-        path,
-        &["schema", "tap", "send", "decode", "relay"],
-        &["schema"],
-    )?;
+    keys(&doc, path, &["schema", "tap", "send", "decode", "relay"], &["schema"])?;
     if doc["schema"].as_integer() != Some(1) {
         return err(format!("{path}: schema must be 1"));
     }
     if !doc.contains_key("tap") && !doc.contains_key("relay") {
-        return err(format!(
-            "{path}: declares no role; declare [tap] or [relay]"
-        ));
+        return err(format!("{path}: declares no role; declare [tap] or [relay]"));
     }
     let tap = doc.get("tap").map(tap).transpose()?;
     let list = |k: &str| -> Vec<Value> {
@@ -1302,40 +992,17 @@ pub fn parse(text: &str, path: &str) -> R<Config> {
             None => vec![],
         }
     };
-    let sends = list("send")
-        .iter()
-        .enumerate()
-        .map(|(i, s)| send(s, i, tap.as_ref()))
-        .collect::<R<Vec<_>>>()?;
-    let decodes = list("decode")
-        .iter()
-        .enumerate()
-        .map(|(i, d)| decode(d, i, tap.as_ref()))
-        .collect::<R<Vec<_>>>()?;
-    let mut names: Vec<&String> = sends
-        .iter()
-        .map(|s| &s.name)
-        .chain(decodes.iter().map(|d| &d.name))
-        .collect();
+    let sends = list("send").iter().enumerate().map(|(i, s)| send(s, i, tap.as_ref())).collect::<R<Vec<_>>>()?;
+    let decodes = list("decode").iter().enumerate().map(|(i, d)| decode(d, i, tap.as_ref())).collect::<R<Vec<_>>>()?;
+    let mut names: Vec<&String> = sends.iter().map(|s| &s.name).chain(decodes.iter().map(|d| &d.name)).collect();
     let n = names.len();
     names.sort();
     names.dedup();
     if names.len() != n {
-        return err(format!(
-            "{path}: a [[send]] or [[decode]] name is used twice"
-        ));
+        return err(format!("{path}: a [[send]] or [[decode]] name is used twice"));
     }
-    let relay = doc
-        .get("relay")
-        .map(|r| relay(r, tap.as_ref()))
-        .transpose()?;
-    Ok(Config {
-        path: path.to_string(),
-        tap,
-        sends,
-        decodes,
-        relay,
-    })
+    let relay = doc.get("relay").map(|r| relay(r, tap.as_ref())).transpose()?;
+    Ok(Config { path: path.to_string(), tap, sends, decodes, relay })
 }
 
 pub fn load(path: &str) -> R<Config> {
@@ -1376,14 +1043,10 @@ files = 4
 
     #[test]
     fn messages_match_python() {
-        assert!(
-            e(&INLINE.replace("mode = \"inline\"\n", "")).contains("missing required key(s) mode")
-        );
+        assert!(e(&INLINE.replace("mode = \"inline\"\n", "")).contains("missing required key(s) mode"));
         assert!(e(&INLINE.replace("\"inline\"", "\"fail-open\"")).contains("not 'fail-open'"));
         assert!(e(&INLINE.replace("[\"tp0\", \"tp1\"]", "[\"tp0\"]")).contains("exactly 2"));
-        assert!(
-            e(&INLINE.replace("[\"tp0\", \"tp1\"]", "[\"tp0\", \"tp0\"]")).contains("listed twice")
-        );
+        assert!(e(&INLINE.replace("[\"tp0\", \"tp1\"]", "[\"tp0\", \"tp0\"]")).contains("listed twice"));
         assert!(e(&(INLINE.to_string() + "\n[tap.extra]\nx = 1\n")).contains("unknown key"));
         assert!(e(&INLINE.replace("filter = \"\"", "filter = \"udp' or 1\"")).contains("quote"));
     }
@@ -1399,18 +1062,9 @@ files = 4
 
     #[test]
     fn endpoints() {
-        assert_eq!(
-            endpoint(&Value::String("203.0.113.7:51900".into()), "w").unwrap(),
-            "203.0.113.7:51900"
-        );
-        assert_eq!(
-            endpoint(&Value::String("[2001:db8::1]:51900".into()), "w").unwrap(),
-            "[2001:db8::1]:51900"
-        );
-        assert!(endpoint(&Value::String("example.org:51900".into()), "w")
-            .unwrap_err()
-            .0
-            .contains("a name is not accepted"));
+        assert_eq!(endpoint(&Value::String("203.0.113.7:51900".into()), "w").unwrap(), "203.0.113.7:51900");
+        assert_eq!(endpoint(&Value::String("[2001:db8::1]:51900".into()), "w").unwrap(), "[2001:db8::1]:51900");
+        assert!(endpoint(&Value::String("example.org:51900".into()), "w").unwrap_err().0.contains("a name is not accepted"));
     }
 
     #[test]

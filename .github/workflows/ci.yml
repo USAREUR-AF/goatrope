@@ -21,8 +21,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Python compiles with the system interpreter (standard library only)
-        run: python3 -m py_compile goatrope/*.py tests/netns/test_tap.py
+      - name: The test scripts compile with the system interpreter
+        run: python3 -m py_compile tests/netns/test_tap.py site/build.py site/fitcheck.py
       - name: Rust formatting, lints and unit tests
         run: |
           rustup component add rustfmt clippy
@@ -35,9 +35,8 @@ jobs:
         run: for f in examples/*.toml; do ./bin/goatrope validate --config "$f"; done
       - name: shellcheck
         run: shellcheck bin/goatrope tests/netns/run.sh tests/arm64/run.sh tools/*.sh
-      - name: VERSION agrees with the package and the binary
+      - name: VERSION agrees with the binary
         run: |
-          test "$(python3 -I -c 'import sys; sys.path.insert(0, "."); import goatrope; print(goatrope.VERSION)')" = "$(cat VERSION)"
           test "$(./bin/goatrope --version)" = "goatrope $(cat VERSION)"
 
   netns:
@@ -50,8 +49,8 @@ jobs:
         ubuntu: ['24.04', '26.04']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: The static binary
-        run: sudo apt-get install -y musl-tools && tools/build-bin.sh
+      - name: The static binary and its unit-test binary
+        run: sudo apt-get install -y musl-tools && GOATROPE_BUILD_UNITS=1 tools/build-bin.sh
       - name: Run (privileged container with systemd as PID 1, veth pairs, namespaces)
         run: OUT="$RUNNER_TEMP/results" tests/netns/run.sh "${{ matrix.ubuntu }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

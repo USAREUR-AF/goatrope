@@ -37,10 +37,7 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 pub fn b64_key(k: &[u8; 32]) -> String {
     let mut out = String::with_capacity(44);
     for chunk in k.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
@@ -96,25 +93,19 @@ fn pubkey(private_key_file: &str) -> Option<String> {
 
 fn file_problem(path: &str, what: &str) -> Option<String> {
     let Ok(st) = std::fs::metadata(path) else {
-        return Some(format!(
-            "{what} {path} does not exist (make it with `goatrope boundary key`)"
-        ));
+        return Some(format!("{what} {path} does not exist (make it with `goatrope boundary key`)"));
     };
     if !st.file_type().is_file() {
         return Some(format!("{what} {path} is not a regular file"));
     }
     if st.uid() != 0 || st.mode() & 0o077 != 0 {
-        return Some(format!(
-            "{what} {path} must be owned by root and readable by root only (mode 600)"
-        ));
+        return Some(format!("{what} {path} must be owned by root and readable by root only (mode 600)"));
     }
     None
 }
 
 fn file_problems(b: &Boundary) -> Vec<String> {
-    let mut out: Vec<String> = file_problem(&b.private_key_file, "private key file")
-        .into_iter()
-        .collect();
+    let mut out: Vec<String> = file_problem(&b.private_key_file, "private key file").into_iter().collect();
     if !b.preshared_key_file.is_empty() {
         out.extend(file_problem(&b.preshared_key_file, "preshared key file"));
     }
@@ -130,11 +121,7 @@ pub fn fmt_endpoint(e: Option<SocketAddr>) -> String {
         Some(SocketAddr::V4(a)) => format!("{}:{}", a.ip(), a.port()),
         Some(SocketAddr::V6(a)) => {
             let scope = if a.scope_id() != 0 {
-                format!(
-                    "%{}",
-                    crate::link::ifname_of(a.scope_id())
-                        .unwrap_or_else(|| a.scope_id().to_string())
-                )
+                format!("%{}", crate::link::ifname_of(a.scope_id()).unwrap_or_else(|| a.scope_id().to_string()))
             } else {
                 String::new()
             };
@@ -148,10 +135,7 @@ pub fn fmt_allowed(ips: &[(IpAddr, u8)]) -> String {
     if ips.is_empty() {
         return "(none)".to_string();
     }
-    ips.iter()
-        .map(|(a, l)| format!("{a}/{l}"))
-        .collect::<Vec<_>>()
-        .join(",")
+    ips.iter().map(|(a, l)| format!("{a}/{l}")).collect::<Vec<_>>().join(",")
 }
 
 /// The keepalive interval; 0 is "off".
@@ -179,42 +163,25 @@ pub fn check(b: &Boundary, ifname: &str) -> Vec<String> {
     }
     let dev = match nl::wg_get(ifname) {
         Ok(d) => d,
-        Err(e) => {
-            return vec![format!(
-                "wg show {ifname} failed: {}",
-                crate::sys::strerror(&e)
-            )]
-        }
+        Err(e) => return vec![format!("wg show {ifname} failed: {}", crate::sys::strerror(&e))],
     };
     if dev.listen_port != b.listen_port {
-        problems.push(format!(
-            "{ifname} listens on {}, not the declared {}",
-            dev.listen_port, b.listen_port
-        ));
+        problems.push(format!("{ifname} listens on {}, not the declared {}", dev.listen_port, b.listen_port));
     }
     match pubkey(&b.private_key_file) {
-        None => problems.push(format!(
-            "cannot derive a public key from {}",
-            b.private_key_file
-        )),
-        Some(want) if dev.public_key.map(|k| b64_key(&k)).as_ref() != Some(&want) => problems.push(
-            format!("{ifname} does not use the key in {}", b.private_key_file),
-        ),
+        None => problems.push(format!("cannot derive a public key from {}", b.private_key_file)),
+        Some(want) if dev.public_key.map(|k| b64_key(&k)).as_ref() != Some(&want) => {
+            problems.push(format!("{ifname} does not use the key in {}", b.private_key_file))
+        }
         Some(_) => {}
     }
     if dev.peers.len() != 1 {
-        problems.push(format!(
-            "{ifname} has {} peers; a boundary interface has exactly one, the boundary point",
-            dev.peers.len()
-        ));
+        problems.push(format!("{ifname} has {} peers; a boundary interface has exactly one, the boundary point", dev.peers.len()));
     }
     if let Some(p) = dev.peers.first() {
         let pubk = b64_key(&p.public_key);
         if pubk != b.peer_public_key {
-            problems.push(format!(
-                "{ifname}'s peer is not the declared boundary point (key {}...)",
-                &pubk[..8]
-            ));
+            problems.push(format!("{ifname}'s peer is not the declared boundary point (key {}...)", &pubk[..8]));
         }
         if !b.preshared_key_file.is_empty() {
             let same = match (p.preshared_key, read_key(&b.preshared_key_file)) {
@@ -226,36 +193,24 @@ pub fn check(b: &Boundary, ifname: &str) -> Vec<String> {
                 _ => false,
             };
             if !same {
-                problems.push(format!(
-                    "{ifname}'s peer does not use the preshared key in {}",
-                    b.preshared_key_file
-                ));
+                problems.push(format!("{ifname}'s peer does not use the preshared key in {}", b.preshared_key_file));
             }
         } else if p.preshared_key.is_some() {
-            problems.push(format!(
-                "{ifname}'s peer has a preshared key the declaration does not name"
-            ));
+            problems.push(format!("{ifname}'s peer has a preshared key the declaration does not name"));
         }
         let endpoint = fmt_endpoint(p.endpoint);
         if endpoint != b.peer_endpoint {
-            problems.push(format!(
-                "{ifname}'s peer endpoint is {endpoint}, not the declared {}",
-                b.peer_endpoint
-            ));
+            problems.push(format!("{ifname}'s peer endpoint is {endpoint}, not the declared {}", b.peer_endpoint));
         }
         let allowed = fmt_allowed(&p.allowed_ips);
         let want_allowed = format!("{}/{}", b.peer_address, host_len(&b.peer_address));
         if allowed != want_allowed {
-            problems.push(format!(
-                "{ifname}'s peer may send from {allowed}; a boundary interface allows only {want_allowed}"
-            ));
+            problems.push(format!("{ifname}'s peer may send from {allowed}; a boundary interface allows only {want_allowed}"));
         }
         let ka = fmt_keepalive(p.keepalive);
         let want_ka = fmt_keepalive(b.keepalive_s);
         if ka != want_ka {
-            problems.push(format!(
-                "{ifname}'s peer keepalive is {ka}, not the declared {want_ka}"
-            ));
+            problems.push(format!("{ifname}'s peer keepalive is {ka}, not the declared {want_ka}"));
         }
     }
     if !nl::addresses(ifname).contains(&b.address) {
@@ -273,28 +228,15 @@ fn make(b: &Boundary, ifname: &str, made: &mut bool) -> Result<(), BoundaryRefus
     nl::add_wireguard(ifname).map_err(|e| err("ip link add", &e))?;
     *made = true;
     let wg_step = format!("wg set {ifname}");
-    let bad_key = || {
-        BoundaryRefusal(format!(
-            "{wg_step} failed: Key is not the correct length or format"
-        ))
-    };
+    let bad_key = || BoundaryRefusal(format!("{wg_step} failed: Key is not the correct length or format"));
     let private_key = read_key(&b.private_key_file).ok_or_else(bad_key)?;
-    let preshared_key = if b.preshared_key_file.is_empty() {
-        None
-    } else {
-        Some(read_key(&b.preshared_key_file).ok_or_else(bad_key)?)
-    };
+    let preshared_key = if b.preshared_key_file.is_empty() { None } else { Some(read_key(&b.preshared_key_file).ok_or_else(bad_key)?) };
     let peer_ip: IpAddr = b.peer_address.parse().map_err(|_| bad_key())?;
     let set = nl::WgSet {
         private_key,
         listen_port: b.listen_port,
         peer_public_key: key_from_b64(&b.peer_public_key).ok_or_else(bad_key)?,
-        endpoint: b.peer_endpoint.parse().map_err(|_| {
-            BoundaryRefusal(format!(
-                "{wg_step} failed: bad endpoint {}",
-                b.peer_endpoint
-            ))
-        })?,
+        endpoint: b.peer_endpoint.parse().map_err(|_| BoundaryRefusal(format!("{wg_step} failed: bad endpoint {}", b.peer_endpoint)))?,
         allowed: (peer_ip, host_len(&b.peer_address)),
         preshared_key,
         keepalive: b.keepalive_s,
@@ -305,15 +247,10 @@ fn make(b: &Boundary, ifname: &str, made: &mut bool) -> Result<(), BoundaryRefus
     crate::sys::write(&format!("/proc/sys/net/ipv4/conf/{ifname}/forwarding"), "0");
     crate::sys::write(&format!("/proc/sys/net/ipv6/conf/{ifname}/forwarding"), "0");
     if !b.address.contains(':') {
-        crate::sys::write(
-            &format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"),
-            "1",
-        );
+        crate::sys::write(&format!("/proc/sys/net/ipv6/conf/{ifname}/disable_ipv6"), "1");
     }
     let (ip, prefix) = b.address.split_once('/').unwrap_or((&b.address, ""));
-    let ip: IpAddr = ip.parse().map_err(|_| {
-        BoundaryRefusal(format!("ip address add failed: bad address {}", b.address))
-    })?;
+    let ip: IpAddr = ip.parse().map_err(|_| BoundaryRefusal(format!("ip address add failed: bad address {}", b.address)))?;
     let prefix: u8 = prefix.parse().unwrap_or(host_len(&b.address));
     nl::add_address(ifname, ip, prefix).map_err(|e| err("ip address add", &e))?;
     nl::set_up(ifname).map_err(|e| err("ip link set", &e))?;
@@ -341,10 +278,7 @@ pub fn up(b: &Boundary, ifname: &str) -> Result<bool, BoundaryRefusal> {
         if made {
             let _ = nl::delete_link(ifname);
         }
-        return Err(BoundaryRefusal(format!(
-            "{ifname} does not match the declaration: {}",
-            problems.join("; ")
-        )));
+        return Err(BoundaryRefusal(format!("{ifname} does not match the declaration: {}", problems.join("; "))));
     }
     Ok(made)
 }
@@ -363,21 +297,14 @@ pub fn down(ifname: &str) -> Result<bool, DownError> {
             "{ifname} is not a WireGuard interface; goatrope removes only its boundary interface"
         ))));
     }
-    nl::delete_link(ifname).map_err(|e| {
-        DownError::Failed(format!(
-            "ip link del {ifname} failed: {}",
-            crate::sys::strerror(&e)
-        ))
-    })?;
+    nl::delete_link(ifname).map_err(|e| DownError::Failed(format!("ip link del {ifname} failed: {}", crate::sys::strerror(&e))))?;
     Ok(true)
 }
 
 /// Write a new private key, mode 600, refusing to replace one. Returns the public key.
 pub fn make_key(path: &str) -> Result<Result<String, BoundaryRefusal>, String> {
     if std::path::Path::new(path).exists() {
-        return Ok(Err(BoundaryRefusal(format!(
-            "{path} already exists; goatrope never replaces a key (remove it yourself to rotate)"
-        ))));
+        return Ok(Err(BoundaryRefusal(format!("{path} already exists; goatrope never replaces a key (remove it yourself to rotate)"))));
     }
     let mut k = [0u8; 32];
     if let Err(e) = getrandom::fill(&mut k) {
@@ -390,14 +317,11 @@ pub fn make_key(path: &str) -> Result<Result<String, BoundaryRefusal>, String> {
     line.push('\n');
     let public = b64_key(&public_from_private(&k));
     k.fill(0);
-    let dir = std::path::Path::new(path)
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty());
+    let dir = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty());
     let dir = dir.unwrap_or(std::path::Path::new("."));
     if !dir.exists() {
         if let Some(up) = dir.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(up)
-                .map_err(|e| crate::sys::oserror(&e, &up.to_string_lossy()))?;
+            std::fs::create_dir_all(up).map_err(|e| crate::sys::oserror(&e, &up.to_string_lossy()))?;
         }
         if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(dir) {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -405,15 +329,10 @@ pub fn make_key(path: &str) -> Result<Result<String, BoundaryRefusal>, String> {
             }
         }
     }
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut f| {
-            f.write_all(line.as_bytes())?;
-            f.sync_all()
-        });
+    let written = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).and_then(|mut f| {
+        f.write_all(line.as_bytes())?;
+        f.sync_all()
+    });
     // overwrite the copy of the key this process holds
     // SAFETY: zero bytes are valid UTF-8, so the string stays valid.
     unsafe { line.as_bytes_mut().fill(0) };
@@ -423,14 +342,9 @@ pub fn make_key(path: &str) -> Result<Result<String, BoundaryRefusal>, String> {
 
 /// What the boundary point's operator needs; no private value.
 pub fn sheet(b: &Boundary, ifname: &str) -> String {
-    let public = pubkey(&b.private_key_file)
-        .unwrap_or_else(|| "(no key yet: goatrope boundary key)".to_string());
+    let public = pubkey(&b.private_key_file).unwrap_or_else(|| "(no key yet: goatrope boundary key)".to_string());
     let mine = b.address.split('/').next().unwrap_or_default();
-    let psk = if b.preshared_key_file.is_empty() {
-        "none"
-    } else {
-        "yes, exchanged out of band"
-    };
+    let psk = if b.preshared_key_file.is_empty() { "none" } else { "yes, exchanged out of band" };
     format!(
         "public key      {public}\n\
          listen port     {} (UDP, on this machine's address facing the boundary point)\n\
@@ -473,42 +387,21 @@ mod tests {
         let s = b64_key(&alice_pub);
         assert_eq!(s, "hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=");
         assert_eq!(key_from_b64(&s), Some(alice_pub));
-        assert_eq!(
-            b64_key(&[0u8; 32]),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-        );
+        assert_eq!(b64_key(&[0u8; 32]), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
         assert_eq!(key_from_b64("short="), None);
-        assert_eq!(
-            key_from_b64("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmoA"),
-            None
-        );
-        assert_eq!(
-            key_from_b64("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066Spjqqb!mo="),
-            None
-        );
+        assert_eq!(key_from_b64("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmoA"), None);
+        assert_eq!(key_from_b64("hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066Spjqqb!mo="), None);
     }
 
     #[test]
     fn wg_show_formats() {
         assert_eq!(fmt_endpoint(None), "(none)");
-        assert_eq!(
-            fmt_endpoint(Some("203.0.113.7:51900".parse().unwrap())),
-            "203.0.113.7:51900"
-        );
-        assert_eq!(
-            fmt_endpoint(Some("[2001:db8::7]:51900".parse().unwrap())),
-            "[2001:db8::7]:51900"
-        );
+        assert_eq!(fmt_endpoint(Some("203.0.113.7:51900".parse().unwrap())), "203.0.113.7:51900");
+        assert_eq!(fmt_endpoint(Some("[2001:db8::7]:51900".parse().unwrap())), "[2001:db8::7]:51900");
         assert_eq!(fmt_allowed(&[]), "(none)");
+        assert_eq!(fmt_allowed(&[("10.200.0.1".parse().unwrap(), 32)]), "10.200.0.1/32");
         assert_eq!(
-            fmt_allowed(&[("10.200.0.1".parse().unwrap(), 32)]),
-            "10.200.0.1/32"
-        );
-        assert_eq!(
-            fmt_allowed(&[
-                ("10.200.0.0".parse().unwrap(), 30),
-                ("2001:db8::1".parse().unwrap(), 128)
-            ]),
+            fmt_allowed(&[("10.200.0.0".parse().unwrap(), 30), ("2001:db8::1".parse().unwrap(), 128)]),
             "10.200.0.0/30,2001:db8::1/128"
         );
         assert_eq!(fmt_keepalive(0), "off");

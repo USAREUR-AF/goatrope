@@ -283,15 +283,9 @@ def read(p):
         return f.read()
 
 
-def outside_stdlib():
-    n = set()
-    for f in sorted(os.listdir(os.path.join(REPO, "goatrope"))):
-        if f.endswith(".py"):
-            for node in ast.walk(ast.parse(read(f"goatrope/{f}"))):
-                mods = [a.name for a in node.names] if isinstance(node, ast.Import) else \
-                    [node.module or ""] if isinstance(node, ast.ImportFrom) and node.level == 0 else []
-                n |= {m.split(".")[0] for m in mods if m.split(".")[0] not in sys.stdlib_module_names}
-    return len(n)
+def static_checked():
+    """1 when every workflow that builds the binary refuses one that is not statically linked."""
+    return int(all("static-pie linked|statically linked" in read(f".github/workflows/{w}") for w in ("ci.yml", "release.yml")))
 
 
 def measures():
@@ -301,7 +295,7 @@ def measures():
                  "deploy: a second inline run loses no ping through the bridge", '"-c", "400"'):
         if need not in t:
             sys.exit(f"site: the page quotes a test that is not there: {need}")
-    return {"inline": "500 of 500", "listen": "0", "ping": "400 of 400", "deps": str(outside_stdlib())}
+    return {"inline": "500 of 500", "listen": "0", "ping": "400 of 400", "static": str(static_checked())}
 
 
 def build():
