@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "goatrope"
+# The released version is the VERSION file; the binary reads it at build time.
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.85"
+
+[dependencies]
+toml = { version = "0.9", default-features = false, features = ["parse", "std", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -30,7 +30,7 @@ import sys
 import time
 
 SRC = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-GR = [sys.executable, "-I", os.path.join(SRC, "bin", "goatrope")]
+GR = [os.path.join(SRC, "bin", "goatrope")]  # the launcher runs bin/<arch>/goatrope
 WORK = "/root/gt"
 CFG = f"{WORK}/goatrope.toml"
 RING = "/var/lib/goatrope/record"
@@ -682,7 +682,7 @@ def phase_uninstall(config_kept: bool) -> None:
     allowed = [x for x in d if x.startswith(("file /etc/goatrope", "file /var/lib/goatrope"))]
     result(set(d) == set(allowed), "uninstall: only the declaration and the recordings remain",
            "; ".join(x for x in d if x not in allowed)[:600])
-    p = subprocess.run(["/usr/bin/python3", "-I", f"{SRC}/bin/goatrope", "uninstall", "--purge"],
+    p = subprocess.run(GR + ["uninstall", "--purge"],
                        capture_output=True, text=True)
     d = diff(before, snapshot())
     result(not d, "uninstall --purge leaves nothing", "; ".join(d)[:600])
