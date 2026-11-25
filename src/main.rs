@@ -5,14 +5,13 @@
 //! Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 
 mod boundary;
-#[allow(dead_code)] // the roles still in Python read most of the declaration (ADR 0003)
 mod config;
-mod fallback;
 mod link;
 mod nl;
 mod relay;
 mod send;
 mod sys;
+mod sysutil;
 mod tap;
 
 pub const VERSION: &str = include_str!("../VERSION");
@@ -47,12 +46,7 @@ Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differ
 /// is the archive, and its VERSION file is part of what the archive's hash covers.
 pub fn version() -> String {
     if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
-        let mut candidates: Vec<std::path::PathBuf> = exe
-            .ancestors()
-            .skip(1)
-            .take(3)
-            .map(|d| d.join("VERSION"))
-            .collect();
+        let mut candidates: Vec<std::path::PathBuf> = exe.ancestors().skip(1).take(3).map(|d| d.join("VERSION")).collect();
         candidates.push("/usr/local/lib/goatrope/VERSION".into());
         candidates.push("/usr/local/lib/goatrope/goatrope/VERSION".into());
         for c in candidates {
@@ -67,28 +61,58 @@ pub fn version() -> String {
     VERSION.trim().to_string()
 }
 
-/// `--config PATH` (or `--config=PATH`) from the arguments after the verb; the default otherwise.
-fn config_path(rest: &[String]) -> Result<String, String> {
-    let mut path = config::DEFAULT_PATH.to_string();
+struct Args {
+    pos: Vec<String>,
+    flags: Vec<String>,
+    config: String,
+}
+
+/// The arguments after the verb: positionals, the flags this verb allows, and `--config PATH`.
+fn args(rest: &[String], allowed: &[&str], npos: usize) -> Result<Args, String> {
+    let mut a = Args { pos: vec![], flags: vec![], config: config::DEFAULT_PATH.to_string() };
     let mut i = 0;
     while i < rest.len() {
-        let a = &rest[i];
-        if a == "--config" {
-            path = rest
-                .get(i + 1)
-                .cloned()
-                .ok_or("argument --config: expected one argument")?;
+        let x = &rest[i];
+        if x == "--config" {
+            a.config = rest.get(i + 1).cloned().ok_or("argument --config: expected one argument")?;
             i += 2;
             continue;
         }
-        if let Some(v) = a.strip_prefix("--config=") {
-            path = v.to_string();
+        if let Some(v) = x.strip_prefix("--config=") {
+            a.config = v.to_string();
+        } else if allowed.contains(&x.as_str()) {
+            a.flags.push(x.clone());
+        } else if x.starts_with('-') || a.pos.len() >= npos {
+            return Err(format!("unrecognized arguments: {x}"));
         } else {
-            return Err(format!("unrecognized arguments: {a}"));
+            a.pos.push(x.clone());
         }
         i += 1;
     }
-    Ok(path)
+    if a.pos.len() < npos {
+        return Err("the following arguments are required: name".into());
+    }
+    Ok(a)
+}
+
+/// `--config PATH` (or `--config=PATH`) from arguments that hold nothing else; the default otherwise.
+fn config_path(rest: &[String]) -> Result<String, String> {
+    args(rest, &[], 0).map(|a| a.config)
+}
+
+/// Load the declaration, then run f; an invalid declaration is a refusal (exit 2).
+fn with_config(rest: &[String], npos: usize, f: impl Fn(&config::Config, &[String]) -> i32) -> i32 {
+    let a = match args(rest, &[], npos) {
+        Ok(a) => a,
+        Err(m) => return usage_error(&m),
+    };
+    match config::load(&a.config) {
+        Ok(cfg) => f(&cfg, &a.pos),
+        Err(e) => {
+            eprintln!("goatrope: refused: {e}");
+            EXIT_REFUSED
+        }
+    }
 }
 
 fn usage_error(msg: &str) -> i32 {
@@ -97,60 +121,152 @@ fn usage_error(msg: &str) -> i32 {
     EXIT_REFUSED
 }
 
-/// A verb with `npos` positional arguments and `--config`: loads the declaration, then runs f.
-fn with_config(rest: &[String], npos: usize, f: impl Fn(&config::Config, &[String]) -> i32) -> i32 {
-    let mut pos = Vec::new();
-    let mut opts = Vec::new();
-    let mut i = 0;
-    while i < rest.len() {
-        if rest[i] == "--config" {
-            opts.extend(rest[i..(i + 2).min(rest.len())].iter().cloned());
-            i += 2;
-        } else if rest[i].starts_with("--") {
-            opts.push(rest[i].clone());
-            i += 1;
-        } else {
-            pos.push(rest[i].clone());
-            i += 1;
-        }
+fn need_root() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("goatrope: run as root (sudo)");
+        return false;
     }
-    if pos.len() != npos {
-        return usage_error("the following arguments are required: name");
-    }
-    let path = match config_path(&opts) {
-        Ok(p) => p,
-        Err(m) => return usage_error(&m),
-    };
-    match config::load(&path) {
-        Ok(cfg) => f(&cfg, &pos),
-        Err(e) => {
-            eprintln!("goatrope: refused: {e}");
-            EXIT_REFUSED
-        }
-    }
+    true
 }
 
-fn validate(rest: &[String]) -> i32 {
-    let path = match config_path(rest) {
-        Ok(p) => p,
+fn refused(e: tap::Refusal) -> i32 {
+    eprintln!("goatrope: refused, nothing was changed: {}", e.0);
+    EXIT_REFUSED
+}
+
+fn run(verb: &str, rest: &[String]) -> i32 {
+    let (allowed, npos): (&[&str], usize) = match verb {
+        "check" => (&["--json"], 0),
+        "deploy" => (&["--dry-run"], 0),
+        "uninstall" => (&["--purge"], 0),
+        "run-send" => (&[], 1),
+        "verify-component" => (&[], 2),
+        _ => (&[], 0),
+    };
+    let a = match args(rest, allowed, npos) {
+        Ok(a) => a,
         Err(m) => return usage_error(&m),
     };
-    match config::load(&path) {
-        Ok(cfg) => {
-            println!("{path}: valid");
+    let flag = |f: &str| a.flags.iter().any(|x| x == f);
+    if verb == "uninstall" {
+        if !need_root() {
+            return EXIT_REFUSED;
+        }
+        return match tap::uninstall(flag("--purge")) {
+            Ok(()) => EXIT_OK,
+            Err(e) => refused(e),
+        };
+    }
+    if verb == "verify-component" && a.pos[0] != "decode" {
+        return usage_error(&format!("argument kind: invalid choice: '{}' (choose from 'decode')", a.pos[0]));
+    }
+    let cfg = match config::load(&a.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("goatrope: refused: {e}");
+            return EXIT_REFUSED;
+        }
+    };
+    match verb {
+        "validate" => {
+            println!("{}: valid", a.config);
             if let Some(t) = &cfg.tap {
                 println!("{}", tap::banner(t));
             }
-            EXIT_OK
+            return EXIT_OK;
         }
-        Err(e) => {
-            eprintln!("goatrope: refused: {e}");
-            EXIT_REFUSED
+        "run-send" => return send::run_send(&cfg, &a.pos[0]),
+        "verify-component" => return send::verify_component(&cfg, &a.pos[0], &a.pos[1]),
+        _ => {}
+    }
+    let Some(t) = &cfg.tap else {
+        eprintln!("goatrope: this declaration has no [tap]; only `goatrope relay` applies");
+        return EXIT_REFUSED;
+    };
+    match verb {
+        "install" => {
+            if !need_root() {
+                return EXIT_REFUSED;
+            }
+            println!("{}", tap::banner(t));
+            if let Err(e) = tap::install(&cfg) {
+                return refused(e);
+            }
+            let bad = tap::check(&cfg).iter().any(|i| i.ok == Some(false));
+            tap::status(&cfg);
+            if bad {
+                EXIT_DIFFERS
+            } else {
+                EXIT_OK
+            }
         }
+        "deploy" => {
+            if !need_root() {
+                return EXIT_REFUSED;
+            }
+            println!("{}", tap::banner(t));
+            let outcome = match tap::deploy(&cfg, flag("--dry-run")) {
+                Ok(o) => o,
+                Err(e) => return refused(e),
+            };
+            let bad: Vec<tap::Item> =
+                if outcome == "changed" { tap::check(&cfg).into_iter().filter(|i| i.ok == Some(false)).collect() } else { vec![] };
+            for i in &bad {
+                println!("  DIFF {}: {} (want {})", i.id, tap::show(&i.have), tap::show(&i.want));
+            }
+            println!("goatrope deploy: {outcome}");
+            if bad.is_empty() {
+                EXIT_OK
+            } else {
+                EXIT_DIFFERS
+            }
+        }
+        "status" => tap::status(&cfg),
+        "check" => {
+            let items = tap::check(&cfg);
+            let nbad = items.iter().filter(|i| i.ok == Some(false)).count();
+            if flag("--json") {
+                println!("{}", tap::check_json(&cfg, &items, nbad > 0));
+            } else {
+                println!("{}", tap::banner(t));
+                for i in &items {
+                    let mark = match i.ok {
+                        Some(true) => "ok  ",
+                        Some(false) => "DIFF",
+                        None => "info",
+                    };
+                    let want = if i.ok == Some(false) { format!(" (want {})", tap::show(&i.want)) } else { String::new() };
+                    println!("  {mark} {}: {}{want}", i.id, tap::show(&i.have));
+                }
+                if nbad > 0 {
+                    println!("result: differs in {nbad} item(s)");
+                } else {
+                    println!("result: matches the declaration");
+                }
+            }
+            if nbad > 0 {
+                EXIT_DIFFERS
+            } else {
+                EXIT_OK
+            }
+        }
+        "apply-ports" => {
+            let problems = tap::apply_ports(&cfg, 120.0);
+            for p in &problems {
+                eprintln!("goatrope: {p}");
+            }
+            if problems.is_empty() {
+                EXIT_OK
+            } else {
+                EXIT_ERROR
+            }
+        }
+        _ => EXIT_ERROR,
     }
 }
 
-fn need_root() -> Result<(), i32> {
+fn root_or_refuse() -> Result<(), i32> {
     if sys::is_root() {
         return Ok(());
     }
@@ -163,15 +279,14 @@ fn relay_cmd(rest: &[String]) -> i32 {
     if let Err(m) = config_path(rest) {
         return usage_error(&m);
     }
-    with_config(rest, 0, |cfg, _| match need_root() {
+    with_config(rest, 0, |cfg, _| match root_or_refuse() {
         Ok(()) => relay::run(cfg),
         Err(code) => code,
     })
 }
 
 const BOUNDARY_ACTIONS: [&str; 5] = ["key", "sheet", "up", "check", "down"];
-const BOUNDARY_USAGE: &str =
-    "usage: goatrope boundary [-h] [--config CONFIG] {key,sheet,up,check,down}";
+const BOUNDARY_USAGE: &str = "usage: goatrope boundary [-h] [--config CONFIG] {key,sheet,up,check,down}";
 
 fn boundary_cmd(rest: &[String]) -> i32 {
     // the one positional (the action) may come before or after --config, as argparse allows
@@ -219,22 +334,16 @@ fn boundary(cfg: &config::Config, action: &str) -> i32 {
         .relay
         .as_ref()
         .filter(|r| r.transport == "boundary")
-        .and_then(|r| {
-            r.boundary
-                .as_ref()
-                .map(|b| (b, r.remote_interface.as_str()))
-        })
+        .and_then(|r| r.boundary.as_ref().map(|b| (b, r.remote_interface.as_str())))
     else {
-        eprintln!(
-            "goatrope boundary: this declaration's [relay] does not use transport = \"boundary\""
-        );
+        eprintln!("goatrope boundary: this declaration's [relay] does not use transport = \"boundary\"");
         return EXIT_REFUSED;
     };
     if action == "sheet" {
         println!("{}", boundary::sheet(b, ifname));
         return EXIT_OK;
     }
-    if let Err(code) = need_root() {
+    if let Err(code) = root_or_refuse() {
         return code;
     }
     let refused = |e: boundary::BoundaryRefusal| {
@@ -244,10 +353,7 @@ fn boundary(cfg: &config::Config, action: &str) -> i32 {
     match action {
         "key" => match boundary::make_key(&b.private_key_file) {
             Ok(Ok(public)) => {
-                println!(
-                    "wrote {} (mode 600); public key {public}",
-                    b.private_key_file
-                );
+                println!("wrote {} (mode 600); public key {public}", b.private_key_file);
                 println!("{}", boundary::sheet(b, ifname));
             }
             Ok(Err(e)) => return refused(e),
@@ -257,10 +363,7 @@ fn boundary(cfg: &config::Config, action: &str) -> i32 {
             }
         },
         "up" => match boundary::up(b, ifname) {
-            Ok(made) => println!(
-                "{ifname}: {}matches the declaration",
-                if made { "made; " } else { "" }
-            ),
+            Ok(made) => println!("{ifname}: {}matches the declaration", if made { "made; " } else { "" }),
             Err(e) => return refused(e),
         },
         "check" => {
@@ -276,10 +379,7 @@ fn boundary(cfg: &config::Config, action: &str) -> i32 {
             return EXIT_DIFFERS;
         }
         _ => match boundary::down(ifname) {
-            Ok(removed) => println!(
-                "{ifname}: {}",
-                if removed { "removed" } else { "not present" }
-            ),
+            Ok(removed) => println!("{ifname}: {}", if removed { "removed" } else { "not present" }),
             Err(boundary::DownError::Refusal(e)) => return refused(e),
             Err(boundary::DownError::Failed(e)) => {
                 eprintln!("goatrope boundary: {e}");
@@ -302,20 +402,12 @@ fn main() {
             print!("{USAGE}");
             EXIT_OK
         }
-        Some("validate") => validate(&args[1..]),
-        Some("run-send") => with_config(&args[1..], 1, |cfg, pos| send::run_send(cfg, &pos[0])),
-        Some("verify-component") => with_config(&args[1..], 2, |cfg, pos| {
-            if pos[0] != "decode" {
-                return usage_error(&format!(
-                    "argument kind: invalid choice: '{}' (choose from 'decode')",
-                    pos[0]
-                ));
-            }
-            send::verify_component(cfg, &pos[0], &pos[1])
-        }),
+        Some(
+            v @ ("validate" | "install" | "deploy" | "status" | "check" | "uninstall" | "apply-ports" | "run-send" | "verify-component"),
+        ) => run(v, &args[1..]),
         Some("relay") => relay_cmd(&args[1..]),
         Some("boundary") => boundary_cmd(&args[1..]),
-        Some(_) => fallback::run(&args),
+        Some(other) => usage_error(&format!("argument cmd: invalid choice: '{other}'")),
     };
     std::process::exit(code);
 }

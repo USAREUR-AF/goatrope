@@ -41,21 +41,13 @@ pub fn ifname_of(index: u32) -> Option<String> {
         return None;
     }
     // SAFETY: if_indextoname wrote a NUL-terminated name into buf.
-    Some(
-        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    Some(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
 }
 
 /// The device the kernel's route to addr leaves through, as `ip route get` names it.
 pub fn route_dev(addr: IpAddr) -> Option<String> {
     let mut msg = RouteMessage::default();
-    msg.header.address_family = if addr.is_ipv4() {
-        AddressFamily::Inet
-    } else {
-        AddressFamily::Inet6
-    };
+    msg.header.address_family = if addr.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
     msg.header.destination_prefix_length = if addr.is_ipv4() { 32 } else { 128 };
     msg.attributes.push(RouteAttribute::Destination(match addr {
         IpAddr::V4(a) => RouteAddress::Inet(a),
@@ -63,10 +55,7 @@ pub fn route_dev(addr: IpAddr) -> Option<String> {
     }));
     let mut header = NetlinkHeader::default();
     header.flags = NLM_F_REQUEST;
-    let mut req = NetlinkMessage::new(
-        header,
-        NetlinkPayload::from(RouteNetlinkMessage::GetRoute(msg)),
-    );
+    let mut req = NetlinkMessage::new(header, NetlinkPayload::from(RouteNetlinkMessage::GetRoute(msg)));
     req.finalize();
     let mut buf = vec![0u8; req.buffer_len()];
     req.serialize(&mut buf);

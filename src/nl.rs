@@ -8,8 +8,8 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use netlink_packet_core::{
-    NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_ACK,
-    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NLM_F_REQUEST,
 };
 use netlink_packet_generic::ctrl::{nlas::GenlCtrlAttrs, GenlCtrl, GenlCtrlCmd};
 use netlink_packet_generic::GenlMessage;
@@ -17,8 +17,8 @@ use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_packet_wireguard::{
-    WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
-    WireguardCmd, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
+    WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute, WireguardCmd, WireguardMessage, WireguardPeer,
+    WireguardPeerAttribute,
 };
 use netlink_sys::protocols::{NETLINK_GENERIC, NETLINK_ROUTE};
 use netlink_sys::{Socket, SocketAddr as NlAddr};
@@ -48,8 +48,7 @@ where
         let (rx, _) = sock.recv_from_full()?;
         let mut off = 0;
         while off < rx.len() {
-            let m = NetlinkMessage::<T>::deserialize(&rx[off..])
-                .map_err(|e| invalid(format!("netlink: {e}")))?;
+            let m = NetlinkMessage::<T>::deserialize(&rx[off..]).map_err(|e| invalid(format!("netlink: {e}")))?;
             let len = m.header.length as usize;
             match m.payload {
                 NetlinkPayload::Done(_) => return Ok(out),
@@ -85,9 +84,7 @@ fn link(ifname: &str) -> io::Result<Option<LinkMessage>> {
 }
 
 fn index(ifname: &str) -> io::Result<u32> {
-    link(ifname)?
-        .map(|l| l.header.index)
-        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
+    link(ifname)?.map(|l| l.header.index).ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
 }
 
 /// The link's kind ("wireguard", "bridge", "veth", ...); None for a plain device or no device.
@@ -107,10 +104,7 @@ pub fn addresses(ifname: &str) -> Vec<String> {
     let Ok(Some(l)) = link(ifname) else {
         return Vec::new();
     };
-    let Ok(all) = route(
-        RouteNetlinkMessage::GetAddress(AddressMessage::default()),
-        NLM_F_DUMP,
-    ) else {
+    let Ok(all) = route(RouteNetlinkMessage::GetAddress(AddressMessage::default()), NLM_F_DUMP) else {
         return Vec::new();
     };
     all.into_iter()
@@ -127,9 +121,7 @@ pub fn addresses(ifname: &str) -> Vec<String> {
                 AddressAttribute::Address(ip) => Some(*ip),
                 _ => None,
             });
-            local
-                .or(addr)
-                .map(|ip| format!("{ip}/{}", a.header.prefix_len))
+            local.or(addr).map(|ip| format!("{ip}/{}", a.header.prefix_len))
         })
         .collect()
 }
@@ -138,10 +130,7 @@ pub fn addresses(ifname: &str) -> Vec<String> {
 pub fn add_wireguard(ifname: &str) -> io::Result<()> {
     let mut m = LinkMessage::default();
     m.attributes.push(LinkAttribute::IfName(ifname.to_string()));
-    m.attributes
-        .push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(
-            InfoKind::Wireguard,
-        )]));
+    m.attributes.push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]));
     route(RouteNetlinkMessage::NewLink(m), NLM_F_CREATE | NLM_F_EXCL).map(|_| ())
 }
 
@@ -166,27 +155,17 @@ pub fn add_address(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<()> {
     let mut m = AddressMessage::default();
     m.header.index = index(ifname)?;
     m.header.prefix_len = prefix;
-    m.header.family = if ip.is_ipv4() {
-        AddressFamily::Inet
-    } else {
-        AddressFamily::Inet6
-    };
+    m.header.family = if ip.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
     m.attributes.push(AddressAttribute::Local(ip));
     m.attributes.push(AddressAttribute::Address(ip));
-    route(
-        RouteNetlinkMessage::NewAddress(m),
-        NLM_F_CREATE | NLM_F_EXCL,
-    )
-    .map(|_| ())
+    route(RouteNetlinkMessage::NewAddress(m), NLM_F_CREATE | NLM_F_EXCL).map(|_| ())
 }
 
 // ---------------------------------------------------------------- WireGuard (generic netlink)
 
 fn wireguard_family() -> io::Result<u16> {
-    let m = GenlMessage::from_payload(GenlCtrl {
-        cmd: GenlCtrlCmd::GetFamily,
-        nlas: vec![GenlCtrlAttrs::FamilyName("wireguard".to_string())],
-    });
+    let m =
+        GenlMessage::from_payload(GenlCtrl { cmd: GenlCtrlCmd::GetFamily, nlas: vec![GenlCtrlAttrs::FamilyName("wireguard".to_string())] });
     let replies = request(NETLINK_GENERIC, NetlinkMessage::from(m), 0)?;
     replies
         .iter()
@@ -198,11 +177,7 @@ fn wireguard_family() -> io::Result<u16> {
         .ok_or_else(|| invalid("netlink: no wireguard family id".to_string()))
 }
 
-fn wireguard(
-    cmd: WireguardCmd,
-    attributes: Vec<WireguardAttribute>,
-    flags: u16,
-) -> io::Result<Vec<WireguardMessage>> {
+fn wireguard(cmd: WireguardCmd, attributes: Vec<WireguardAttribute>, flags: u16) -> io::Result<Vec<WireguardMessage>> {
     let family = wireguard_family()?;
     let mut m = GenlMessage::from_payload(WireguardMessage { cmd, attributes });
     m.set_resolved_family_id(family);
@@ -235,9 +210,7 @@ fn peer_from(attrs: &[WireguardPeerAttribute]) -> WgPeer {
     for a in attrs {
         match a {
             WireguardPeerAttribute::PublicKey(k) => p.public_key = *k,
-            WireguardPeerAttribute::PresharedKey(k) if k.iter().any(|b| *b != 0) => {
-                p.preshared_key = Some(*k)
-            }
+            WireguardPeerAttribute::PresharedKey(k) if k.iter().any(|b| *b != 0) => p.preshared_key = Some(*k),
             WireguardPeerAttribute::Endpoint(e) => p.endpoint = Some(*e),
             WireguardPeerAttribute::PersistentKeepalive(k) => p.keepalive = *k,
             WireguardPeerAttribute::AllowedIps(ips) => {
@@ -264,20 +237,14 @@ fn peer_from(attrs: &[WireguardPeerAttribute]) -> WgPeer {
 /// `wg show <ifname> dump`. The kernel may split the peers, and one peer's allowed IPs, over
 /// several messages; a peer that continues from the previous message is merged into it.
 pub fn wg_get(ifname: &str) -> io::Result<WgDevice> {
-    let msgs = wireguard(
-        WireguardCmd::GetDevice,
-        vec![WireguardAttribute::IfName(ifname.to_string())],
-        NLM_F_DUMP,
-    )?;
+    let msgs = wireguard(WireguardCmd::GetDevice, vec![WireguardAttribute::IfName(ifname.to_string())], NLM_F_DUMP)?;
     let mut d = WgDevice::default();
     for mut m in msgs {
         for a in m.attributes.iter_mut() {
             match a {
                 // the kernel sends the private key to a privileged caller; it is not kept
                 WireguardAttribute::PrivateKey(k) => k.fill(0),
-                WireguardAttribute::PublicKey(k) if k.iter().any(|b| *b != 0) => {
-                    d.public_key = Some(*k)
-                }
+                WireguardAttribute::PublicKey(k) if k.iter().any(|b| *b != 0) => d.public_key = Some(*k),
                 WireguardAttribute::ListenPort(p) => d.listen_port = *p,
                 WireguardAttribute::Peers(peers) => {
                     for p in peers.iter() {
@@ -320,11 +287,7 @@ impl Drop for WgSet {
 /// `wg set <ifname> listen-port .. private-key .. peer .. endpoint .. allowed-ips .. [preshared-key ..] [persistent-keepalive ..]`
 pub fn wg_set(ifname: &str, s: &WgSet) -> io::Result<()> {
     let (ip, cidr) = s.allowed;
-    let fam = if ip.is_ipv4() {
-        WireguardAddressFamily::Ipv4
-    } else {
-        WireguardAddressFamily::Ipv6
-    };
+    let fam = if ip.is_ipv4() { WireguardAddressFamily::Ipv4 } else { WireguardAddressFamily::Ipv6 };
     let mut peer = vec![
         WireguardPeerAttribute::PublicKey(s.peer_public_key),
         WireguardPeerAttribute::Endpoint(s.endpoint),

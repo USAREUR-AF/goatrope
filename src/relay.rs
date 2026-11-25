@@ -41,20 +41,14 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             r.remote_interface
         ));
     }
-    if r.transport == "boundary" && sys::exists(&r.remote_interface) && !is_wg(&r.remote_interface)
-    {
-        return refuse(format!(
-            "{} exists and is not a WireGuard interface; it cannot be the boundary interface",
-            r.remote_interface
-        ));
+    if r.transport == "boundary" && sys::exists(&r.remote_interface) && !is_wg(&r.remote_interface) {
+        return refuse(format!("{} exists and is not a WireGuard interface; it cannot be the boundary interface", r.remote_interface));
     }
     if !sys::exists(&r.link_interface) {
         return refuse(format!("no interface {}", r.link_interface));
     }
     let link_kind = nl::kind(&r.link_interface);
-    if matches!(link_kind.as_deref(), Some("bridge") | Some("wireguard"))
-        || sys::master(&r.link_interface).is_some()
-    {
+    if matches!(link_kind.as_deref(), Some("bridge") | Some("wireguard")) || sys::master(&r.link_interface).is_some() {
         return refuse(format!(
             "{} is a bridge, a tunnel or a bridge member; the relay sends from a plain interface of its own",
             r.link_interface
@@ -66,12 +60,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
         return refuse("a relay interface is a tap interface".to_string());
     }
     if !r.link_address.contains(':')
-        && sys::read(&format!(
-            "/proc/sys/net/ipv6/conf/{}/disable_ipv6",
-            r.link_interface
-        ))
-        .as_deref()
-            != Some("1")
+        && sys::read(&format!("/proc/sys/net/ipv6/conf/{}/disable_ipv6", r.link_interface)).as_deref() != Some("1")
     {
         return refuse(format!(
             "IPv6 is on for {}: the kernel would send neighbor discovery and MLD frames on the link. Disable it (net.ipv6.conf.<if>.disable_ipv6 = 1) or declare an IPv6 address",
@@ -87,11 +76,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
     }
     let addrs = nl::addresses(&r.link_interface);
     if !addrs.contains(&r.link_address) {
-        let have = if addrs.is_empty() {
-            "none".to_string()
-        } else {
-            addrs.join(", ")
-        };
+        let have = if addrs.is_empty() { "none".to_string() } else { addrs.join(", ") };
         return refuse(format!(
             "{} does not hold {} (it has {have}); configure the relay's own address on its interface first",
             r.link_interface, r.link_address
@@ -99,10 +84,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
     }
     if r.transport == "boundary" {
         // last, so a refusal above leaves the machine as it was
-        let b = r
-            .boundary
-            .as_ref()
-            .expect("transport boundary has a [relay.boundary]");
+        let b = r.boundary.as_ref().expect("transport boundary has a [relay.boundary]");
         let made = boundary::up(b, &r.remote_interface).map_err(|e| RelayRefusal(e.0))?;
         println!(
             "goatrope relay (WIP): boundary interface {} {}, one peer {} at {}",
@@ -118,11 +100,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
 fn forwarding(r: &Relay) -> Vec<String> {
     let mut on: Vec<String> = [&r.remote_interface, &r.link_interface]
         .iter()
-        .flat_map(|i| {
-            sys::forwarding(i)
-                .into_iter()
-                .map(move |fam| format!("{fam} on {i}"))
-        })
+        .flat_map(|i| sys::forwarding(i).into_iter().map(move |fam| format!("{fam} on {i}")))
         .collect();
     if sys::read("/proc/sys/net/ipv6/conf/all/forwarding").as_deref() == Some("1") {
         // IPv6 forwards on the global setting, whatever each interface says
@@ -133,11 +111,7 @@ fn forwarding(r: &Relay) -> Vec<String> {
 
 /// A UDP socket bound to one device (SO_BINDTODEVICE) and to addr:port, non-blocking.
 fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
-    let fam = if addr.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
+    let fam = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: plain socket(2) call; the descriptor is owned by the UdpSocket below.
     let fd = unsafe { libc::socket(fam, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -147,13 +121,7 @@ fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
     let sock = unsafe { UdpSocket::from_raw_fd(fd) };
     // SAFETY: the option value is dev's bytes with their length.
     let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            dev.as_ptr() as *const libc::c_void,
-            dev.len() as libc::socklen_t,
-        )
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, dev.as_ptr() as *const libc::c_void, dev.len() as libc::socklen_t)
     };
     if rc != 0 {
         return Err(io::Error::last_os_error());
@@ -166,13 +134,7 @@ fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
             sa.sin_port = port.to_be();
             sa.sin_addr.s_addr = u32::from_ne_bytes(a.octets());
             // SAFETY: sa is a sockaddr_in of the size given.
-            unsafe {
-                libc::bind(
-                    fd,
-                    &sa as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                )
-            }
+            unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) }
         }
         IpAddr::V6(a) => {
             // SAFETY: an all-zero sockaddr_in6 is valid; the fields are filled below.
@@ -182,11 +144,7 @@ fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
             sa.sin6_addr.s6_addr = a.octets();
             // SAFETY: sa is a sockaddr_in6 of the size given.
             unsafe {
-                libc::bind(
-                    fd,
-                    &sa as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                )
+                libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
             }
         }
     };
@@ -231,20 +189,13 @@ fn health_json(time: f64, state: &[RuleState]) -> String {
             )
         })
         .collect();
-    format!(
-        "{{\"time\": {}, \"rules\": [{}]}}",
-        json_float(time),
-        rows.join(", ")
-    )
+    format!("{{\"time\": {}, \"rules\": [{}]}}", json_float(time), rows.join(", "))
 }
 
 fn health(state: &[RuleState]) -> Result<(), String> {
     let dir = std::path::Path::new(HEALTH).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| sys::oserror(&e, &dir.to_string_lossy()))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let tmp = format!("{HEALTH}.new");
     let res = std::fs::write(&tmp, health_json(now, state))
         .map_err(|e| sys::oserror(&e, &tmp))
@@ -272,18 +223,11 @@ pub fn run(cfg: &Config) -> i32 {
 fn serve(cfg: &Config) -> Result<i32, String> {
     let r = cfg.relay.as_ref().unwrap();
     let link_ip = r.link_address.split('/').next().unwrap_or_default();
-    let link_addr: IpAddr = link_ip
-        .parse()
-        .map_err(|_| format!("bad link address {link_ip}"))?;
+    let link_addr: IpAddr = link_ip.parse().map_err(|_| format!("bad link address {link_ip}"))?;
     let mut state: Vec<RuleState> = Vec::new();
     for rule in &r.rules {
-        let any: IpAddr = if rule.remote.contains(':') {
-            "::".parse().unwrap()
-        } else {
-            "0.0.0.0".parse().unwrap()
-        };
-        let remote_sock =
-            bound(&r.remote_interface, any, rule.listen_port).map_err(|e| sys::strerror(&e))?;
+        let any: IpAddr = if rule.remote.contains(':') { "::".parse().unwrap() } else { "0.0.0.0".parse().unwrap() };
+        let remote_sock = bound(&r.remote_interface, any, rule.listen_port).map_err(|e| sys::strerror(&e))?;
         let link_sock = bound(&r.link_interface, link_addr, 0).map_err(|e| sys::strerror(&e))?;
         state.push(RuleState {
             rule,
@@ -299,13 +243,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         });
         println!(
             "goatrope relay (WIP): {} -> {}:{} => {link_ip} -> {}:{} on {} ({})",
-            rule.remote,
-            r.remote_interface,
-            rule.listen_port,
-            rule.target,
-            rule.target_port,
-            r.link_interface,
-            rule.direction
+            rule.remote, r.remote_interface, rule.listen_port, rule.target, rule.target_port, r.link_interface, rule.direction
         );
     }
     let mut last = Instant::now();
@@ -315,11 +253,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         let mut fds: Vec<libc::pollfd> = state
             .iter()
             .flat_map(|s| [s.remote_sock.as_raw_fd(), s.link_sock.as_raw_fd()])
-            .map(|fd| libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            })
+            .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
         // SAFETY: fds is a valid array of pollfd of the length given.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
@@ -330,11 +264,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                 }
                 let st = &mut state[i / 2];
                 let from_remote = i % 2 == 0;
-                let sock = if from_remote {
-                    &st.remote_sock
-                } else {
-                    &st.link_sock
-                };
+                let sock = if from_remote { &st.remote_sock } else { &st.link_sock };
                 let Ok((len, src)) = sock.recv_from(&mut buf) else {
                     continue;
                 };
@@ -344,13 +274,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                     if Some(src.ip()) != st.remote {
                         st.denied += 1;
                         if last_denied_log.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
-                            println!(
-                                "denied: {}:{} -> port {} (allowed: {})",
-                                src.ip(),
-                                src.port(),
-                                rule.listen_port,
-                                rule.remote
-                            );
+                            println!("denied: {}:{} -> port {} (allowed: {})", src.ip(), src.port(), rule.listen_port, rule.remote);
                             last_denied_log = Some(Instant::now());
                         }
                         continue;
@@ -370,8 +294,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                     }
                 } else {
                     let from_target = Some(src.ip()) == st.target && src.port() == rule.target_port;
-                    let Some(peer) = st.peer.filter(|_| rule.direction == "both" && from_target)
-                    else {
+                    let Some(peer) = st.peer.filter(|_| rule.direction == "both" && from_target) else {
                         st.denied += 1;
                         continue;
                     };
@@ -388,20 +311,13 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
-                eprintln!(
-                    "goatrope relay: stopping: IP forwarding was turned on ({})",
-                    fwd.join(", ")
-                );
+                eprintln!("goatrope relay: stopping: IP forwarding was turned on ({})", fwd.join(", "));
                 return Ok(crate::EXIT_ERROR);
             }
             if r.transport == "boundary" {
                 let drift = boundary::check(r.boundary.as_ref().unwrap(), &r.remote_interface);
                 if !drift.is_empty() {
-                    eprintln!(
-                        "goatrope relay: stopping: {} no longer matches the declaration: {}",
-                        r.remote_interface,
-                        drift.join("; ")
-                    );
+                    eprintln!("goatrope relay: stopping: {} no longer matches the declaration: {}", r.remote_interface, drift.join("; "));
                     return Ok(crate::EXIT_ERROR);
                 }
             }

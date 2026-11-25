@@ -25,9 +25,7 @@ pub fn oserror(e: &std::io::Error, path: &str) -> String {
 
 /// A file's content without surrounding whitespace; None when it cannot be read.
 pub fn read(path: &str) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
 /// Write a value to a file such as a sysctl under /proc/sys; false when it cannot be written.
@@ -53,9 +51,7 @@ pub fn master(ifname: &str) -> Option<String> {
 pub fn forwarding(ifname: &str) -> Vec<&'static str> {
     ["ipv4", "ipv6"]
         .into_iter()
-        .filter(|fam| {
-            read(&format!("/proc/sys/net/{fam}/conf/{ifname}/forwarding")).as_deref() == Some("1")
-        })
+        .filter(|fam| read(&format!("/proc/sys/net/{fam}/conf/{ifname}/forwarding")).as_deref() == Some("1"))
         .collect()
 }
 

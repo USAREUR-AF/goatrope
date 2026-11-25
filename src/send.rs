@@ -30,10 +30,7 @@ pub fn component_path(sha: &str) -> String {
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn sha256_file(path: &str) -> Option<String> {
@@ -62,14 +59,8 @@ pub fn install_component(binary: &str, sha: &str) -> Option<String> {
         fs::create_dir_all(COMPONENTS).ok()?;
         let _ = fs::set_permissions(COMPONENTS, fs::Permissions::from_mode(0o755));
         let tmp = format!("{dest}.new");
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o555)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)
-            .ok()?;
+        let mut f =
+            OpenOptions::new().write(true).create(true).truncate(true).mode(0o555).custom_flags(libc::O_NOFOLLOW).open(&tmp).ok()?;
         f.write_all(&data).ok()?;
         f.set_permissions(fs::Permissions::from_mode(0o555)).ok()?;
         f.sync_all().ok()?;
@@ -80,21 +71,14 @@ pub fn install_component(binary: &str, sha: &str) -> Option<String> {
 }
 
 pub fn verify_component(cfg: &Config, kind: &str, name: &str) -> i32 {
-    let found = if kind == "decode" {
-        cfg.decodes.iter().find(|d| d.name == name)
-    } else {
-        None
-    };
+    let found = if kind == "decode" { cfg.decodes.iter().find(|d| d.name == name) } else { None };
     let Some(d) = found else {
         eprintln!("goatrope: no [[decode]] {name}");
         return 2;
     };
     if install_component(&d.binary, &d.sha256).is_none() {
         let have = sha256_file(&d.binary).unwrap_or_else(|| "None".into());
-        eprintln!(
-            "goatrope: {} is not the pinned first-bite {} (sha256 {have})",
-            d.binary, d.version
-        );
+        eprintln!("goatrope: {} is not the pinned first-bite {} (sha256 {have})", d.binary, d.version);
         return 1;
     }
     0
@@ -139,11 +123,7 @@ fn ifname_of(index: u32) -> Option<String> {
         return None;
     }
     // SAFETY: if_indextoname wrote a NUL-terminated name into buf.
-    Some(
-        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
-            .to_string_lossy()
-            .into_owned(),
-    )
+    Some(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------- frames
@@ -171,54 +151,31 @@ impl Fragments {
     pub const MAX_BYTES: usize = 4 << 20;
 
     pub fn new() -> Self {
-        Fragments {
-            pending: HashMap::new(),
-            bytes: 0,
-        }
+        Fragments { pending: HashMap::new(), bytes: 0 }
     }
 
     #[cfg(test)]
     pub fn held(&self) -> usize {
-        self.pending
-            .values()
-            .map(|e| e.parts.values().map(Vec::len).sum::<usize>())
-            .sum()
+        self.pending.values().map(|e| e.parts.values().map(Vec::len).sum::<usize>()).sum()
     }
 
-    pub fn add(
-        &mut self,
-        key: (String, String, u16),
-        offset: usize,
-        more: bool,
-        data: &[u8],
-    ) -> Option<Vec<u8>> {
+    pub fn add(&mut self, key: (String, String, u16), offset: usize, more: bool, data: &[u8]) -> Option<Vec<u8>> {
         let now = Instant::now();
-        let old: Vec<_> = self
-            .pending
-            .iter()
-            .filter(|(_, v)| now.duration_since(v.t) > Duration::from_secs(30))
-            .map(|(k, _)| k.clone())
-            .collect();
+        let old: Vec<_> =
+            self.pending.iter().filter(|(_, v)| now.duration_since(v.t) > Duration::from_secs(30)).map(|(k, _)| k.clone()).collect();
         for k in old {
             if let Some(e) = self.pending.remove(&k) {
                 self.bytes -= e.parts.values().map(Vec::len).sum::<usize>();
             }
         }
-        if self.pending.len() > 256
-            || self.bytes + data.len() > Self::MAX_BYTES
-            || offset + data.len() > 65535
-        {
+        if self.pending.len() > 256 || self.bytes + data.len() > Self::MAX_BYTES || offset + data.len() > 65535 {
             self.pending.clear();
             self.bytes = 0;
             if offset + data.len() > 65535 {
                 return None;
             }
         }
-        let e = self.pending.entry(key.clone()).or_insert_with(|| Pending {
-            t: now,
-            parts: Default::default(),
-            end: None,
-        });
+        let e = self.pending.entry(key.clone()).or_insert_with(|| Pending { t: now, parts: Default::default(), end: None });
         let prev = e.parts.get(&offset).map(Vec::len).unwrap_or(0);
         self.bytes = self.bytes + data.len() - prev;
         e.parts.insert(offset, data.to_vec());
@@ -297,9 +254,7 @@ pub fn parse(frame: &[u8], frags: &mut Fragments, m: Option<&Match>) -> Option<D
         let more = fl & 0x2000 != 0;
         if foff != 0 || more {
             if let Some(m) = m {
-                if m.src.as_ref().is_some_and(|s| *s != src)
-                    || m.dst.as_ref().is_some_and(|d| *d != dst)
-                {
+                if m.src.as_ref().is_some_and(|s| *s != src) || m.dst.as_ref().is_some_and(|d| *d != dst) {
                     return None;
                 }
             }
@@ -326,18 +281,8 @@ pub fn parse(frame: &[u8], frags: &mut Fragments, m: Option<&Match>) -> Option<D
     let sport = be16(&body, 0);
     let dport = be16(&body, 2);
     let ulen = be16(&body, 4) as usize;
-    let payload = if ulen >= 8 {
-        slice(&body, 8, ulen).to_vec()
-    } else {
-        body[8..].to_vec()
-    };
-    Some(Datagram {
-        src,
-        dst,
-        sport,
-        dport,
-        payload,
-    })
+    let payload = if ulen >= 8 { slice(&body, 8, ulen).to_vec() } else { body[8..].to_vec() };
+    Some(Datagram { src, dst, sport, dport, payload })
 }
 
 pub fn matches(m: &Match, d: &Datagram) -> bool {
@@ -383,10 +328,7 @@ pub fn py_float(x: f64) -> String {
 }
 
 fn now_f64() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 fn round6(x: f64) -> f64 {
@@ -415,29 +357,18 @@ pub struct Sink {
 
 impl Sink {
     pub fn new(d: Destination, taken: BTreeSet<String>) -> Sink {
-        Sink {
-            d,
-            taken,
-            udp: None,
-            tcp: None,
-            file: None,
-            http: None,
-        }
+        Sink { d, taken, udp: None, tcp: None, file: None, http: None }
     }
 
     fn guard(&self) -> Result<(), String> {
         if let Some(h) = &self.d.host {
-            let devs =
-                destination_devices(h).map_err(|e| format!("{}: {e}; not sending", self.d.url))?;
+            let devs = destination_devices(h).map_err(|e| format!("{}: {e}; not sending", self.d.url))?;
             let bad: Vec<&String> = devs.iter().filter(|d| self.taken.contains(*d)).collect();
             if !bad.is_empty() {
                 return Err(format!(
                     "{} is reached through tap port {}; not sending",
                     self.d.url,
-                    bad.iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
                 ));
             }
         }
@@ -459,29 +390,17 @@ impl Sink {
             "udp" => {
                 if self.udp.is_none() {
                     self.guard()?;
-                    let bind = if self.d.host.as_deref().unwrap_or("").contains(':') {
-                        "[::]:0"
-                    } else {
-                        "0.0.0.0:0"
-                    };
+                    let bind = if self.d.host.as_deref().unwrap_or("").contains(':') { "[::]:0" } else { "0.0.0.0:0" };
                     self.udp = Some(UdpSocket::bind(bind).map_err(|e| strerror(&e))?);
                 }
-                self.udp
-                    .as_ref()
-                    .unwrap()
-                    .send_to(payload, self.target())
-                    .map_err(|e| strerror(&e))?;
+                self.udp.as_ref().unwrap().send_to(payload, self.target()).map_err(|e| strerror(&e))?;
                 Ok(())
             }
             "tcp" => {
                 if self.tcp.is_none() {
                     self.guard()?;
-                    let addr: SocketAddr = self
-                        .target()
-                        .parse()
-                        .map_err(|_| "bad address".to_string())?;
-                    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-                        .map_err(|e| strerror(&e))?;
+                    let addr: SocketAddr = self.target().parse().map_err(|_| "bad address".to_string())?;
+                    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| strerror(&e))?;
                     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
                     self.tcp = Some(s);
                 }
@@ -516,19 +435,11 @@ impl Sink {
                     .map_err(|e| format!("HTTP: {e}"))?;
                 let code = r.status().as_u16();
                 if (300..400).contains(&code) {
-                    let to = r
-                        .headers()
-                        .get("location")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
+                    let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                     return Err(format!("HTTP Error {code}: redirect to {to} refused"));
                 }
                 if code >= 400 {
-                    return Err(format!(
-                        "HTTP Error {code}: {}",
-                        r.status().canonical_reason().unwrap_or("")
-                    ));
+                    return Err(format!("HTTP Error {code}: {}", r.status().canonical_reason().unwrap_or("")));
                 }
                 let mut body = r.into_body();
                 let _ = body.read_to_vec();
@@ -593,26 +504,13 @@ pub fn convert(c: &Convert, payload: &[u8], binary: &str) -> Result<Vec<u8>, Str
         }
     }
     let mut child = Command::new(binary)
-        .args([
-            "convert",
-            "--from",
-            &c.from_format,
-            "--to",
-            &c.to_format,
-            "--packs",
-            &c.packs,
-            "--packs-only",
-            &packs.join(","),
-        ])
+        .args(["convert", "--from", &c.from_format, "--to", &c.to_format, "--packs", &c.packs, "--packs-only", &packs.join(",")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| strerror(&e))?;
-    let mut input: Vec<u8> = payload
-        .iter()
-        .flat_map(|b| format!("{b:02x}").into_bytes())
-        .collect();
+    let mut input: Vec<u8> = payload.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect();
     input.push(b'\n');
     {
         let mut stdin = child.stdin.take().unwrap();
@@ -653,13 +551,7 @@ struct PacketSocket(libc::c_int);
 impl PacketSocket {
     fn open(ifname: &str) -> Result<PacketSocket, String> {
         // SAFETY: plain socket(2) call; the descriptor is owned by PacketSocket and closed on drop.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_PACKET,
-                libc::SOCK_RAW,
-                (ETH_P_ALL.to_be()) as libc::c_int,
-            )
-        };
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (ETH_P_ALL.to_be()) as libc::c_int) };
         if fd < 0 {
             return Err(strerror(&std::io::Error::last_os_error()));
         }
@@ -677,19 +569,12 @@ impl PacketSocket {
         sll.sll_ifindex = index as i32;
         // SAFETY: sll is a fully initialised sockaddr_ll of the size passed.
         let rc = unsafe {
-            libc::bind(
-                fd,
-                &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as u32,
-            )
+            libc::bind(fd, &sll as *const libc::sockaddr_ll as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_ll>() as u32)
         };
         if rc != 0 {
             return Err(strerror(&std::io::Error::last_os_error()));
         }
-        let tv = libc::timeval {
-            tv_sec: 1,
-            tv_usec: 0,
-        };
+        let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
         // SAFETY: tv is a valid timeval of the size passed.
         unsafe {
             libc::setsockopt(
@@ -722,21 +607,9 @@ impl Drop for PacketSocket {
     }
 }
 
-fn write_heartbeat(
-    path: &str,
-    matched: u64,
-    sent: u64,
-    errors: u64,
-    now: f64,
-) -> std::io::Result<()> {
+fn write_heartbeat(path: &str, matched: u64, sent: u64, errors: u64, now: f64) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
-    fs::write(
-        &tmp,
-        format!(
-            "{{\"matched\": {matched}, \"sent\": {sent}, \"errors\": {errors}, \"time\": {}}}",
-            py_float(now)
-        ),
-    )?;
+    fs::write(&tmp, format!("{{\"matched\": {matched}, \"sent\": {sent}, \"errors\": {errors}, \"time\": {}}}", py_float(now)))?;
     fs::rename(&tmp, path)
 }
 
@@ -750,20 +623,14 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
         match install_component(&c.binary, &c.sha256) {
             Some(p) => conv_bin = Some(p),
             None => {
-                eprintln!(
-                    "goatrope: {} is not the pinned goat-transformers {}",
-                    c.binary, c.version
-                );
+                eprintln!("goatrope: {} is not the pinned goat-transformers {}", c.binary, c.version);
                 return 1;
             }
         }
     }
     let mut taken: BTreeSet<String> = cfg.tap_ports().into_iter().collect();
     taken.insert("goatrope0".into());
-    let mut sinks: Vec<Sink> =
-        s.to.iter()
-            .map(|d| Sink::new(d.clone(), taken.clone()))
-            .collect();
+    let mut sinks: Vec<Sink> = s.to.iter().map(|d| Sink::new(d.clone(), taken.clone())).collect();
     let sock = match PacketSocket::open(&s.port) {
         Ok(sock) => sock,
         Err(e) => {
@@ -777,12 +644,7 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
     let _ = fs::create_dir_all("/var/lib/goatrope/send");
     let mut last_hb = 0.0f64;
     let urls: Vec<&str> = s.to.iter().map(|d| d.url.as_str()).collect();
-    println!(
-        "goatrope send {name}: {} udp {} -> {}",
-        s.port,
-        s.matcher,
-        urls.join(", ")
-    );
+    println!("goatrope send {name}: {} udp {} -> {}", s.port, s.matcher, urls.join(", "));
     let _ = std::io::stdout().flush();
     let mut buf = vec![0u8; 65535];
     loop {
@@ -806,14 +668,8 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
             continue;
         }
         matched += 1;
-        let meta = Meta {
-            feed: name.to_string(),
-            time: round6(now),
-            src: d.src.clone(),
-            dst: d.dst.clone(),
-            sport: d.sport,
-            dport: d.dport,
-        };
+        let meta =
+            Meta { feed: name.to_string(), time: round6(now), src: d.src.clone(), dst: d.dst.clone(), sport: d.sport, dport: d.dport };
         let out = match (&s.convert, &conv_bin) {
             (Some(c), Some(bin)) => match convert(c, &d.payload, bin) {
                 Ok(o) => o,
@@ -839,6 +695,211 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------- install time: units, check, status
+
+const UNITS: &str = "/etc/systemd/system";
+const BIN: &str = "/usr/local/sbin/goatrope";
+const ETC: &str = "/etc/goatrope";
+
+pub fn units(cfg: &Config) -> Vec<String> {
+    let mut u: Vec<String> = cfg.sends.iter().map(|s| format!("goatrope-send@{}.service", s.name)).collect();
+    u.extend(cfg.decodes.iter().map(|d| format!("goatrope-decode@{}.service", d.name)));
+    u
+}
+
+/// The files decode-and-send needs, and the mode of each file not written 0644.
+pub fn render(cfg: &Config) -> (std::collections::BTreeMap<String, String>, HashMap<String, u32>) {
+    let mut files = std::collections::BTreeMap::new();
+    let mut modes = HashMap::new();
+    let h = format!("# Written by goatrope {} from {ETC}/goatrope.toml. goatrope uninstall removes it; do not edit.\n", crate::version());
+    if !cfg.sends.is_empty() {
+        files.insert(
+            format!("{UNITS}/goatrope-send@.service"),
+            format!(
+                "{h}[Unit]
+Description=goatrope: decode-and-send %i
+After=goatrope-ports.service network-online.target
+Wants=goatrope-ports.service
+
+[Service]
+ExecStart={BIN} run-send %i --config {ETC}/goatrope.toml
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/goatrope
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+"
+            ),
+        );
+    }
+    if !cfg.decodes.is_empty() {
+        files.insert(
+            format!("{UNITS}/goatrope-decode@.service"),
+            format!(
+                "{h}[Unit]
+Description=goatrope: first-bite decoder %i
+After=goatrope-ports.service
+Wants=goatrope-ports.service
+
+[Service]
+EnvironmentFile={ETC}/decode-%i.env
+# \"+\": verification runs as root; it copies the pinned binary to {COMPONENTS}, and the copy runs.
+ExecStartPre=+{BIN} verify-component decode %i --config {ETC}/goatrope.toml
+ExecStart=/bin/sh -c 'exec \"$$MIND\" $$PORTS --dictionary \"$$DICTIONARY\" $${{FILTER:+--filter \"$$FILTER\"}}'
+Restart=always
+RestartSec=5
+# The decoder parses link traffic: its own user, capture capabilities only, a read-only system.
+DynamicUser=yes
+StateDirectory=goatrope-decode-%i
+WorkingDirectory=/var/lib/goatrope-decode-%i
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_PACKET AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+"
+            ),
+        );
+        for d in &cfg.decodes {
+            let path = format!("{ETC}/decode-{}.env", d.name);
+            // single-quoted: the declaration refuses quotes, backslashes and control characters
+            files.insert(
+                path.clone(),
+                format!(
+                    "{h}MIND='{}'\nPORTS='{}'\nDICTIONARY='{}'\nFILTER='{}'\nSUBSCRIBER_CONFIG_PATH='{}'\nPUBLISHER_CONFIG_PATH='{}'\n",
+                    component_path(&d.sha256),
+                    d.ports.join(" "),
+                    d.dictionary,
+                    d.filter,
+                    d.subscribers,
+                    d.publishers
+                ),
+            );
+            modes.insert(path, 0o640);
+        }
+    }
+    (files, modes)
+}
+
+/// Destinations whose route leaves through a tap port: sending there would transmit on the link.
+pub fn refuse_tap_routes(cfg: &Config) -> Vec<String> {
+    let mut taken: BTreeSet<String> = cfg.tap_ports().into_iter().collect();
+    taken.insert("goatrope0".into());
+    let mut bad = Vec::new();
+    for s in &cfg.sends {
+        for d in &s.to {
+            if !matches!(d.scheme.as_str(), "udp" | "tcp" | "http" | "https") {
+                continue;
+            }
+            let Some(h) = &d.host else { continue };
+            match destination_devices(h) {
+                Err(e) => bad.push(format!("[[send]] {}: {}: {e}", s.name, d.url)),
+                Ok(devs) => {
+                    let hit: Vec<&str> = devs.iter().filter(|x| taken.contains(*x)).map(String::as_str).collect();
+                    if !hit.is_empty() {
+                        bad.push(format!("[[send]] {}: {} is reached through {}, a tap port", s.name, d.url, hit.join(", ")));
+                    }
+                }
+            }
+        }
+    }
+    bad
+}
+
+pub fn start(cfg: &Config) {
+    for u in units(cfg) {
+        crate::sysutil::systemctl(&["enable", &u]);
+        crate::sysutil::systemctl(&["restart", &u]);
+    }
+}
+
+/// The heartbeat as the forwarder wrote it, and its parsed value.
+fn heartbeat(name: &str) -> Option<(String, serde_json::Value)> {
+    let s = crate::sysutil::read(&format!("/var/lib/goatrope/send/{name}.health"))?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    Some((s, v))
+}
+
+pub fn check(cfg: &Config) -> Vec<crate::tap::Item> {
+    use crate::tap::item;
+    let mut items = Vec::new();
+    for s in &cfg.sends {
+        if let Some(c) = &s.convert {
+            let h = sha256_file(&c.binary);
+            item(
+                &mut items,
+                format!("pin:send:{}", s.name),
+                Some(h.as_deref() == Some(c.sha256.as_str())),
+                format!("goat-transformers {} sha256 {}", c.version, &c.sha256[..12]),
+                h.map(|x| x[..12].to_string()).unwrap_or_else(|| "absent".into()),
+            );
+        }
+        let hb = heartbeat(&s.name);
+        let fresh = hb.as_ref().map(|(_, v)| now_f64() - v.get("time").and_then(|t| t.as_f64()).unwrap_or(0.0) < 30.0).unwrap_or(false);
+        item(
+            &mut items,
+            format!("send-health:{}", s.name),
+            Some(fresh),
+            "heartbeat within 30 s",
+            hb.map(|(raw, _)| raw).unwrap_or_else(|| "none".into()),
+        );
+    }
+    for d in &cfg.decodes {
+        let h = sha256_file(&d.binary);
+        item(
+            &mut items,
+            format!("pin:decode:{}", d.name),
+            Some(h.as_deref() == Some(d.sha256.as_str())),
+            format!("first-bite {} sha256 {}", d.version, &d.sha256[..12]),
+            h.map(|x| x[..12].to_string()).unwrap_or_else(|| "absent".into()),
+        );
+    }
+    for b in refuse_tap_routes(cfg) {
+        item(&mut items, "send-route", Some(false), "no destination through a tap port", b);
+    }
+    items
+}
+
+pub fn status(cfg: &Config) {
+    for s in &cfg.sends {
+        let hb = heartbeat(&s.name).map(|x| x.1).unwrap_or(serde_json::Value::Null);
+        let n = |k: &str| hb.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+        let urls: Vec<&str> = s.to.iter().map(|d| d.url.as_str()).collect();
+        println!(
+            "  send   {:<14} {:<9} matched={} sent={} errors={} -> {}",
+            s.name,
+            crate::sysutil::unit_active(&format!("goatrope-send@{}.service", s.name)),
+            n("matched"),
+            n("sent"),
+            n("errors"),
+            urls.join(", ")
+        );
+    }
+    for d in &cfg.decodes {
+        println!(
+            "  decode {:<14} {:<9} first-bite {} on {}",
+            d.name,
+            crate::sysutil::unit_active(&format!("goatrope-decode@{}.service", d.name)),
+            d.version,
+            d.ports.join(" ")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,14 +918,8 @@ mod tests {
     #[test]
     fn reassembles_two_fragments() {
         let mut f = Fragments::new();
-        assert!(f
-            .add(("a".into(), "b".into(), 1), 0, true, &[1; 8])
-            .is_none());
-        assert_eq!(
-            f.add(("a".into(), "b".into(), 1), 8, false, &[2; 4])
-                .unwrap(),
-            [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]
-        );
+        assert!(f.add(("a".into(), "b".into(), 1), 0, true, &[1; 8]).is_none());
+        assert_eq!(f.add(("a".into(), "b".into(), 1), 8, false, &[2; 4]).unwrap(), [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2]);
     }
 
     #[test]
@@ -877,9 +932,7 @@ mod tests {
     fn parses_udp_in_ipv4() {
         let mut fr = vec![0u8; 14];
         fr[12] = 0x08;
-        let mut ip = vec![
-            0x45, 0, 0, 0, 0, 1, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2,
-        ];
+        let mut ip = vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, 17, 0, 0, 192, 0, 2, 1, 192, 0, 2, 2];
         let udp = [0x13, 0x88, 0x13, 0x89, 0, 11, 0, 0, b'a', b'b', b'c'];
         let total = (ip.len() + udp.len()) as u16;
         ip[2..4].copy_from_slice(&total.to_be_bytes());
@@ -887,13 +940,7 @@ mod tests {
         fr.extend_from_slice(&udp);
         let d = parse(&fr, &mut Fragments::new(), None).unwrap();
         assert_eq!(
-            (
-                d.src.as_str(),
-                d.dst.as_str(),
-                d.sport,
-                d.dport,
-                d.payload.as_slice()
-            ),
+            (d.src.as_str(), d.dst.as_str(), d.sport, d.dport, d.payload.as_slice()),
             ("192.0.2.1", "192.0.2.2", 5000, 5001, &b"abc"[..])
         );
     }
