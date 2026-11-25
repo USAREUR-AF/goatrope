@@ -165,12 +165,12 @@ ERSPANVersion={}
 {index}Independent=yes
 ",
         header(&decl()),
-        e.session_id,
+        e.gre_key,
         e.remote,
         e.local,
         e.local,
         e.remote,
-        e.session_id,
+        e.gre_key,
         e.version
     )
 }
@@ -1483,7 +1483,7 @@ pub fn status(cfg: &Config) -> i32 {
         println!(
             "  erspan {:<14} session {} (type {}) from {} to {} on {}",
             tap.ports[0],
-            e.session_id,
+            e.gre_key,
             if e.version == 1 { "II" } else { "III" },
             e.remote,
             e.local,

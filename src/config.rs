@@ -65,8 +65,9 @@ pub struct Erspan {
     pub local: String,
     /// the address the switch sends the mirror from
     pub remote: String,
-    /// the mirror session; the kernel delivers a mirror only to the interface whose key is its session ID
-    pub session_id: i64,
+    /// the GRE key: the switch's mirror session number (declared as session_id); the kernel delivers a
+    /// mirror only to the interface whose key is it
+    pub gre_key: i64,
     /// 1: ERSPAN type II; 2: type III
     pub version: i64,
 }
@@ -570,12 +571,12 @@ fn erspan_table(v: &Value, port: &str) -> R<Erspan> {
     if local == remote {
         return err(format!("{w}: local and remote must differ"));
     }
-    let session_id = int(t, "session_id", w, 0, 1023)?;
+    let gre_key = int(t, "session_id", w, 0, 1023)?;
     let version = match &t["version"] {
         Value::Integer(n) if *n == 1 || *n == 2 => *n,
         _ => return err(format!("{w}.version must be 1 (ERSPAN type II) or 2 (type III)")),
     };
-    Ok(Erspan { underlay, local, remote, session_id, version })
+    Ok(Erspan { underlay, local, remote, gre_key, version })
 }
 
 /// The parts of a URL Python's urllib.parse.urlsplit gives: scheme, hostname, port, path.
