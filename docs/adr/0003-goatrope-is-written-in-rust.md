@@ -73,16 +73,17 @@ Each step is one pull request that passes the namespace suite on Ubuntu 24.04 an
 | Offloads, EEE, speed; the egress drop | `ethtool` and `tc`, whose command lines are those tools' stable interfaces |
 | Units and network files | `systemctl` and `networkctl` |
 
-Dependencies are pure Rust where one exists, so the binary links statically against
-musl with no C library at run time.
+Dependencies are pure Rust where one exists. The HTTPS client (`ureq` with `rustls`)
+uses `ring`, which compiles some C at build time with `musl-gcc`; the binary still links
+statically against musl and needs no C library at run time.
 
 ## Decoding
 
 `[[decode]]` keeps running the pinned first-bite `mind` as a separate process under
 its own dynamic user with capture capabilities only. A parser of untrusted link
 traffic stays outside the process that installs units and changes interfaces.
-`[[send]]` parses Ethernet, VLAN, IPv4, IPv6 and UDP headers with `etherparse`, the
-crate first-bite uses.
+`[[send]]` reads the Ethernet, VLAN, IPv4, IPv6 and UDP headers itself, by the same
+rules as the Python it replaces, so the datagrams it keeps do not change with the port.
 
 ## Consequences
 

@@ -30,7 +30,7 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
       - name: The static binary
-        run: tools/build-bin.sh
+        run: sudo apt-get install -y musl-tools && tools/build-bin.sh
       - name: Every example declaration validates
         run: for f in examples/*.toml; do ./bin/goatrope validate --config "$f"; done
       - name: shellcheck
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: The static binary
-        run: tools/build-bin.sh
+        run: sudo apt-get install -y musl-tools && tools/build-bin.sh
       - name: Run (privileged container with systemd as PID 1, veth pairs, namespaces)
         run: OUT="$RUNNER_TEMP/results" tests/netns/run.sh "${{ matrix.ubuntu }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -66,7 +66,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: tools/build-bin.sh
+      - run: sudo apt-get install -y musl-tools && tools/build-bin.sh
       - run: for f in examples/*.toml; do ./bin/goatrope validate --config "$f"; done
       - run: file bin/aarch64/goatrope | grep -qE 'static-pie linked|statically linked'
 
