@@ -1686,7 +1686,7 @@ def phase_erspan() -> None:
     rx = subprocess.Popen([sys.executable, "-c", """
 import socket, json, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 9301)); s.settimeout(0.5)
-got = set(); end = time.time() + 40
+got = set(); end = time.time() + 600  # an emulated arm64 install alone can take a minute
 while time.time() < end and len(got) < 50:
     try:
         d = s.recv(65535)
@@ -1708,7 +1708,7 @@ print(json.dumps(sorted(got)))
     time.sleep(2)
     mirror_udp("span100", 50, b"OK", 9300)
     mirror_udp("span200", 20, b"NO", 9300)
-    got = json.loads(rx.communicate(timeout=60)[0] or "[]")
+    got = json.loads(rx.communicate(timeout=660)[0] or "[]")
     result(got == list(range(50)), "erspan: [[send]] got every datagram of the declared session", f"{len(got)} of 50")
     time.sleep(3)  # stopping a recorder loses what tcpdump has not yet written (hardware.md, known limits)
     flush_recorders(["grspan0"])
