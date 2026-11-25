@@ -33,7 +33,7 @@ pub fn lowers(ifname: &str) -> BTreeSet<String> {
     out
 }
 
-fn ifname_of(index: u32) -> Option<String> {
+pub fn ifname_of(index: u32) -> Option<String> {
     let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
     // SAFETY: buf is IF_NAMESIZE bytes, as if_indextoname requires.
     let p = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
