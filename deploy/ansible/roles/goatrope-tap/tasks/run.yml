@@ -15,10 +15,11 @@
     fail_msg: "{{ inventory_hostname }}: the host_vars need tap (mode, ports, management, and source when listening) and goatrope_record (ports, filter, file_mb, files); there is no default. Nothing changed"
     quiet: true
 
+# Under /var/lib, not /run or /tmp: hardened images mount those noexec, and the archive holds a binary.
 - name: goatrope-tap | a run directory only root can write
   ansible.builtin.tempfile:
     state: directory
-    path: /run
+    path: /var/lib
     prefix: goatrope-deploy.
   register: _gt_dir
   check_mode: false
@@ -93,7 +94,7 @@
     # Exit 2: goatrope refused and changed nothing. 3: installed, and the machine does not match.
     - name: "goatrope-tap | goatrope deploy{{ ' --dry-run' if _gt_dry | bool else '' }}"
       ansible.builtin.command:
-        argv: "{{ ['/usr/bin/python3', '-I', '-B', _gt_dir.path + '/bin/goatrope', 'deploy', '--config', _gt_dir.path + '/goatrope.toml'] + (['--dry-run'] if _gt_dry | bool else []) }}"
+        argv: "{{ [_gt_dir.path + '/bin/goatrope', 'deploy', '--config', _gt_dir.path + '/goatrope.toml'] + (['--dry-run'] if _gt_dry | bool else []) }}"
       register: _gt_run
       changed_when: "not (_gt_dry | bool) and 'goatrope deploy: changed' in _gt_run.stdout"
       check_mode: false

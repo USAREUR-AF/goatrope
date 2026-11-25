@@ -102,7 +102,7 @@ rc=0
 phase() { vm "GOATROPE_TEST_REAL_WATCHDOG=1 GOATROPE_TEST_MGMT=\$(ip -o route show default | awk '{print \$5; exit}') python3 -I /src/tests/netns/test_tap.py $*" 2>&1 | tee -a "$log" || rc=1; }
 
 wait_vm 2400
-tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ -cf - . | vm 'mkdir -p /src && tar -C /src --no-same-owner -xf - && chmod -R go+rX /src'
+tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ --exclude=./target -cf - . | vm 'mkdir -p /src && tar -C /src --no-same-owner -xf - && chmod -R go+rX /src'
 vm sh -s <<'EOF' | tee -a "$log"
 . /etc/os-release
 echo "### Ubuntu $VERSION $(uname -m), emulated (qemu TCG); kernel $(uname -r); $(systemctl --version | head -1);" \
