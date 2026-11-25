@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 | Field | Value |
 |---|---|
-| Status | Proposed |
+| Status | Accepted |
 | Date | 2026-11-25 |
 | Deciders | operator |
 | Owner | `goat-owners` |

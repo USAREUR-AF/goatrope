@@ -119,7 +119,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
     <p class="lede">goatrope takes a copy of one network link, from a tap device, a switch mirror port or its own inline tap on a small computer, and records it, sends on what you name, or relays named datagrams. The relay joins distant sites over the mesh they already share, or through a declared boundary point when a site stands outside it; it is work in progress. One file declares what it does. It runs with nothing else of ours installed.</p></div>
-    <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
+    <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.2.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
     <figcaption><b>Joining distant sites: work in progress.</b> A controller at one site reaching sensors at others. Where the sites already share an encrypted mesh, goatrope uses it and adds no tunnel. A site that must stay outside, for technical or policy reasons, is reached through a tunnel of goatrope's own whose one peer is the declared boundary point. Addresses are documentation addresses.</figcaption></figure>
@@ -177,14 +177,14 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
 
 <section id="install"><div class="wrap">
   <h2>Install in one command</h2>
-  <p class="sub">Write the declaration, then run the install. It refuses, changing nothing, when a port carries your session, the default route or an address. Release 0.1.0 is one archive for arm64 and amd64.</p>
+  <p class="sub">Write the declaration, then run the install. It refuses, changing nothing, when a port carries your session, the default route or an address. Release 0.2.0 is one archive for arm64 and amd64.</p>
   <div class="install">
     <div class="box" data-box="command"><header>/etc/goatrope/goatrope.toml</header><pre data-box="output"><span class="ln">schema = 1</span><span class="ln"> </span><span class="ln">[tap]</span><span class="ln">mode = "listen"</span><span class="ln">source = "mirror-port"</span><span class="ln">ports = ["enxPORTA"]</span><span class="ln">management = "eth0"</span><span class="ln"> </span><span class="ln">[tap.record]</span><span class="ln">ports = ["enxPORTA"]</span><span class="ln">filter = ""        <span class="c"># every frame</span></span><span class="ln">file_mb = 50</span><span class="ln">files = 40</span></pre></div>
     <div>
       <div class="box" data-box="command"><header>On the machine<button class="copybtn" type="button" data-copy="cmd">Copy</button></header><pre id="cmd" data-box="command"><span class="ln">sudo ./bin/goatrope install --config /etc/goatrope/goatrope.toml</span></pre></div>
       <ol class="steps" style="margin-top:24px">
         <li>Ubuntu Server 24.04 or 26.04, reached over a third interface. <code>sudo apt-get install -y tcpdump ethtool</code></li>
-        <li>Download <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">release 0.1.0</a>, check its signature with the <code>cosign</code> command in <a href="https://github.com/USAREUR-AF/goatrope/blob/main/.github/workflows/release.yml">release.yml</a> and its contents with <code>sha256sum -c SHA256SUMS</code>, unpack it, and change into its directory.</li>
+        <li>Download <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.2.0">release 0.2.0</a>, check its signature with the <code>cosign</code> command in <a href="https://github.com/USAREUR-AF/goatrope/blob/main/.github/workflows/release.yml">release.yml</a> and its contents with <code>sha256sum -c SHA256SUMS</code>, unpack it, and change into its directory.</li>
         <li>Fill in the declaration from <a href="https://github.com/USAREUR-AF/goatrope/blob/main/examples/listen-copper-tap.toml">an example</a>.</li>
         <li>Cable the link, then run the command above.</li>
         <li><code>sudo goatrope check</code> exits 0 when the machine matches the file, and 3 when anything differs.</li>
@@ -208,7 +208,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
       <li><b>No egress from a listen port.</b> The drop is in place before the port goes up, and <code>check</code> reads it.</li>
       <li><b>A refusal changes nothing.</b> Tests compare the files and ports before and after each one.</li>
       <li><b>Pinned components.</b> A decoder or converter is hashed and copied in one read, and the copy is what runs.</li>
-      <li><b>Signed releases.</b> Each release is the archive, its checksums and a keyless signature made by the release workflow at the tag. <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">0.1.0</a> is the first.</li>
+      <li><b>Signed releases.</b> Each release is the archive, its checksums and a keyless signature made by the release workflow at the tag. <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.1.0">0.1.0</a> was the first; <a href="https://github.com/USAREUR-AF/goatrope/releases/tag/goatrope-v0.2.0">0.2.0</a> is the current one.</li>
       <li class="not"><b>A limit.</b> A process with <code>CAP_NET_RAW</code> can get past the listen drop. Where sending must be impossible, use a tap that cannot transmit. <a href="https://github.com/USAREUR-AF/goatrope/blob/main/SECURITY.md">Known limits</a></li>
     </ul></div>
 </div></div></section>
