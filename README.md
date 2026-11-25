@@ -5,12 +5,25 @@ SPDX-License-Identifier: Apache-2.0
 
 # goatrope
 
-goatrope turns one small computer with two Ethernet ports, such as a Raspberry Pi,
-into a machine on one network link, in up to three declared roles:
+goatrope takes a copy of the traffic on one network link and records it, sends on the
+datagrams you name, and can relay named datagrams to a remote machine. The copy can
+come from any of these:
+
+| Where the copy comes from | goatrope declaration | Status |
+|---|---|---|
+| a **prebuilt tap device** in the cable: a passive copper tap, or a powered tap device that keeps the link closed when its power fails | `mode = "listen"`, `source = "copper-tap"` or `"bypass-relay"` | built; tested in network namespaces; no device measured with goatrope |
+| a switch **mirror port**: SPAN on the same switch, or RSPAN delivered to a port of another | `mode = "listen"`, `source = "mirror-port"` | built; tested in network namespaces |
+| **ERSPAN**: a mirror sent over IP, in GRE, to an address on the goatrope machine | `source = "erspan"` | designed ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md), step 5); not built |
+| goatrope's **own inline tap**: a small computer with two Ethernet ports, such as a Raspberry Pi, bridging the link | `mode = "inline"` | built; tested in network namespaces |
+
+When the system that sends the data seems locked down, [three-ways.md](docs/three-ways.md)
+compares the ways to get a copy without taking control of it.
+
+On the machine that receives the copy, goatrope runs in up to three declared roles:
 
 | Role | What it does | Status |
 |---|---|---|
-| **tap** | records the link: **inline** (the machine bridges the link) or **listen** (a tap device or mirror port hands it a copy) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
+| **tap** | records the link: **listen** (a tap device or mirror port hands the machine a copy) or **inline** (the machine bridges the link) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
 | **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
 | **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | WIP; design in [ADR 0002](docs/adr/0002-relay.md) |
 
