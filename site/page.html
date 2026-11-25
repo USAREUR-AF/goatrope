@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goatrope</title>
-<meta name="description" content="One small computer with two Ethernet ports: a tap that records the link, or a relay onto it.">
+<meta name="description" content="A copy of one network link, from a tap device, a switch mirror port or a small computer in the link: recorded, sent on, or relayed.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%23093f46' stroke-width='11'/%3E%3Ccircle cx='20' cy='20' r='13' fill='none' stroke='%2338a59d' stroke-width='8' stroke-dasharray='5 3'/%3E%3C/svg%3E">
 <style>
 /* Laid rope on a sea-fog ground. Rope is the one ornament: the name is tied in it, links are made of
@@ -101,6 +101,8 @@ section { padding-block: 60px; } section h2 { font-size: clamp(27px, 3.4vw, 40px
 .steps { margin: 0; padding-left: 1.3em; } .steps li + li { margin-top: 12px; }
 @media (max-width: 860px) { .install { grid-template-columns: minmax(0, 1fr); } }
 
+.ways { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 28px; margin-top: 30px; } .way { background: var(--panel); border: 1.5px solid var(--rule); border-radius: 12px; padding: 20px 18px; min-width: 0; } .way h3 { font-size: 20px; } .way p { margin-top: 8px; } .way .st { color: var(--quiet); font-size: 15px; } .way dl { margin: 12px 0 0; font-size: 15px; } .way dt { font-weight: 650; margin-top: 10px; } .way dd { margin: 2px 0 0; color: var(--quiet); }
+@media (max-width: 1100px) { .ways { grid-template-columns: repeat(2, minmax(0, 1fr)); } } @media (max-width: 640px) { .ways { grid-template-columns: minmax(0, 1fr); } }
 .two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 56px; } @media (max-width: 860px) { .two { grid-template-columns: minmax(0, 1fr); gap: 48px; } }
 table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 16px; } th, td { text-align: left; vertical-align: top; padding: 11px 14px 11px 0; border-bottom: 1px solid var(--rule); } th { font-weight: 650; width: 34%; }
 .safe { list-style: none; margin: 20px 0 0; padding: 0; } .safe li { padding: 13px 0 13px 34px; border-bottom: 1px solid var(--rule); position: relative; } .safe li::before { content: ""; position: absolute; left: 2px; top: 19px; width: 16px; height: 16px; border: 5px solid var(--rope); border-radius: 50%; } .safe .not::before { border-style: dashed; border-width: 3px; border-color: var(--quiet); }
@@ -110,25 +112,36 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
 <body>
 <a class="skip" href="#main">Skip to the content</a>
 <div class="wrap top"><a class="brand" href="#main">{{mark}}goatrope</a>
-  <nav aria-label="Page"><a href="#roles">Roles</a><a href="#modes">Fail-open or not</a><a href="#install">Install</a><a href="#safety">Safety</a><a class="gh" href="https://github.com/USAREUR-AF/goatrope">GitHub</a></nav></div>
+  <nav aria-label="Page"><a href="#sources">Sources</a><a href="#roles">Roles</a><a href="#locked">Locked down</a><a href="#modes">Fail-open or not</a><a href="#install">Install</a><a href="#safety">Safety</a><a class="gh" href="https://github.com/USAREUR-AF/goatrope">GitHub</a></nav></div>
 <main id="main">
 <div class="hero"><div class="wrap">
   <h1>{{wordmark}}</h1>
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
-    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. Joining distant sites is being designed, and is not in 0.1.0. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <p class="lede">goatrope takes a copy of one network link, from a tap device, a switch mirror port or its own inline tap on a small computer, and records it, sends on what you name, or relays named datagrams. The relay joins distant sites over the mesh they already share, or through a declared boundary point when a site stands outside it; it is work in progress. One file declares what it does. It runs with nothing else of ours installed.</p></div>
     <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
-    <figcaption><b>Joining distant sites: being designed, not in 0.1.0.</b> A controller at one site reaching sensors at others. In a deployment that already has an encrypted mesh between its sites, goatrope uses that mesh; it does not add tunnels of its own. Addresses are documentation addresses.</figcaption></figure>
+    <figcaption><b>Joining distant sites: work in progress.</b> A controller at one site reaching sensors at others. Where the sites already share an encrypted mesh, goatrope uses it and adds no tunnel. A site that must stay outside, for technical or policy reasons, is reached through a tunnel of goatrope's own whose one peer is the declared boundary point. Addresses are documentation addresses.</figcaption></figure>
 </div></div>
 
 <div class="wrap"><div class="strip">
   <div><b data-measure="inline">500 of 500</b><span>datagrams each way through the inline tap</span><code>tests/netns, inline</code></div>
   <div><b data-measure="listen">0</b><span>frames out of a listen port: install, traffic, attempts to send, restarts</span><code>tests/netns, listen</code></div>
   <div><b data-measure="ping">400 of 400</b><span>pings through the bridge while it is deployed again</span><code>tests/netns, deploy</code></div>
-  <div><b data-measure="deps">0</b><span>Python packages beyond the standard library</span><code>site/build.py reads every import</code></div>
+  <div><b data-measure="static">1</b><span>statically linked binary per machine, no interpreter or library needed</span><code>ci.yml checks every build</code></div>
 </div></div>
+
+<section id="sources"><div class="wrap">
+  <h2>Where the copy comes from</h2>
+  <p class="sub">goatrope does not have to sit in the link. It listens to whatever hands it a copy; the inline tap is one choice of four.</p>
+  <div class="ways">
+    <div class="way"><h3>A tap device</h3><p>A passive copper tap or a powered tap device in the cable hands goatrope one copy per direction. The link carries on while goatrope is off.</p><p class="st">Built. Tested in network namespaces; no device measured yet.</p></div>
+    <div class="way"><h3>A mirror port</h3><p>The switch copies a port's traffic to the port goatrope listens on: SPAN on the same switch, RSPAN from another.</p><p class="st">Built. Tested in network namespaces.</p></div>
+    <div class="way"><h3>ERSPAN</h3><p>The switch sends the mirror over IP, in GRE, to an address on the goatrope machine, which needs no port on the link.</p><p class="st">Designed. Not built.</p></div>
+    <div class="way"><h3>Its own inline tap</h3><p>A small computer with two Ethernet ports, such as a Raspberry Pi, bridges the link and records it. The link is down while it is off.</p><p class="st">Built. Tested in network namespaces.</p></div>
+  </div>
+</div></section>
 
 <section id="roles"><div class="wrap">
   <h2>Three roles on one link</h2>
@@ -148,6 +161,18 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
     <div class="mode"><h3>Listen fails open</h3>{{listen-on}}{{listen-off}}<p class="when-on">A tap device or a switch mirror port hands goatrope a copy. It receives and does not send.</p><p class="when-off">The link carries on. Only the recording has a gap.</p></div>
     <div class="mode"><h3>Inline fails closed</h3>{{inline-on}}{{inline-off}}<p class="when-on">Every frame passes through the machine's bridge.</p><p class="when-off">The link is down until the machine is back. A hardware watchdog restarts a hung one.</p></div>
   </div>
+</div></section>
+
+<section id="locked"><div class="wrap">{{divider}}
+  <h2 style="margin-top:48px">When the system seems locked down</h2>
+  <p class="sub">A system that sends its data only to its own display looks closed. There are still three ways to get a copy without taking control of it, and a fourth when nobody can change anything.</p>
+  <div class="ways">
+    <div class="way"><h3>1. One more destination</h3><dl><dt>What it takes</dt><dd>The owner adds one destination to the output the system already sends.</dd><dt>Who acts</dt><dd>The system's owner or vendor.</dd><dt>What changes</dt><dd>One configuration entry.</dd><dt>Undone by</dt><dd>Removing the entry.</dd></dl></div>
+    <div class="way"><h3>2. A mirror port</h3><dl><dt>What it takes</dt><dd>The switch the data crosses copies that port: SPAN, RSPAN or ERSPAN.</dd><dt>Who acts</dt><dd>The site network administrator.</dd><dt>What changes</dt><dd>Nothing on the system; one mirror session on the switch.</dd><dt>Undone by</dt><dd>Deleting the session.</dd></dl><p class="st">goatrope listens on the mirror port.</p></div>
+    <div class="way"><h3>3. A listen-only client</h3><dl><dt>What it takes</dt><dd>One more client of the system that only receives, as its displays do.</dd><dt>Who acts</dt><dd>Us, with the system's interface description.</dd><dt>What changes</dt><dd>Nothing in its configuration; one more client.</dd><dt>Undone by</dt><dd>Stopping the client.</dd></dl></div>
+    <div class="way"><h3>4. A cable tap</h3><dl><dt>What it takes</dt><dd>A tap device in the cable the data crosses, or goatrope inline.</dd><dt>Who acts</dt><dd>Us, with the owner's agreement.</dd><dt>What changes</dt><dd>No configuration; the cable is re-made through the tap.</dd><dt>Undone by</dt><dd>Removing the tap.</dd></dl><p class="st">goatrope listens behind the tap, or is the tap.</p></div>
+  </div>
+  <p class="cap">Risks and how to choose: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/three-ways.md">three-ways.md</a>.</p>
 </div></section>
 
 <section id="install"><div class="wrap">
@@ -173,7 +198,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
 <section id="safety"><div class="wrap">{{divider}}<div class="two" style="margin-top:52px">
   <div><h2>Hardware</h2>
     <table><tr><th scope="row">Computer</th><td>Raspberry Pi 4 or 5, or a small amd64 computer. Not yet run on a Pi: tested in containers, in amd64 virtual machines and in an emulated arm64 one</td></tr>
-    <tr><th scope="row">Tap ports</th><td>two wired Ethernet ports, USB adapters included</td></tr>
+    <tr><th scope="row">Tap ports</th><td>behind a tap device: one or two receive-only ports; on a mirror port: one; inline: two wired Ethernet ports, USB adapters included</td></tr>
     <tr><th scope="row">Management</th><td>a third interface: Wi-Fi or Ethernet</td></tr>
     <tr><th scope="row">Storage</th><td>room for the ring you declare; install refuses one that does not fit</td></tr></table>
     <p class="cap"><a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/hardware.md">hardware.md</a> has the tap devices and their limits.</p></div>

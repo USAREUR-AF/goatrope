@@ -7,10 +7,10 @@ name: pages
 
 on:
   pull_request:
-    paths: ['site/**', 'tests/netns/test_tap.py', 'goatrope/**', '.github/workflows/pages.yml']
+    paths: ['site/**', 'tests/netns/test_tap.py', '.github/workflows/ci.yml', '.github/workflows/release.yml', '.github/workflows/pages.yml']
   push:
     branches: [main]
-    paths: ['site/**', 'tests/netns/test_tap.py', 'goatrope/**', '.github/workflows/pages.yml']
+    paths: ['site/**', 'tests/netns/test_tap.py', '.github/workflows/ci.yml', '.github/workflows/release.yml', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:

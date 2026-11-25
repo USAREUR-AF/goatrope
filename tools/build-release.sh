@@ -5,8 +5,9 @@
 #
 #   tools/build-release.sh <version>
 #
-# The archive is architecture-independent (Python 3 standard library only), so one
-# archive serves arm64 and amd64. VERSION must equal <version>.
+# One archive serves arm64 and amd64: it holds both static binaries (bin/x86_64/goatrope and
+# bin/aarch64/goatrope, built first by tools/build-bin.sh) and bin/goatrope, which runs the one
+# for the machine. VERSION must equal <version>.
 set -euo pipefail
 v="${1:?usage: build-release.sh <version>}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,8 +17,15 @@ rm -rf "$dist"
 mkdir -p "$dist"
 name="goatrope-$v"
 # git archive: exactly the committed tree, with a fixed mtime from the commit.
+for a in x86_64 aarch64; do
+    [ -x "$repo/bin/$a/goatrope" ] || { echo "bin/$a/goatrope is missing: tools/build-bin.sh $a" >&2; exit 1; }
+done
 git -C "$repo" archive --format=tar --prefix="$name/" HEAD \
-    bin goatrope deploy examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
-    | gzip -n -9 > "$dist/$name.tar.gz"
+    bin deploy examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
+    > "$dist/$name.tar"
+# The binaries are built, not committed; they go in with the commit's time and root ownership.
+tar -C "$repo" --append -f "$dist/$name.tar" --transform "s,^,$name/," --owner=0 --group=0 --numeric-owner \
+    --mtime="@$(git -C "$repo" log -1 --format=%ct)" --mode=0755 bin/x86_64/goatrope bin/aarch64/goatrope
+gzip -n -9 "$dist/$name.tar"
 (cd "$dist" && sha256sum "$name.tar.gz" > SHA256SUMS)
 cat "$dist/SHA256SUMS"

@@ -20,6 +20,12 @@ repo="$(cd "$here/../.." && pwd)"
 out="${OUT:-$repo/test-results}"
 mkdir -p "$out"
 versions=("$@")
+# The binary under test: built here unless it is already there (tools/build-bin.sh; without cargo
+# on the host, GOATROPE_BUILD_IN_DOCKER=1 builds it in the rust image).
+if [ ! -x "$repo/bin/$(uname -m)/goatrope" ] || [ ! -x "$repo/bin/$(uname -m)/goatrope-units" ]; then
+    GOATROPE_BUILD_UNITS=1 "$repo/tools/build-bin.sh"
+fi
+
 [ "${#versions[@]}" -gt 0 ] || versions=(24.04 26.04)
 rc=0
 
@@ -41,7 +47,7 @@ start() { # container, image tag
         --tmpfs /run --tmpfs /run/lock "goatrope-netns:$v" >/dev/null
     wait_systemd "$c"
     docker exec "$c" mkdir -p /src
-    tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ -cf - . | docker exec -i "$c" tar -C /src --no-same-owner -xf -
+    tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ --exclude=./target -cf - . | docker exec -i "$c" tar -C /src --no-same-owner -xf -
     docker exec "$c" chmod -R go+rX /src
     if [ -n "${GOATROPE_TEST_COMPONENTS:-}" ]; then
         docker exec "$c" mkdir -p /opt/gt-components
@@ -62,7 +68,7 @@ for v in "${versions[@]}"; do
     docker build -q --build-arg "UBUNTU=$v" -t "goatrope-netns:$v" "$here" >/dev/null
     docker build -q --build-arg "UBUNTU=$v" --build-arg NM=1 -t "goatrope-netns:$v-nm" "$here" >/dev/null
     docker build -q --build-arg "UBUNTU=$v" --build-arg ANSIBLE=1 -t "goatrope-netns:$v-ansible" "$here" >/dev/null
-    c="goatrope-netns-$v"
+    c="${GOATROPE_TEST_CONTAINER:-goatrope-netns}-$v"   # another name lets two runs share a host
 
     start "$c" "$v"
     docker exec "$c" sh -c 'echo "# image: $(. /etc/os-release; echo $PRETTY_NAME), $(systemctl --version | head -1), $(python3 --version), $(tcpdump --version 2>&1 | head -1)"' | tee -a "$log"
@@ -78,7 +84,7 @@ for v in "${versions[@]}"; do
     docker rm -f "$c" >/dev/null
 
     start "$c" "$v"
-    phase "$c" "$log" listen uninstall send components relay uninstall units
+    phase "$c" "$log" listen uninstall send components relay boundary uninstall units
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 

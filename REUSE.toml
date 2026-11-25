@@ -6,7 +6,7 @@
 version = 1
 
 [[annotations]]
-path = ["VERSION", "NOTICE", "CHANGELOG.md", ".gitignore", "examples/*.toml", "site/page.html", "site/index.html"]
+path = ["VERSION", "Cargo.lock", "NOTICE", "CHANGELOG.md", ".gitignore", "examples/*.toml", "site/page.html", "site/index.html"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 U.S. Federal Government (in countries where recognized)"
 SPDX-License-Identifier = "Apache-2.0"
