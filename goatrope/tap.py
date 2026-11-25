@@ -373,6 +373,16 @@ def _install_software() -> None:
         os.rename(tmp, LIB)
         su.fsync_dir(os.path.dirname(LIB))
         shutil.rmtree(old, ignore_errors=True)
+    exe = os.environ.get("GOATROPE_EXE")
+    if exe:  # the Rust binary that ran this (ADR 0003): it is the command; the verbs it lacks run from LIB
+        tmp = BIN + ".goatrope-new"
+        shutil.copyfile(exe, tmp)
+        os.chmod(tmp, 0o755)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, BIN)
+        su.fsync_dir(os.path.dirname(BIN))
+        return
     wrapper = ("#!/usr/bin/python3 -I\n# Written by goatrope install; goatrope uninstall removes it.\n"
                f"import sys\nsys.path.insert(0, {LIB!r})\nfrom goatrope.cli import main\nsys.exit(main())\n")
     su.write_file(BIN, wrapper, 0o755)
@@ -412,7 +422,9 @@ def deploy(cfg: cfgmod.Config, dry_run: bool = False, log=print) -> str:
             mine["VERSION"] = hashlib.sha256(f.read()).hexdigest()
     with open(cfg.path, encoding="utf-8") as f:
         declared = f.read()
-    there = (_load_state() is not None and os.path.exists(BIN) and _tree(os.path.join(LIB, "goatrope")) == mine
+    exe = os.environ.get("GOATROPE_EXE")
+    same_bin = not exe or (os.path.exists(BIN) and sendmod_sha(exe) == sendmod_sha(BIN))
+    there = (_load_state() is not None and os.path.exists(BIN) and same_bin and _tree(os.path.join(LIB, "goatrope")) == mine
              and (su.read(f"{ETC}/goatrope.toml") or "") == declared.strip()
              and all(i["ok"] is not False for i in check(cfg)))
     if there:
@@ -421,6 +433,11 @@ def deploy(cfg: cfgmod.Config, dry_run: bool = False, log=print) -> str:
         return "would-change"
     install(cfg, log)
     return "changed"
+
+
+def sendmod_sha(path: str) -> str | None:
+    from . import send as sendmod
+    return sendmod.sha256(path)
 
 
 def install(cfg: cfgmod.Config, log=print) -> None:

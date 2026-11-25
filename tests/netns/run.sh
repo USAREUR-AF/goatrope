@@ -66,7 +66,7 @@ for v in "${versions[@]}"; do
     docker build -q --build-arg "UBUNTU=$v" -t "goatrope-netns:$v" "$here" >/dev/null
     docker build -q --build-arg "UBUNTU=$v" --build-arg NM=1 -t "goatrope-netns:$v-nm" "$here" >/dev/null
     docker build -q --build-arg "UBUNTU=$v" --build-arg ANSIBLE=1 -t "goatrope-netns:$v-ansible" "$here" >/dev/null
-    c="goatrope-netns-$v"
+    c="${GOATROPE_TEST_CONTAINER:-goatrope-netns}-$v"   # another name lets two runs share a host
 
     start "$c" "$v"
     docker exec "$c" sh -c 'echo "# image: $(. /etc/os-release; echo $PRETTY_NAME), $(systemctl --version | head -1), $(python3 --version), $(tcpdump --version 2>&1 | head -1)"' | tee -a "$log"

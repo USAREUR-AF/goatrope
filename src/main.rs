@@ -7,6 +7,8 @@
 #[allow(dead_code)] // the roles still in Python read most of the declaration (ADR 0003)
 mod config;
 mod fallback;
+mod link;
+mod send;
 mod sys;
 mod tap;
 
@@ -37,8 +39,29 @@ goatrope command line.
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 ";
 
-pub fn version() -> &'static str {
-    VERSION.trim()
+/// The version of the software this binary belongs to: the VERSION file of the checkout,
+/// unpacked release or installed tree it runs from, else the one it was built with. A release
+/// is the archive, and its VERSION file is part of what the archive's hash covers.
+pub fn version() -> String {
+    if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
+        let mut candidates: Vec<std::path::PathBuf> = exe
+            .ancestors()
+            .skip(1)
+            .take(3)
+            .map(|d| d.join("VERSION"))
+            .collect();
+        candidates.push("/usr/local/lib/goatrope/VERSION".into());
+        candidates.push("/usr/local/lib/goatrope/goatrope/VERSION".into());
+        for c in candidates {
+            if let Ok(v) = std::fs::read_to_string(&c) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+    VERSION.trim().to_string()
 }
 
 /// `--config PATH` (or `--config=PATH`) from the arguments after the verb; the default otherwise.
@@ -69,6 +92,39 @@ fn usage_error(msg: &str) -> i32 {
     eprintln!("usage: goatrope [-h] [--version] COMMAND ...");
     eprintln!("goatrope: error: {msg}");
     EXIT_REFUSED
+}
+
+/// A verb with `npos` positional arguments and `--config`: loads the declaration, then runs f.
+fn with_config(rest: &[String], npos: usize, f: impl Fn(&config::Config, &[String]) -> i32) -> i32 {
+    let mut pos = Vec::new();
+    let mut opts = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--config" {
+            opts.extend(rest[i..(i + 2).min(rest.len())].iter().cloned());
+            i += 2;
+        } else if rest[i].starts_with("--") {
+            opts.push(rest[i].clone());
+            i += 1;
+        } else {
+            pos.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    if pos.len() != npos {
+        return usage_error("the following arguments are required: name");
+    }
+    let path = match config_path(&opts) {
+        Ok(p) => p,
+        Err(m) => return usage_error(&m),
+    };
+    match config::load(&path) {
+        Ok(cfg) => f(&cfg, &pos),
+        Err(e) => {
+            eprintln!("goatrope: refused: {e}");
+            EXIT_REFUSED
+        }
+    }
 }
 
 fn validate(rest: &[String]) -> i32 {
@@ -104,6 +160,16 @@ fn main() {
             EXIT_OK
         }
         Some("validate") => validate(&args[1..]),
+        Some("run-send") => with_config(&args[1..], 1, |cfg, pos| send::run_send(cfg, &pos[0])),
+        Some("verify-component") => with_config(&args[1..], 2, |cfg, pos| {
+            if pos[0] != "decode" {
+                return usage_error(&format!(
+                    "argument kind: invalid choice: '{}' (choose from 'decode')",
+                    pos[0]
+                ));
+            }
+            send::verify_component(cfg, &pos[0], &pos[1])
+        }),
         Some(_) => fallback::run(&args),
     };
     std::process::exit(code);
