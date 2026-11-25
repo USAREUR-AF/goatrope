@@ -53,6 +53,7 @@ svg { display: block; max-width: 100%; }
 .acts { display: flex; flex-wrap: wrap; gap: 12px; }
 .btn { display: inline-flex; align-items: center; min-height: 46px; padding: 0 20px; border: 2px solid var(--accent); border-radius: 23px; font: 650 16px var(--sans); text-decoration: none; color: var(--accent); background: transparent; cursor: pointer; }
 .btn.main { background: var(--accent); color: var(--on-accent); }
+.btn.star svg { width: 18px; height: 18px; margin-right: 9px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linejoin: round; }
 .btn:hover { text-decoration: underline; }
 @media (max-width: 860px) { .hero-row { grid-template-columns: minmax(0, 1fr); } }
 
@@ -115,11 +116,11 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
   <h1>{{wordmark}}</h1>
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
-    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. A wormhole that joins distant sites is in progress, and is not in 0.1.0. One file declares what it does. It runs with nothing else of ours installed.</p></div>
-    <div class="acts"><a class="btn main" href="https://github.com/USAREUR-AF/goatrope">See it on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
+    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. Joining distant sites is being designed, and is not in 0.1.0. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
-    <figcaption><b>The wormhole, work in progress, not in 0.1.0.</b> Each end answers on its own link for the machines at the other. The two sensor sites above use the same subnet and the same sensor address, and the controller still reaches each at an address of its own. Addresses are documentation addresses. Do not use it to control real equipment yet.</figcaption></figure>
+    <figcaption><b>Joining distant sites: being designed, not in 0.1.0.</b> A controller at one site reaching sensors at others. In a deployment that already has an encrypted mesh between its sites, goatrope uses that mesh; it does not add tunnels of its own. Addresses are documentation addresses.</figcaption></figure>
 </div></div>
 
 <div class="wrap"><div class="strip">
