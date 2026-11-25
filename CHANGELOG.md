@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 (2026-11-25)
+
 - listen source `erspan`: goatrope makes an `erspan` interface for one declared mirror session
   arriving on an underlay address, and records and decodes from it (ADR 0003 step 5).
 - goatrope is one static Rust binary for amd64 and arm64 (ADR 0003): the declaration,
@@ -9,7 +11,7 @@
   by 0.1.0 is checked, upgraded and removed by this release. The release archive holds both
   binaries and `bin/goatrope`, which runs the one for the machine.
 - relay boundary transport: keys and the peer are set through netlink; the `wg` tool is not needed.
-- ADR 0003 (Proposed): goatrope is written in Rust; the declaration, commands, exit codes,
+- ADR 0003 (Accepted): goatrope is written in Rust; the declaration, commands, exit codes,
   release shape and namespace tests stay as they are.
 - landing page (site/) and its Pages workflow.
 - relay: `transport = "mesh"` (default) uses the site's existing WireGuard mesh and creates no tunnel;
