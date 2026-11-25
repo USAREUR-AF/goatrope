@@ -200,8 +200,8 @@ own watchdog, forced link speed (veth cannot be forced), and recording throughpu
 
 | Path | Holds |
 |---|---|
-| `bin/goatrope` | the entry point |
-| `goatrope/` | `config.py` (the declaration), `tap.py`, `send.py`, `relay.py`, `boundary.py`, `sysutil.py`, `cli.py`; Python 3 standard library only |
+| `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `relay.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests and their container |
