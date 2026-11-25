@@ -1066,6 +1066,8 @@ peer_address = "10.200.0.1"
 
 def phase_boundary() -> None:
     """A site outside the deployment: goatrope's own WireGuard interface, one peer, the boundary point."""
+    for leftover in ("wg0", "u0", "r0"):  # the relay phase's interfaces, if it ran first in this container
+        sh(f"ip link del {leftover}", check=False)
     topo_relay()  # the link side (r0 -> linkhost 192.0.2.2); its wg0 is not used here
     sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv6.conf.all.forwarding=0")
     sh("ip netns del bpoint", check=False)
