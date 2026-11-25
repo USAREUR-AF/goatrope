@@ -176,29 +176,3 @@ pub fn default_route_devs() -> Vec<String> {
     }
     devs.into_iter().collect()
 }
-
-/// Remove a link (RTM_DELLINK), as `ip link del` does. False when it could not be removed.
-pub fn delete(ifname: &str) -> bool {
-    use netlink_packet_route::link::LinkMessage;
-    let Some(index) = index_of(ifname) else { return false };
-    let mut m = LinkMessage::default();
-    m.header.index = index;
-    let mut header = NetlinkHeader::default();
-    header.flags = NLM_F_REQUEST | netlink_packet_core::NLM_F_ACK;
-    let mut req = NetlinkMessage::new(header, NetlinkPayload::from(RouteNetlinkMessage::DelLink(m)));
-    req.finalize();
-    let mut buf = vec![0u8; req.buffer_len()];
-    req.serialize(&mut buf);
-    let Ok(mut sock) = Socket::new(NETLINK_ROUTE) else { return false };
-    if sock.bind_auto().is_err() || sock.connect(&SocketAddr::new(0, 0)).is_err() || sock.send(&buf, 0).is_err() {
-        return false;
-    }
-    let Ok((data, _)) = sock.recv_from_full() else { return false };
-    match NetlinkMessage::<RouteNetlinkMessage>::deserialize(&data) {
-        Ok(m) => match m.payload {
-            NetlinkPayload::Error(e) => e.code.is_none(),
-            _ => true,
-        },
-        Err(_) => false,
-    }
-}

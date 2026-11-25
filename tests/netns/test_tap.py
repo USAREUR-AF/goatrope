@@ -1710,11 +1710,12 @@ print(json.dumps(sorted(got)))
     mirror_udp("span200", 20, b"NO", 9300)
     got = json.loads(rx.communicate(timeout=60)[0] or "[]")
     result(got == list(range(50)), "erspan: [[send]] got every datagram of the declared session", f"{len(got)} of 50")
+    time.sleep(3)  # stopping a recorder loses what tcpdump has not yet written (hardware.md, known limits)
     flush_recorders(["grspan0"])
     frames = ring_frames("grspan0")
     start_recorders(["grspan0"])
     result(tagged(frames, b"OK") == set(range(50)), "erspan: every mirrored frame of session 100 recorded, decapsulated",
-           f"{len(tagged(frames, b'OK'))} of 50")
+           f"{len(tagged(frames, b'OK'))} of 50 ({len(frames)} frames in the ring)")
     result(not tagged(frames, b"NO"), "erspan: no frame of another session recorded", f"{len(tagged(frames, b'NO'))} of 20")
     back = [f for f in up.stop() if len(f) > 23 and f[12:14] == b"\x08\x00" and f[23] == 47]
     result(not back, "erspan: nothing sent back toward the switch in GRE", f"{len(back)} GRE frames")

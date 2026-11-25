@@ -160,6 +160,7 @@ Kind=erspan
 Local={}
 Remote={}
 Key={}
+SerializeTunneledPackets=yes
 ERSPANVersion={}
 {index}Independent=yes
 ",
@@ -916,7 +917,7 @@ pub fn uninstall(purge: bool) -> R<()> {
     if let Some(made) = state["created_links"].as_array() {
         for l in made.iter().filter_map(|v| v.as_str()) {
             if su::exists(l) && su::kind(l).as_deref() == Some("erspan") {
-                crate::link::delete(l);
+                let _ = crate::nl::delete_link(l);
             }
         }
     }

@@ -13,7 +13,7 @@ comes from decides what the link does while that machine is off.
 | Passive copper tap | two receive-only Ethernet ports, one per direction | the link carries on | `mode = "listen"`, `source = "copper-tap"`, two ports, `speed_mbps = 100` | built; tested in namespaces; no device measured |
 | Powered tap device that closes the link when its power fails | one or two receive-only Ethernet ports | the link carries on | `mode = "listen"`, `source = "bypass-relay"` | built; tested in namespaces; no device measured |
 | Switch mirror port (SPAN; RSPAN at the destination switch) | one receive-only Ethernet port | the link carries on | `mode = "listen"`, `source = "mirror-port"`, one port | built; tested in namespaces |
-| ERSPAN: a mirror sent in GRE to an IP address | an address on an ordinary interface, where the mirror arrives | the link carries on | `source = "erspan"` | designed ([ADR 0003](adr/0003-goatrope-is-written-in-rust.md), step 5); not built |
+| ERSPAN: a mirror sent in GRE to an IP address | an address on an ordinary interface, where the mirror arrives | the link carries on | `mode = "listen"`, `source = "erspan"`, `[tap.erspan]` | built; tested in namespaces |
 | goatrope's own inline tap | two Ethernet ports the link passes through | **the link is down** | `mode = "inline"`, two ports | built; tested in namespaces |
 
 Every case needs a management interface that is not a tap port, Ubuntu Server 24.04 or
@@ -41,14 +41,24 @@ a frame sent could reach the switch, the drop is a software guarantee for ordina
 processes, not a physical one. Where transmission onto the link must be impossible,
 use a passive copper tap or a tap device whose monitor ports cannot transmit.
 
-## ERSPAN (designed)
+## ERSPAN
 
-A switch or router sends the mirror inside GRE to an IP address. goatrope will make a
-Linux `erspan` interface on a declared underlay address, keyed by the mirror's session
-ID (the kernel delivers a mirror only to the interface whose key matches it), and
-record and decode from that interface as from a listen port. The goatrope machine
-needs no port on the mirrored link at all, only a route from the switch. Built only in
-the Rust version (ADR 0003, step 5).
+A switch or router sends the mirror inside GRE to an IP address on the goatrope machine,
+which needs no port on the mirrored link, only a route from the switch.
+[examples/listen-erspan.toml](../examples/listen-erspan.toml) shows the declaration.
+
+| Declared | What goatrope does with it |
+|---|---|
+| `ports` (one name) | systemd-networkd makes a Linux `erspan` interface of that name at every boot, as it makes the inline bridge; goatrope records and decodes on it as on any listen port, with the same egress drop |
+| `underlay`, `local` | the mirror arrives on `underlay` at `local`; install refuses while `underlay` does not hold `local` |
+| `remote` | the address the switch sends from; frames from any other source are not decapsulated |
+| `session_id` | the switch's mirror session. The kernel delivers a mirror only to the interface whose key equals its session ID, so another session's mirror is not received |
+| `version` | 1 for ERSPAN type II, 2 for type III |
+
+Limits: IPv4 underlay only (ERSPAN over IPv6 is not built). When a mirror for a session
+or source goatrope does not declare reaches `local`, the kernel answers the switch with
+an ICMP unreachable on the underlay; nothing is sent on the mirrored link. Cloud traffic
+mirroring (VXLAN or Geneve, not ERSPAN) is not built.
 
 ## goatrope's own inline tap: a small computer
 

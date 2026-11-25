@@ -17,7 +17,7 @@ change anything at all. None of them takes control of the system.
 | **What changes on the system** | One configuration entry | None on the system; the switch configuration gains a mirror session that adds a copy | None to its configuration; one more client connected | None to any configuration; the cable is re-made through the tap |
 | **Risk** | Low: the owner makes a change it understands | Low: a switch under load may drop copies, never the original traffic | The client must never take control or change the system's state; the interface must be documented | A brief interruption while the cable is re-made; a passive tap holds the link to 100 Mb/s |
 | **How it is undone** | Remove the entry | Delete the mirror session | Stop the client | Remove the tap and re-make the cable |
-| **Where goatrope fits** | Not needed: the copy arrives addressed to the receiving machine | Listens on the mirror port: `source = "mirror-port"` (SPAN, RSPAN); ERSPAN is designed | Not goatrope's role; a client for the system's own protocol | Listens behind the tap (`source = "copper-tap"` or `"bypass-relay"`), or is itself the inline tap (`mode = "inline"`) |
+| **Where goatrope fits** | Not needed: the copy arrives addressed to the receiving machine | Listens on the mirror port: `source = "mirror-port"` (SPAN, RSPAN) or `source = "erspan"` (ERSPAN) | Not goatrope's role; a client for the system's own protocol | Listens behind the tap (`source = "copper-tap"` or `"bypass-relay"`), or is itself the inline tap (`mode = "inline"`) |
 
 ## Choosing
 
@@ -40,7 +40,7 @@ cable, so they also see any other traffic on that cable; goatrope's recording fi
 | Way | Declaration |
 |---|---|
 | 2. SPAN or RSPAN | `[tap] mode = "listen"`, `source = "mirror-port"`, one port |
-| 2. ERSPAN | `source = "erspan"`: designed, not built ([ADR 0003](adr/0003-goatrope-is-written-in-rust.md), step 5) |
+| 2. ERSPAN | `mode = "listen"`, `source = "erspan"` and `[tap.erspan]` ([hardware.md](hardware.md#erspan)) |
 | 4. Passive copper tap | `mode = "listen"`, `source = "copper-tap"`, two ports (one per direction), `speed_mbps = 100` |
 | 4. Powered tap device | `mode = "listen"`, `source = "bypass-relay"` |
 | 4. goatrope as the tap | `mode = "inline"`: a small computer with two Ethernet ports bridges the link; the link is down while it is off ([README](../README.md#inline-is-fail-closed)) |

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- listen source `erspan`: goatrope makes an `erspan` interface for one declared mirror session
+  arriving on an underlay address, and records and decodes from it (ADR 0003 step 5).
 - goatrope is one static Rust binary for amd64 and arm64 (ADR 0003): the declaration,
   commands, exit codes, installed files and state file are unchanged, and a machine installed
   by 0.1.0 is checked, upgraded and removed by this release. The release archive holds both
