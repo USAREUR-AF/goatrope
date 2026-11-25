@@ -1043,6 +1043,146 @@ print(replies)
 
 PHASES["relay"] = phase_relay
 
+
+BOUNDARY = """schema = 1
+[relay]
+wip = true
+transport = "boundary"
+remote_interface = "grb0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "both", protocol = "udp", remote = "10.200.0.1", listen_port = 7000, target = "192.0.2.2", target_port = 7000 },
+]
+[relay.boundary]
+listen_port = 51901
+private_key_file = "/root/gt/bnd/boundary.key"
+address = "10.200.0.2/30"
+peer_public_key = "PEERKEY"
+peer_endpoint = "203.0.113.7:51900"
+peer_address = "10.200.0.1"
+"""
+
+
+def phase_boundary() -> None:
+    """A site outside the deployment: goatrope's own WireGuard interface, one peer, the boundary point."""
+    for leftover in ("wg0", "u0", "r0"):  # the relay phase's interfaces, if it ran first in this container
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()  # the link side (r0 -> linkhost 192.0.2.2); its wg0 is not used here
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv6.conf.all.forwarding=0")
+    sh("ip netns del bpoint", check=False)
+    sh("ip link del grb0", check=False)
+    shutil.rmtree(f"{WORK}/bnd", ignore_errors=True)
+    sh("ip netns add bpoint && ip -n bpoint link set lo up")
+    sh("ip link add bp0 type veth peer name bp1 && ip link set bp1 netns bpoint")
+    sh("ip addr add 203.0.113.1/24 dev bp0 && ip link set bp0 up")
+    sh("ip -n bpoint addr add 203.0.113.7/24 dev bp1 && ip -n bpoint link set bp1 up")
+    bpriv = sh("wg genkey").stdout.strip()
+    bpub = subprocess.run(["wg", "pubkey"], input=bpriv, capture_output=True, text=True).stdout.strip()
+    cfg = BOUNDARY.replace("PEERKEY", bpub)
+    write_cfg(cfg)
+
+    p = gr("boundary", "check", "--config", CFG)
+    result(p.returncode == 3 and "does not exist" in p.stdout, "boundary: check before a key exists differs", p.stdout.strip()[-160:])
+    p = gr("boundary", "key", "--config", CFG)
+    key = f"{WORK}/bnd/boundary.key"
+    mode = oct(os.stat(key).st_mode & 0o777) if os.path.exists(key) else "absent"
+    mypub = p.stdout.split("public key ", 1)[1].split()[0] if "public key " in p.stdout else ""
+    result(p.returncode == 0 and mode == "0o600" and len(mypub) == 44 and "PRIVATE" not in p.stdout.upper(),
+           "boundary: key writes a mode-600 private key and prints only the public key", f"exit {p.returncode}, {mode}")
+    p = gr("boundary", "key", "--config", CFG)
+    result(p.returncode == 2 and "never replaces" in p.stderr, "boundary: key refuses to replace an existing key", p.stderr.strip()[-120:])
+
+    # The boundary point: one WireGuard peer, us.
+    sh("ip -n bpoint link add bpw type wireguard")
+    subprocess.run(["ip", "netns", "exec", "bpoint", "wg", "set", "bpw", "listen-port", "51900", "private-key", "/dev/stdin",
+                    "peer", mypub, "endpoint", "203.0.113.1:51901", "allowed-ips", "10.200.0.2/32"],
+                   input=bpriv + "\n", text=True, check=True)
+    sh("ip -n bpoint addr add 10.200.0.1/30 dev bpw && ip -n bpoint link set bpw up")
+
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
+import socket, json, select, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", 7000))
+got = []; end = time.time() + 10
+while time.time() < end:
+    if select.select([s], [], [], 0.5)[0]:
+        d, a = s.recvfrom(65535); got.append([d.decode(), a[0]]); s.sendto(b"reply-" + d, a)
+print(json.dumps(got))
+"""], stdout=subprocess.PIPE, text=True)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(3)
+    made = sh("ip -d link show grb0", check=False).stdout
+    result("wireguard" in made, "boundary: the relay makes its boundary interface when it is absent", made.strip()[:120])
+    sender = """
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, 25, b"bpw")
+s.bind(("10.200.0.1", 0)); s.settimeout(0.5); n = 0
+for i in range(10):
+    s.sendto(f"bp{i}".encode(), ("10.200.0.2", 7000))
+    try:
+        n += s.recv(65535).startswith(b"reply-")
+    except socket.timeout: pass
+print(n)
+"""
+    rep = sh(f"ip netns exec bpoint python3 -c '{sender}'", check=False).stdout.strip()
+    got = json.loads(rx.communicate(timeout=30)[0])
+    result(len(got) == 10 and all(a == "192.0.2.50" for _, a in got) and rep == "10",
+           "boundary: datagrams from the boundary point reach the target and replies return",
+           f"{len(got)} delivered, {rep} replies")
+    p = gr("boundary", "check", "--config", CFG)
+    result(p.returncode == 0, "boundary: check says the interface matches the declaration", p.stdout.strip()[-160:])
+
+    # A second peer on the boundary interface: the relay stops.
+    other = subprocess.run(["wg", "pubkey"], input=sh("wg genkey").stdout, capture_output=True, text=True).stdout.strip()
+    sh(f"wg set grb0 peer {other} allowed-ips 10.200.0.3/32")
+    try:
+        rc = relay.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        relay.kill()
+        rc = None
+    out = relay.communicate(timeout=10)[0]
+    result(rc == 1 and "2 peers" in out, "boundary: the relay stops when a second peer is added to its interface", f"exit {rc}: {out.strip()[-160:]}")
+    sh(f"wg set grb0 peer {other} remove")
+
+    # Each way the interface can differ from the declaration is a difference, and the relay refuses to start on it.
+    for name, bad, undo, want in (
+            ("the peer may send from more than one address", f"wg set grb0 peer {bpub} allowed-ips 10.200.0.0/30",
+             f"wg set grb0 peer {bpub} allowed-ips 10.200.0.1/32", "allows only"),
+            ("another endpoint", f"wg set grb0 peer {bpub} endpoint 203.0.113.9:51900",
+             f"wg set grb0 peer {bpub} endpoint 203.0.113.7:51900", "endpoint"),
+            ("another listen port", "wg set grb0 listen-port 51999", "wg set grb0 listen-port 51901", "listens on"),
+            ("a key file others can read", f"chmod 644 {key}", f"chmod 600 {key}", "mode 600")):
+        sh(bad)
+        p = gr("boundary", "check", "--config", CFG)
+        q = gr("relay", "--config", CFG)
+        sh(undo)
+        result(p.returncode == 3 and want in p.stdout and q.returncode == 2,
+               f"boundary: {name} is a difference, and the relay refuses to start", f"check {p.returncode}, relay {q.returncode}: {p.stdout.strip()[-120:]}")
+
+    p = gr("boundary", "check", "--config", CFG)
+    result(p.returncode == 0, "boundary: after each repair, check matches again", p.stdout.strip()[-120:])
+    p = gr("boundary", "down", "--config", CFG)
+    result(p.returncode == 0 and not os.path.exists("/sys/class/net/grb0"), "boundary: down removes the interface", p.stdout.strip())
+    p = gr("boundary", "up", "--config", CFG)
+    result(p.returncode == 0 and "made" in p.stdout, "boundary: up makes it again from the declaration", p.stdout.strip())
+    sh("ip link del grb0", check=False)
+    sh("ip link add grb0 type dummy")
+    q = gr("relay", "--config", CFG)
+    sh("ip link del grb0", check=False)
+    result(q.returncode == 2 and "not a WireGuard interface" in q.stderr,
+           "boundary: an existing non-WireGuard interface under that name is refused", q.stderr.strip()[-120:])
+    for name, text, want in (
+            ("the mesh's own port", cfg.replace("listen_port = 51901", "listen_port = 51820"), "mesh's own"),
+            ("a rule whose remote is not the boundary point", cfg.replace('remote = "10.200.0.1"', 'remote = "10.200.0.9"'), "not the boundary point"),
+            ("an endpoint given as a name", cfg.replace('"203.0.113.7:51900"', '"bp.example:51900"'), "name is not accepted")):
+        write_cfg(text)
+        p = gr("validate", "--config", CFG)
+        result(p.returncode == 2 and want in p.stderr, f"boundary refused at validation: {name}", p.stderr.strip()[-120:])
+    sh("ip netns del bpoint", check=False)
+
+
+PHASES["boundary"] = phase_boundary
+
 COMPONENTS = "/opt/gt-components"  # run.sh copies the real binaries here when GOATROPE_TEST_COMPONENTS is set
 REMOTE_ID = "122624160b42bf241b6ed1b4b69808ac0870086b53150e0200"  # goat-transformers' README example message
 NTP = ("240206e90000060000000a80c0000201ed135500c0000000ed13554040000000ed13554043000000ed13554043800000")

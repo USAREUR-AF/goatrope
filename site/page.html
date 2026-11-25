@@ -116,11 +116,11 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
   <h1>{{wordmark}}</h1>
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
-    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. Joining distant sites is being designed, and is not in 0.1.0. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <p class="lede">goatrope turns one small computer with two Ethernet ports into a tap or a relay. The relay joins distant sites over the mesh they already share, or through a declared boundary point when a site stands outside it; it is work in progress. One file declares what it does. It runs with nothing else of ours installed.</p></div>
     <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.1.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
-    <figcaption><b>Joining distant sites: being designed, not in 0.1.0.</b> A controller at one site reaching sensors at others. In a deployment that already has an encrypted mesh between its sites, goatrope uses that mesh; it does not add tunnels of its own. Addresses are documentation addresses.</figcaption></figure>
+    <figcaption><b>Joining distant sites: work in progress.</b> A controller at one site reaching sensors at others. Where the sites already share an encrypted mesh, goatrope uses it and adds no tunnel. A site that must stay outside, for technical or policy reasons, is reached through a tunnel of goatrope's own whose one peer is the declared boundary point. Addresses are documentation addresses.</figcaption></figure>
 </div></div>
 
 <div class="wrap"><div class="strip">

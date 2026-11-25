@@ -86,25 +86,55 @@ its own address; replies from that target go back to the remote machine.
   dropped and counted.
 - Latency added is the tunnel's plus one user-space hop.
 
-## Transport: the WireGuard the site already runs
+## Transport: the existing mesh, or a dedicated tunnel to a boundary point
 
-goatrope creates no tunnel. The relay's `remote_interface` names a WireGuard
-interface that already exists on the machine.
+The relay always reaches the remote side through WireGuard. A declaration picks one
+of two transports with `[relay].transport`.
 
-- **In a deployment that runs a WireGuard mesh between its sites** (a NetBird
-  mesh, whose interface is a kernel WireGuard device, usually `wt0`), the relay
-  uses that interface. The controller and the relay are both peers of the mesh.
-  The mesh authenticates each peer by its key and assigns its address, so a rule's
-  `remote` names a peer the mesh admitted. The mesh's own access policy decides
-  which peers may reach the relay at all; the relay's rules then narrow that to
-  named ports, targets and directions. Peers, keys and access stay with the mesh's
-  owner; goatrope holds none of them.
-- **With no mesh** (goatrope used on its own), the operator brings up a WireGuard
-  interface with the usual tools and names it. goatrope does not create or manage
-  it.
+**`mesh` (the default): the WireGuard the site already runs.** goatrope creates no
+tunnel. `remote_interface` names a WireGuard interface that already exists.
+
+- In a deployment that runs a WireGuard mesh between its sites (a NetBird mesh, whose
+  interface is a kernel WireGuard device, usually `wt0`), the relay uses that
+  interface. The controller and the relay are both peers of the mesh. The mesh
+  authenticates each peer by its key and assigns its address, so a rule's `remote`
+  names a peer the mesh admitted. The mesh's own access policy decides which peers
+  may reach the relay at all; the relay's rules then narrow that to named ports,
+  targets and directions. Peers, keys and access stay with the mesh's owner; goatrope
+  holds none of them.
+- With no mesh (goatrope used on its own), the operator brings up a WireGuard
+  interface with the usual tools and names it.
 - A mesh client that runs WireGuard in user space presents a TUN device, not a
   WireGuard interface. The relay refuses it, because it cannot then tell that the
   source address inside the tunnel was authenticated.
+
+**`boundary`: a dedicated tunnel to one declared boundary point.** For a site that
+must be treated as outside the deployment, because it cannot run the mesh
+(technology) or may not join it (policy), and is reached only through a boundary
+point specified for that crossing. goatrope runs a WireGuard interface of its own,
+separate from the mesh, with exactly one peer: the boundary point.
+
+- `[relay.boundary]` fixes the tunnel: the boundary point's public key, its endpoint
+  (an address and a port, never a name), its single tunnel address, this end's tunnel
+  address, the listen port (never 51820, the mesh's port), the private key file and,
+  where policy asks for one, a preshared key file.
+- Every allow rule's `remote` is the boundary point's tunnel address. The interface
+  accepts nothing else: its one peer may send only from that address (WireGuard's
+  allowed addresses are that one /32 or /128).
+- Before the relay starts, and every two seconds while it runs, the interface is
+  checked against the declaration: one peer, that key, that endpoint, that one
+  allowed address, that listen port, the key derived from the declared file, the
+  declared keepalive and preshared key, and this end's address. A difference refuses
+  the start, or stops the relay.
+- The private key is made on the machine (`goatrope boundary key`, mode 600, never
+  replaced by goatrope) and never leaves it. Only public keys are exchanged, out of
+  band; `goatrope boundary sheet` prints what the boundary point's operator needs.
+- The relay makes the interface when it is absent; `goatrope boundary up` and `down`
+  do it by hand. Other tooling may make it instead; goatrope then only checks it.
+- This is the same shape goat uses for its own dedicated crossings (one interface,
+  one peer, one allowed address, a listen port that is not the mesh's), so a goat
+  deployment's boundary point and goatrope's interface pair with each other.
+- `examples/relay-boundary.toml` is this case.
 
 **Several sensor sites and one controller site.** One relay runs at each sensor
 site, on that site's mesh peer. The controller reaches each sensor at the mesh
@@ -120,7 +150,7 @@ proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
 | Property | Rule |
 |---|---|
 | Off unless declared | no `[relay]` table, no relay; `wip = true` is required while it is WIP |
-| Remote authentication | the remote side must be an existing WireGuard interface (the site mesh's, or one the operator made; see Transport). WireGuard authenticates each peer by its key and accepts from a peer only the tunnel addresses listed for it, so the source address inside the tunnel names an authenticated machine. A rule names that address |
+| Remote authentication | the remote side is a WireGuard interface: an existing one (`mesh`: the site mesh's, or one the operator made) or goatrope's own with exactly one peer that matches `[relay.boundary]` (`boundary`); see Transport. WireGuard authenticates each peer by its key and accepts from a peer only the tunnel addresses listed for it, so the source address inside the tunnel names an authenticated machine. A rule names that address |
 | Default deny | each rule names direction, protocol, remote tunnel address, tunnel port, target address and target port; everything else is dropped and counted |
 | Directions | `remote-to-link`, or `both`: replies are accepted only from the rule's target address and port, and go only to the remote machine that last used the rule |
 | Its own interface | the link side is a plain interface holding the declared address; never a tap port, the tap's bridge, a bridge member or a tunnel |
@@ -130,6 +160,7 @@ proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
 | One machine per rule | a target that is the relay's own address, the link's network or broadcast address, or a multicast address is refused |
 | Send errors | a datagram the relay cannot send (tunnel down, peer without an endpoint) is dropped and counted in `send_errors`; the relay keeps running |
 | Replies | replies are accepted from the rule's target address and port. A machine on the link that sends from that address and port to the relay's port is relayed as the target would be: the link is not authenticated, only the tunnel is |
+| Boundary interface | with `boundary`: one peer, the declared key, endpoint, single allowed address and listen port (not 51820); private key file owned by root, mode 600; checked at start and every two seconds, the relay stops on a difference; a name that exists and is not WireGuard is refused |
 | Logging | one line per rule at start; denied datagrams logged at most every 10 s; counters per rule in `/var/lib/goatrope/relay.health` |
 
 ## Built (WIP)
@@ -155,6 +186,18 @@ and a veth to a "link" namespace:
 | a reply that cannot be sent (the remote peer removed from the WireGuard interface) | counted; the relay keeps running |
 | IP forwarding turned on while it runs | the relay stops, exit 1 |
 
+Boundary transport, in the same namespaces, against a "boundary point" namespace
+with its own WireGuard interface (phase `boundary`):
+
+| Test | Result |
+|---|---|
+| `goatrope boundary key` writes a mode-600 key, prints only the public key, refuses to replace it | as stated |
+| the relay makes its interface when absent; datagrams from the boundary point reach the target, replies return | 10 of 10 |
+| a second peer added while it runs | the relay stops, exit 1 |
+| allowed addresses widened; another endpoint; another listen port; a key file others can read | each a difference (`check` exit 3) and a refused start (exit 2) |
+| `down` removes the interface; `up` makes it again | as stated |
+| refusals at validation: listen port 51820; a rule whose remote is not the boundary point; an endpoint given as a name | each refused, exit 2 |
+
 Not built: TCP, the address-level proxy, a systemd unit, IPv6 targets beyond
 parsing, and rate limits per rule. Not measured: latency, loss and throughput
 through a real tunnel and link.
@@ -164,7 +207,5 @@ through a real tunnel and link.
 1. Which protocols a first real use needs (UDP only, or TCP too), and whether any
    of them checks the sender's address, which decides between this forwarder and
    the address-level proxy.
-2. Whether the WireGuard peer for the remote machine comes from goat's mesh or is
-   configured by hand on the tap machine.
-3. Where a relay runs on a Pi with two USB ports used by the tap: the relay needs a
+2. Where a relay runs on a Pi with two USB ports used by the tap: the relay needs a
    third link-side port, or a machine of its own.

@@ -153,60 +153,65 @@ def ring(x, y, w):
 
 # ---------------------------------------------------------------- figures
 
-ALT_WORM = ("A controller site and two sensor sites, each with a goatrope machine, joined by one rope per sensor site. "
-            "On the controller's link, goatrope answers at 192.0.2.101 for sensor 1 and 192.0.2.102 for sensor 2. "
-            "Both sensor sites use 198.51.100.0/24; on each, goatrope answers at 198.51.100.200 for the controller.")
+ALT_WORM = ("A controller site and two sensor sites. The controller reaches sensor site 1 over the existing mesh "
+            "between sites, and external site 2 through a boundary point, over a dedicated tunnel whose one peer is "
+            "that boundary point. Each sensor site has a goatrope machine that answers on the sensor's network at "
+            "198.51.100.200 for the controller; both sensor sites use 198.51.100.0/24. Either way, only the declared "
+            "addresses, ports and directions cross.")
+
+
+def gate(x, y, w, h):
+    """The boundary point: a box the rope enters and leaves."""
+    return box(x, y, w, h, "node")
 
 
 def worm_wide():
     o = [f'<svg class="fig wide" viewBox="0 0 1152 452" role="img" aria-label="{ALT_WORM}">']
     o += [box(2, 2, 396, 448, "site", 12), text(24, 36, "Controller site", "h"), text(24, 58, "192.0.2.0/24", "m")]
-    o += [box(24, 192, 132, 76, "node"), text(90, 224, "controller", "b", "middle"), text(90, 246, "192.0.2.10", "m", "middle")]
-    o += [line(188, 84, 188, 426), line(156, 230, 188, 230)]
-    o += [box(222, 84, 154, 342, "gr"), text(299, 112, "goatrope", "b on", "middle")]
-    for y, a, n in ((164, "101", "1"), (330, "102", "2")):
-        o += [line(188, y, 236, y), box(236, y - 30, 126, 60, "ghost"), text(299, y - 5, f"192.0.2.{a}", "m", "middle"),
-              text(299, y + 15, f"is sensor {n} here", "s", "middle")]
-    for k, (y0, n) in enumerate(((2, "1"), (234, "2"))):
-        o += [box(754, y0, 396, 216, "site", 12), text(1130, y0 + 34, f"Sensor site {n}", "h", "end"), text(1130, y0 + 56, "198.51.100.0/24", "m", "end")]
+    o += [box(210, 188, 150, 80, "node"), text(285, 222, "controller", "b", "middle"), text(285, 244, "192.0.2.10", "m", "middle")]
+    for k, (y0, n) in enumerate(((2, "Sensor site 1"), (234, "External site 2"))):
+        o += [box(754, y0, 396, 216, "site", 12), text(1130, y0 + 34, n, "h", "end"), text(1130, y0 + 56, "198.51.100.0/24", "m", "end")]
         c = y0 + 128
         o += [box(768, y0 + 60, 170, 136, "gr"), text(853, y0 + 86, "goatrope", "b on", "middle")]
         o += [box(780, c - 25, 146, 60, "ghost"), text(853, c, "198.51.100.200", "m", "middle"), text(853, c + 20, "is the controller", "s", "middle")]
         o += [line(964, y0 + 66, 964, y0 + 196), line(926, c + 5, 964, c + 5), line(964, c + 5, 996, c + 5)]
-        o += [box(996, c - 33, 132, 76, "node"), text(1062, c - 1, f"sensor {n}", "b", "middle"), text(1062, c + 21, "198.51.100.10", "m", "middle")]
-    ropes = [bez((376, 164), (520, 164), (620, 135), (768, 135)), bez((376, 330), (520, 330), (620, 367), (768, 367))]
-    for p in ropes:
+        o += [box(996, c - 33, 132, 76, "node"), text(1062, c - 1, "sensor " + n[-1], "b", "middle"), text(1062, c + 21, "198.51.100.10", "m", "middle")]
+    mesh = bez((360, 212), (520, 212), (620, 135), (768, 135))
+    to_gate = bez((360, 244), (440, 244), (460, 300), (522, 300))
+    from_gate = bez((630, 300), (690, 300), (700, 367), (768, 367))
+    for p in (mesh, to_gate, from_gate):
         o += [rope(p, 17)]
-    for x, y in ((376, 164), (376, 330), (768, 135), (768, 367)):
+    o += [gate(522, 272, 108, 56), text(576, 297, "boundary", "b", "middle"), text(576, 316, "point", "b", "middle")]
+    for x, y in ((360, 212), (360, 244), (768, 135), (768, 367)):
         o += [ring(x, y, 22)]
-    for i, p in enumerate(ropes):
-        o += [packet(path_d(p), 3.2, i * .7), packet(path_d(p), 3.2, 1.6 + i * .7, True)]
-    o += [text(576, 206, "the existing mesh between sites", "b", "middle"), text(576, 230, "only the declared addresses,", "s", "middle"),
-          text(576, 250, "ports and directions cross", "s", "middle")]
+    for i, p in enumerate((mesh, to_gate, from_gate)):
+        o += [packet(path_d(p), 3.2 if i == 0 else 1.8, i * .5), packet(path_d(p), 3.2 if i == 0 else 1.8, 1.6 + i * .4, True)]
+    o += [text(590, 112, "the existing mesh between sites", "b", "middle")]
+    o += [text(576, 366, "a dedicated tunnel,", "b", "middle"), text(576, 386, "one peer: the boundary point", "s", "middle")]
+    o += [text(576, 424, "only the declared addresses,", "s", "middle"), text(576, 444, "ports and directions cross", "s", "middle")]
     return "".join(o) + "</svg>"
 
 
 def worm_narrow():
     o = [f'<svg class="fig narrow" viewBox="0 0 358 560" role="img" aria-label="{ALT_WORM}">']
-    o += [box(1, 1, 356, 232, "site", 10), text(16, 28, "Controller site", "h"), text(342, 28, "192.0.2.0/24", "m", "end")]
+    o += [box(1, 1, 356, 120, "site", 10), text(16, 28, "Controller site", "h"), text(342, 28, "192.0.2.0/24", "m", "end")]
     o += [box(113, 44, 132, 56, "node"), text(179, 68, "controller", "b", "middle"), text(179, 88, "192.0.2.10", "m", "middle")]
-    o += [line(24, 118, 334, 118), line(179, 100, 179, 118)]
-    o += [box(16, 136, 326, 86, "gr"), text(179, 158, "goatrope", "b on", "middle")]
-    for cx, a, n in ((91, "101", "1"), (267, "102", "2")):
-        o += [line(cx, 118, cx, 166), box(cx - 66, 166, 132, 46, "ghost"), text(cx, 186, f"192.0.2.{a}", "m", "middle"), text(cx, 203, f"is sensor {n} here", "s", "middle")]
-    ropes = [bez((91, 222), (91, 270), (84, 280), (84, 330)), bez((267, 222), (267, 270), (274, 280), (274, 330))]
-    o += [text(179, 262, "the existing", "s", "middle"), text(179, 279, "mesh", "s", "middle")]
-    for x, n in ((1, "1"), (183, "2")):
+    mesh = bez((150, 100), (150, 210), (88, 230), (88, 330))
+    to_gate = bez((208, 100), (208, 170), (274, 170), (274, 212))
+    from_gate = bez((274, 266), (274, 290), (270, 300), (270, 330))
+    o += [text(12, 196, "the existing", "s"), text(12, 213, "mesh", "s")]
+    o += [gate(204, 212, 140, 54), text(274, 234, "boundary point", "b", "middle"), text(274, 254, "dedicated tunnel", "s", "middle")]
+    for x, n in ((1, "Sensor site 1"), (183, "External site 2")):
         c = x + 87
         o += [box(x, 310, 174, 249, "site", 10), box(x + 10, 330, 154, 92, "gr"), text(c, 352, "goatrope", "b on", "middle")]
         o += [box(x + 18, 362, 138, 50, "ghost"), text(c, 383, "198.51.100.200", "m", "middle"), text(c, 401, "is the controller", "s", "middle")]
         o += [line(x + 14, 440, x + 160, 440), line(c, 412, c, 440), line(c, 440, c, 456)]
-        o += [box(x + 18, 456, 138, 52, "node"), text(c, 478, f"sensor {n}", "b", "middle"), text(c, 497, "198.51.100.10", "m", "middle")]
-        o += [text(c, 530, f"Sensor site {n}", "h", "middle"), text(c, 548, "198.51.100.0/24", "m", "middle")]
-    for p in ropes:
+        o += [box(x + 18, 456, 138, 52, "node"), text(c, 478, "sensor " + n[-1], "b", "middle"), text(c, 497, "198.51.100.10", "m", "middle")]
+        o += [text(c, 530, n, "h", "middle"), text(c, 548, "198.51.100.0/24", "m", "middle")]
+    for p in (mesh, to_gate, from_gate):
         o += [rope(p, 15)]
-    for i, p in enumerate(ropes):
-        o += [packet(path_d(p), 2.6, i * .6), packet(path_d(p), 2.6, 1.3 + i * .6, True)]
+    for i, p in enumerate((mesh, to_gate, from_gate)):
+        o += [packet(path_d(p), 2.6 if i == 0 else 1.4, i * .5), packet(path_d(p), 2.6 if i == 0 else 1.4, 1.3 + i * .3, True)]
     return "".join(o) + "</svg>"
 
 

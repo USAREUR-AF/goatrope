@@ -3,6 +3,10 @@
 ## Unreleased
 
 - landing page (site/) and its Pages workflow.
+- relay: `transport = "mesh"` (default) uses the site's existing WireGuard mesh and creates no tunnel;
+  `transport = "boundary"` reaches a site outside the deployment through a dedicated WireGuard
+  interface with exactly one peer, the declared boundary point, checked at start and while running.
+- `goatrope boundary key|sheet|up|check|down`.
 
 ## 0.1.0 (2026-11-24)
 

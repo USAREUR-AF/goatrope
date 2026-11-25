@@ -112,12 +112,27 @@ class RelayRule:
 
 
 @dataclass
+class Boundary:
+    """A WireGuard interface of the relay's own with exactly one peer, the boundary point (ADR 0002, Transport)."""
+    listen_port: int
+    private_key_file: str
+    address: str            # this end's tunnel address, with prefix
+    peer_public_key: str
+    peer_endpoint: str      # canonical "ip:port" or "[ip6]:port", as `wg show` prints it
+    peer_address: str       # the boundary point's tunnel address; the only source the interface accepts
+    preshared_key_file: str = ""
+    keepalive_s: int = 0
+
+
+@dataclass
 class Relay:
     wip_acknowledged: bool
     remote_interface: str
     link_interface: str
     link_address: str
     rules: list[RelayRule]
+    transport: str = "mesh"            # "mesh": an existing WireGuard interface; "boundary": goatrope's own, one peer
+    boundary: Boundary | None = None
 
 
 @dataclass
@@ -360,12 +375,72 @@ def _decode(d: dict, i: int, tap: Tap | None) -> Decode:
                   _str(d, "publishers", w))
 
 
+NETBIRD_PORT = 51820
+WG_KEY = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$")
+
+
+def _abs_file(t: dict, key: str, where: str) -> str:
+    v = _str(t, key, where)
+    if not v.startswith("/") or "/../" in v + "/":
+        raise ConfigError(f"{where}.{key} must be an absolute path")
+    return v
+
+
+def _endpoint(v, where: str) -> str:
+    if not isinstance(v, str):
+        raise ConfigError(f"{where} must be a string \"address:port\"")
+    host, sep, port = v.rpartition(":")
+    host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        ip = ipaddress.ip_address(host)
+        n = int(port)
+    except ValueError:
+        raise ConfigError(f"{where}: {v!r} must be an IP address and a port; a name is not accepted, because "
+                          "the boundary point is fixed by the declaration") from None
+    if not sep or not 1 <= n <= 65535:
+        raise ConfigError(f"{where}: {v!r} must end in a port from 1 to 65535")
+    return f"[{ip}]:{n}" if ip.version == 6 else f"{ip}:{n}"
+
+
+def _boundary(t, w: str) -> Boundary:
+    if not isinstance(t, dict):
+        raise ConfigError(f"{w} must be a table")
+    req = {"listen_port", "private_key_file", "address", "peer_public_key", "peer_endpoint", "peer_address"}
+    _keys(t, w, req | {"preshared_key_file", "keepalive_s"}, req)
+    port = _int(t, "listen_port", w, 1024, 65535)
+    if port == NETBIRD_PORT:
+        raise ConfigError(f"{w}.listen_port {NETBIRD_PORT} is the mesh's own WireGuard port; choose another")
+    try:
+        addr = ipaddress.ip_interface(t["address"])
+    except (ValueError, TypeError):
+        raise ConfigError(f"{w}.address must be an address with a prefix, e.g. 10.200.0.2/30") from None
+    peer = _addr(t["peer_address"], f"{w}.peer_address")
+    if ipaddress.ip_address(peer) not in addr.network or ipaddress.ip_address(peer) == addr.ip:
+        raise ConfigError(f"{w}.peer_address {peer} must be another address in {addr.network}")
+    key = t["peer_public_key"]
+    if not isinstance(key, str) or not WG_KEY.match(key):
+        raise ConfigError(f"{w}.peer_public_key must be a WireGuard public key (44 base64 characters)")
+    psk = _abs_file(t, "preshared_key_file", w) if "preshared_key_file" in t else ""
+    ka = _int(t, "keepalive_s", w, 0, 65535) if "keepalive_s" in t else 0
+    return Boundary(port, _abs_file(t, "private_key_file", w), str(addr), key,
+                    _endpoint(t["peer_endpoint"], f"{w}.peer_endpoint"), peer, psk, ka)
+
+
 def _relay(r: dict, tap: Tap | None) -> Relay:
     w = "[relay]"
     if not isinstance(r, dict):
         raise ConfigError(f"{w} must be a table")
-    _keys(r, w, {"wip", "remote_interface", "link_interface", "link_address", "allow"},
+    _keys(r, w, {"wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow"},
           {"wip", "remote_interface", "link_interface", "link_address", "allow"})
+    transport = r.get("transport", "mesh")
+    if transport not in ("mesh", "boundary"):
+        raise ConfigError(f"{w}.transport must be \"mesh\" (an existing WireGuard interface) or \"boundary\" "
+                          "(goatrope's own interface with one peer, the boundary point)")
+    if transport == "boundary" and "boundary" not in r:
+        raise ConfigError(f"{w}: transport \"boundary\" needs a [relay.boundary] table")
+    if transport == "mesh" and "boundary" in r:
+        raise ConfigError(f"{w}: [relay.boundary] applies only with transport = \"boundary\"")
+    boundary = _boundary(r["boundary"], f"{w}.boundary") if transport == "boundary" else None
     if r["wip"] is not True:
         raise ConfigError(f"{w}.wip must be true: the relay is work in progress and transmits on the link")
     remote_if = _ifname(r["remote_interface"], f"{w}.remote_interface")
@@ -415,7 +490,12 @@ def _relay(r: dict, tap: Tap | None) -> Relay:
         if rule.listen_port in seen:
             raise ConfigError(f"{w}.allow: listen_port {rule.listen_port} is used twice")
         seen.add(rule.listen_port)
-    return Relay(True, remote_if, link_if, link_addr, rules)
+    if boundary is not None:
+        for rule in rules:
+            if rule.remote != boundary.peer_address:
+                raise ConfigError(f"{w}.allow: remote {rule.remote} is not the boundary point; with transport "
+                                  f"\"boundary\" every rule's remote is {boundary.peer_address}")
+    return Relay(True, remote_if, link_if, link_addr, rules, transport, boundary)
 
 
 def parse(text: str, path: str = DEFAULT_PATH) -> Config:
