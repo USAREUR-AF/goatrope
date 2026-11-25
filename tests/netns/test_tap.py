@@ -215,6 +215,18 @@ def read_pcaps(paths: list[str]) -> list[bytes]:
     return frames
 
 
+def wait_packet_sockets(port: str, n: int, timeout: float = 300) -> None:
+    """Wait until n packet sockets are bound to port. A unit is active before its program has opened
+    its socket; under emulation that takes seconds, and frames sent sooner are not seen."""
+    index = open(f"/sys/class/net/{port}/ifindex").read().strip()
+    end = time.time() + timeout
+    while time.time() < end:
+        rows = open("/proc/net/packet").read().splitlines()[1:]
+        if sum(1 for r in rows if r.split()[4] == index) >= n:
+            return
+        time.sleep(0.5)
+
+
 def ring_frames(port: str) -> list[bytes]:
     return read_pcaps(sorted(glob.glob(f"{RING}/{port}.pcap*")))
 
@@ -1705,7 +1717,7 @@ print(json.dumps(sorted(got)))
     p = gr("status", "--config", CFG)
     result("session 100" in p.stdout and "egress-drop=yes" in p.stdout, "erspan: status names the session and the egress drop",
            next((ln for ln in p.stdout.splitlines() if "erspan" in ln), ""))
-    time.sleep(2)
+    wait_packet_sockets("grspan0", 2)  # the recorder and the send service, before the mirror starts
     mirror_udp("span100", 50, b"OK", 9300)
     mirror_udp("span200", 20, b"NO", 9300)
     got = json.loads(rx.communicate(timeout=660)[0] or "[]")
