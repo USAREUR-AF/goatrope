@@ -17,7 +17,7 @@ pub const DEFAULT_PATH: &str = "/etc/goatrope/goatrope.toml";
 pub const RECORD_DIR: &str = "/var/lib/goatrope/record";
 /// goatrope's own directories under /var/lib/goatrope; a recording directory may not be one of them.
 pub const RESERVED_DIRS: [&str; 4] = ["send", "components", "state.json", "relay.health"];
-pub const SOURCES: [&str; 3] = ["copper-tap", "mirror-port", "bypass-relay"];
+pub const SOURCES: [&str; 4] = ["copper-tap", "mirror-port", "bypass-relay", "erspan"];
 pub const NETBIRD_PORT: i64 = 51820;
 
 /// The declaration is incomplete or contradicts itself. Exit code 2.
@@ -53,6 +53,23 @@ pub struct Tap {
     pub source: Option<String>,
     pub speed_mbps: Option<i64>,
     pub record: Record,
+    pub erspan: Option<Erspan>,
+}
+
+/// An ERSPAN mirror: the switch sends copies in GRE to `local`; goatrope's `erspan` interface
+/// (the one tap port) decapsulates the session it names.
+#[derive(Debug, Clone)]
+pub struct Erspan {
+    /// the interface the mirror arrives on; it holds `local`
+    pub underlay: String,
+    pub local: String,
+    /// the address the switch sends the mirror from
+    pub remote: String,
+    /// the GRE key: the switch's mirror session number (declared as session_id); the kernel delivers a
+    /// mirror only to the interface whose key is it
+    pub gre_key: i64,
+    /// 1: ERSPAN type II; 2: type III
+    pub version: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -443,7 +460,7 @@ fn as_table<'a>(v: &'a Value, where_: &str) -> R<&'a Table> {
 fn tap(v: &Value) -> R<Tap> {
     let w = "[tap]";
     let t = as_table(v, w)?;
-    keys(t, w, &["mode", "ports", "management", "source", "speed_mbps", "record"], &["mode", "ports", "management", "record"])?;
+    keys(t, w, &["mode", "ports", "management", "source", "speed_mbps", "record", "erspan"], &["mode", "ports", "management", "record"])?;
     let mode = match &t["mode"] {
         Value::String(s) if s == "inline" || s == "listen" => s.clone(),
         other => return err(format!("{w}.mode must be \"inline\" or \"listen\", not {}", pyrepr(other))),
@@ -464,6 +481,23 @@ fn tap(v: &Value) -> R<Tap> {
             other => return err(format!("{w}.source must be one of {}, not {}", SOURCES.join(", "), pyrepr(other))),
         }
     };
+    let mut erspan = None;
+    if source.as_deref() == Some("erspan") {
+        if ports.len() != 1 {
+            return err(format!(
+                "{w}.ports: with source = \"erspan\" list exactly 1 interface, the one goatrope makes to decapsulate the mirror"
+            ));
+        }
+        if t.contains_key("speed_mbps") {
+            return err(format!("{w}.speed_mbps does not apply to source = \"erspan\": the mirror arrives over IP"));
+        }
+        let Some(e) = t.get("erspan") else {
+            return err(format!("{w}: source = \"erspan\" needs a [tap.erspan] table: underlay, local, remote, session_id, version"));
+        };
+        erspan = Some(erspan_table(e, &ports[0])?);
+    } else if t.contains_key("erspan") {
+        return err(format!("{w}: [tap.erspan] applies only with source = \"erspan\""));
+    }
     let mgmt = ifname(&t["management"], &format!("{w}.management"))?;
     if ports.contains(&mgmt) {
         return err(format!("{w}.management ({mgmt}) is also a tap port; manage the machine over another interface"));
@@ -516,7 +550,33 @@ fn tap(v: &Value) -> R<Tap> {
             files: int(r, "files", rw, 2, 10000)?,
             directory: directory.unwrap(),
         },
+        erspan,
     })
+}
+
+fn erspan_table(v: &Value, port: &str) -> R<Erspan> {
+    let w = "[tap.erspan]";
+    let t = as_table(v, w)?;
+    let req = ["underlay", "local", "remote", "session_id", "version"];
+    keys(t, w, &req, &req)?;
+    let underlay = ifname(&t["underlay"], &format!("{w}.underlay"))?;
+    if underlay == port {
+        return err(format!("{w}.underlay is the tap port; the mirror arrives on another interface, which holds {w}.local"));
+    }
+    let local = addr(&t["local"], &format!("{w}.local"))?;
+    let remote = addr(&t["remote"], &format!("{w}.remote"))?;
+    if local.contains(':') || remote.contains(':') {
+        return err(format!("{w}: ERSPAN over IPv6 is not built; local and remote are IPv4 addresses"));
+    }
+    if local == remote {
+        return err(format!("{w}: local and remote must differ"));
+    }
+    let gre_key = int(t, "session_id", w, 0, 1023)?;
+    let version = match &t["version"] {
+        Value::Integer(n) if *n == 1 || *n == 2 => *n,
+        _ => return err(format!("{w}.version must be 1 (ERSPAN type II) or 2 (type III)")),
+    };
+    Ok(Erspan { underlay, local, remote, gre_key, version })
 }
 
 /// The parts of a URL Python's urllib.parse.urlsplit gives: scheme, hostname, port, path.

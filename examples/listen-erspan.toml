@@ -1,0 +1,23 @@
+# goatrope declaration: listen mode on an ERSPAN mirror, sent by a switch over IP in GRE.
+# goatrope makes the erspan interface named in ports; the mirror arrives on the underlay.
+# Every value is a placeholder; replace each one.
+schema = 1
+
+[tap]
+mode = "listen"
+source = "erspan"
+ports = ["grspan0"]                # the interface goatrope makes; exactly one
+management = "eth0"
+
+[tap.erspan]
+underlay = "eth1"                  # the interface the mirror arrives on; it holds local
+local = "192.0.2.10"               # this machine's address, where the switch sends the mirror
+remote = "198.51.100.1"            # the address the switch sends the mirror from
+session_id = 100                   # the switch's mirror session (0 to 1023); other sessions are not received
+version = 1                        # 1: ERSPAN type II; 2: type III
+
+[tap.record]
+ports = ["grspan0"]
+filter = ""
+file_mb = 50
+files = 20

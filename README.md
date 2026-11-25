@@ -13,11 +13,13 @@ come from any of these:
 |---|---|---|
 | a **prebuilt tap device** in the cable: a passive copper tap, or a powered tap device that keeps the link closed when its power fails | `mode = "listen"`, `source = "copper-tap"` or `"bypass-relay"` | built; tested in network namespaces; no device measured with goatrope |
 | a switch **mirror port**: SPAN on the same switch, or RSPAN delivered to a port of another | `mode = "listen"`, `source = "mirror-port"` | built; tested in network namespaces |
-| **ERSPAN**: a mirror sent over IP, in GRE, to an address on the goatrope machine | `source = "erspan"` | designed ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md), step 5); not built |
+| **ERSPAN**: a mirror sent over IP, in GRE, to an address on the goatrope machine | `mode = "listen"`, `source = "erspan"` and a `[tap.erspan]` table | built; tested in network namespaces with a mirroring namespace |
 | goatrope's **own inline tap**: a small computer with two Ethernet ports, such as a Raspberry Pi, bridging the link | `mode = "inline"` | built; tested in network namespaces |
 
 When the system that sends the data seems locked down, [three-ways.md](docs/three-ways.md)
 compares the ways to get a copy without taking control of it.
+[related-work.md](docs/related-work.md) lists the established practice goatrope follows, with
+its sources, and the practice it does not follow yet.
 
 On the machine that receives the copy, goatrope runs in up to three declared roles:
 
@@ -65,7 +67,7 @@ schema = 1
 mode = "inline"                    # "inline" or "listen"; required
 ports = ["enxPORTA", "enxPORTB"]   # inline: exactly two; listen: one, or two for a passive tap's outputs
 management = "eth0"                # never a tap port
-# listen only:  source = "copper-tap" | "mirror-port" | "bypass-relay"
+# listen only:  source = "copper-tap" | "mirror-port" | "bypass-relay" | "erspan" (with [tap.erspan])
 # optional:     speed_mbps = 100   (forced, full duplex; required for copper-tap)
 
 [tap.record]
