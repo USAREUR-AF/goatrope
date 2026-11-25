@@ -18,6 +18,8 @@ come from any of these:
 
 When the system that sends the data seems locked down, [three-ways.md](docs/three-ways.md)
 compares the ways to get a copy without taking control of it.
+[related-work.md](docs/related-work.md) lists the established practice goatrope follows, with
+its sources, and the practice it does not follow yet.
 
 On the machine that receives the copy, goatrope runs in up to three declared roles:
 
