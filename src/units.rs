@@ -122,7 +122,8 @@ fn a_filter_that_looks_like_an_option_reaches_tcpdump_as_a_filter() {
     let a = tap::recorder_argv(&c, "tp0");
     let i = a.iter().position(|x| x == "--").expect("the filter follows --");
     assert_eq!(&a[i + 1..], ["-c1"]);
-    if su::have("tcpdump") {
+    // tcpdump opens the device even to compile a filter, which needs root: the namespace tests run this as root
+    if su::have("tcpdump") && crate::sys::is_root() {
         let mut cmd = vec!["tcpdump".to_string(), "-d".into(), "-i".into(), "lo".into()];
         cmd.extend(a[i..].iter().cloned());
         let out = Command::new(&cmd[0]).args(&cmd[1..]).output().unwrap();
