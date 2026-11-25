@@ -22,7 +22,7 @@ mkdir -p "$out"
 versions=("$@")
 # The binary under test: built here unless it is already there (tools/build-bin.sh; without cargo
 # on the host, GOATROPE_BUILD_IN_DOCKER=1 builds it in the rust image).
-[ -x "$repo/bin/$(uname -m)/goatrope" ] || "$repo/tools/build-bin.sh"
+[ -x "$repo/bin/$(uname -m)/goatrope" ] && [ -x "$repo/bin/$(uname -m)/goatrope-units" ] || GOATROPE_BUILD_UNITS=1 "$repo/tools/build-bin.sh"
 
 [ "${#versions[@]}" -gt 0 ] || versions=(24.04 26.04)
 rc=0

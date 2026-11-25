@@ -13,6 +13,8 @@ mod send;
 mod sys;
 mod sysutil;
 mod tap;
+#[cfg(test)]
+mod units;
 
 pub const VERSION: &str = include_str!("../VERSION");
 

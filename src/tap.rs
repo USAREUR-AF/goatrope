@@ -545,6 +545,11 @@ fn save_state(state: &Value) -> std::io::Result<()> {
     su::write_file(STATE, &text, 0o600)
 }
 
+#[cfg(test)]
+pub fn save_state_for_test(state: &Value) {
+    save_state(state).unwrap();
+}
+
 fn makedirs(d: &str, state: &mut Value) -> std::io::Result<()> {
     let mut missing = Vec::new();
     let mut cur = Path::new(d).to_path_buf();

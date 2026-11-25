@@ -50,8 +50,8 @@ jobs:
         ubuntu: ['24.04', '26.04']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: The static binary
-        run: sudo apt-get install -y musl-tools && tools/build-bin.sh
+      - name: The static binary and its unit-test binary
+        run: sudo apt-get install -y musl-tools && GOATROPE_BUILD_UNITS=1 tools/build-bin.sh
       - name: Run (privileged container with systemd as PID 1, veth pairs, namespaces)
         run: OUT="$RUNNER_TEMP/results" tests/netns/run.sh "${{ matrix.ubuntu }}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
