@@ -1612,6 +1612,127 @@ def phase_deploy() -> None:
 PHASES["deploy"] = phase_deploy
 
 
+
+ERSPAN = """schema = 1
+[tap]
+mode = "listen"
+source = "erspan"
+ports = ["grspan0"]
+management = "eth0"
+[tap.erspan]
+underlay = "er0"
+local = "203.0.113.10"
+remote = "203.0.113.1"
+session_id = 100
+version = 1
+[tap.record]
+ports = ["grspan0"]
+filter = ""
+file_mb = 5
+files = 4
+
+[[send]]
+name = "span"
+port = "grspan0"
+match = { protocol = "udp", dst_port = 9300 }
+to = ["udp://127.0.0.1:9301"]
+"""
+
+
+def topo_erspan() -> None:
+    """A switch in its own namespace mirrors a link to this machine over ERSPAN: one session the
+    declaration names (key 100) and one it does not (key 200)."""
+    sh("ip netns del sw", check=False)
+    sh("ip link del er0", check=False)
+    sh("ip netns add sw && ip -n sw link set lo up")
+    sh("ip link add er0 type veth peer name sw1 && ip link set sw1 netns sw")
+    sh("ip addr add 203.0.113.10/24 dev er0 && ip link set er0 up")
+    sh("ip -n sw addr add 203.0.113.1/24 dev sw1 && ip -n sw link set sw1 up")
+    for name, key in (("span100", 100), ("span200", 200)):
+        sh(f"ip -n sw link add {name} type erspan seq key {key} local 203.0.113.1 remote 203.0.113.10 erspan_ver 1 erspan 7")
+        sh(f"ip -n sw link set {name} up")
+
+
+def mirror_udp(ifname: str, n: int, tag: bytes, dport: int) -> None:
+    """Ethernet frames carrying UDP datagrams, sent into the switch's ERSPAN interface, as a mirror copies them."""
+    code = ("import socket,struct\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\n"
+            f"s.bind(({ifname!r},0))\n"
+            "def ck(h):\n s=sum(struct.unpack('!10H',h));s=(s>>16)+(s&0xffff);return (~(s+(s>>16)))&0xffff\n"
+            f"for i in range({n}):\n"
+            f" pl={MAGIC!r}+{tag!r}+i.to_bytes(4,'big')+b'm'*30\n"
+            f" u=struct.pack('!HHHH',40000,{dport},8+len(pl),0)+pl\n"
+            " h=struct.pack('!BBHHHBBH4s4s',0x45,0,20+len(u),i,0,64,17,0,bytes([192,0,2,10]),bytes([192,0,2,20]))\n"
+            " h=h[:10]+struct.pack('!H',ck(h))+h[12:]\n"
+            " s.send(b'\\x02\\x00\\x00\\x00\\x00\\x20'+b'\\x02\\x00\\x00\\x00\\x00\\x10'+b'\\x08\\x00'+h+u)\n")
+    sh(f"ip netns exec sw python3 -c \"{code}\"")
+
+
+def phase_erspan() -> None:
+    topo_erspan()
+    before = snapshot()
+    stand_in_watchdog()
+    p = gr("validate", "--config", write_cfg(ERSPAN.replace("session_id = 100", "session_id = 2000")))
+    result(p.returncode == 2 and "session_id must be a whole number from 0 to 1023" in p.stderr, "erspan: a session ID over 1023 is refused", p.stderr.strip()[-120:])
+    p = gr("validate", "--config", write_cfg(ERSPAN.replace('local = "203.0.113.10"', 'local = "2001:db8::10"')))
+    result(p.returncode == 2 and "IPv6 is not built" in p.stderr, "erspan: an IPv6 underlay is refused", p.stderr.strip()[-120:])
+    p = gr("validate", "--config", write_cfg(ERSPAN.replace('source = "erspan"', 'source = "mirror-port"')))
+    result(p.returncode == 2 and "applies only with source" in p.stderr, "erspan: [tap.erspan] without source = \"erspan\" is refused", p.stderr.strip()[-120:])
+    p = gr("install", "--config", write_cfg(ERSPAN.replace('local = "203.0.113.10"', 'local = "203.0.113.11"')))
+    result(p.returncode == 2 and "does not hold 203.0.113.11" in p.stderr and not diff(before, snapshot()),
+           "erspan: install refused, changing nothing, when the underlay does not hold the declared address", p.stderr.strip()[-160:])
+
+    write_cfg(ERSPAN)
+    up = Capture("sw", "sw1", "erspan-back")  # anything this machine sends toward the switch
+    rx = subprocess.Popen([sys.executable, "-c", """
+import socket, json, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 9301)); s.settimeout(0.5)
+got = set(); end = time.time() + 40
+while time.time() < end and len(got) < 50:
+    try:
+        d = s.recv(65535)
+    except socket.timeout:
+        continue
+    if d.startswith(b"GTROPEOK"):
+        got.add(int.from_bytes(d[8:12], "big"))
+print(json.dumps(sorted(got)))
+"""], stdout=subprocess.PIPE, text=True)
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "erspan: install", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-600:]}")
+    kind = sh("ip -d link show grspan0", check=False).stdout
+    result("erspan" in kind and "key 100" in kind.replace("ikey 0.0.0.100", "key 100").replace("ikey 100", "key 100"),
+           "erspan: the decapsulating interface exists, keyed by the session ID", " ".join(kind.split())[:200])
+    check_exit(0, "erspan after install")
+    p = gr("status", "--config", CFG)
+    result("session 100" in p.stdout and "egress-drop=yes" in p.stdout, "erspan: status names the session and the egress drop",
+           next((ln for ln in p.stdout.splitlines() if "erspan" in ln), ""))
+    time.sleep(2)
+    mirror_udp("span100", 50, b"OK", 9300)
+    mirror_udp("span200", 20, b"NO", 9300)
+    got = json.loads(rx.communicate(timeout=60)[0] or "[]")
+    result(got == list(range(50)), "erspan: [[send]] got every datagram of the declared session", f"{len(got)} of 50")
+    flush_recorders(["grspan0"])
+    frames = ring_frames("grspan0")
+    start_recorders(["grspan0"])
+    result(tagged(frames, b"OK") == set(range(50)), "erspan: every mirrored frame of session 100 recorded, decapsulated",
+           f"{len(tagged(frames, b'OK'))} of 50")
+    result(not tagged(frames, b"NO"), "erspan: no frame of another session recorded", f"{len(tagged(frames, b'NO'))} of 20")
+    back = [f for f in up.stop() if len(f) > 23 and f[12:14] == b"\x08\x00" and f[23] == 47]
+    result(not back, "erspan: nothing sent back toward the switch in GRE", f"{len(back)} GRE frames")
+    sh("ip link del grspan0")
+    check_exit(3, "erspan: the decapsulating interface removed")
+    p = gr("install", "--config", CFG)
+    check_exit(0, "erspan: install again restores it")
+    p = gr("uninstall", "--purge")
+    d = diff(before, snapshot())
+    result(p.returncode == 0 and not d and not os.path.exists("/sys/class/net/grspan0"),
+           "erspan: uninstall --purge removes the interface and leaves nothing", "; ".join(d)[:400])
+    sh("ip netns del sw", check=False)
+    sh("ip link del er0", check=False)
+
+
+PHASES["erspan"] = phase_erspan
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

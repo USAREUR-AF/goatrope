@@ -146,6 +146,34 @@ ConfigureWithoutCarrier=yes
     vec![(format!("{NET}/04-goatrope-{BRIDGE}.netdev"), netdev), (format!("{NET}/04-goatrope-{BRIDGE}.network"), network)]
 }
 
+/// The decapsulating interface, made by systemd-networkd at every boot, as it makes the bridge.
+/// Independent: it is bound to no underlay's .network file, which belongs to the system, not goatrope.
+fn erspan_netdev(port: &str, e: &config::Erspan) -> String {
+    let index = if e.version == 1 { "ERSPANIndex=1\n" } else { "" };
+    format!(
+        "{}# listen, erspan: decapsulates mirror session {} sent from {} to {}; it never transmits
+[NetDev]
+Name={port}
+Kind=erspan
+
+[Tunnel]
+Local={}
+Remote={}
+Key={}
+ERSPANVersion={}
+{index}Independent=yes
+",
+        header(&decl()),
+        e.session_id,
+        e.remote,
+        e.local,
+        e.local,
+        e.remote,
+        e.session_id,
+        e.version
+    )
+}
+
 fn tap_names(tap: &Tap) -> Vec<String> {
     let mut names = tap.ports.clone();
     if tap.mode == "inline" {
@@ -271,6 +299,9 @@ pub fn render(cfg: &Config, nm_present: bool) -> BTreeMap<String, String> {
     if tap.mode == "inline" {
         files.extend(bridge_files());
     }
+    if let Some(e) = &tap.erspan {
+        files.insert(format!("{NET}/03-goatrope-{}.netdev", tap.ports[0]), erspan_netdev(&tap.ports[0], e));
+    }
     files.insert(SYSCTL.into(), sysctl_file(cfg));
     files.insert(format!("{UNITS}/goatrope-ports.service"), ports_unit());
     files.insert(format!("{UNITS}/goatrope-record@.service"), record_unit(cfg));
@@ -334,12 +365,30 @@ pub fn preflight(cfg: &Config) -> R<()> {
     if !su::exists(&tap.management) {
         return refuse(format!("the management interface {} does not exist (see: ip -br link)", tap.management));
     }
+    if let Some(e) = &tap.erspan {
+        let p = &tap.ports[0];
+        if su::exists(p) && su::kind(p).as_deref() != Some("erspan") {
+            return refuse(format!("{p} exists and is not an erspan interface; name the interface goatrope makes for the mirror"));
+        }
+        if !su::exists(&e.underlay) {
+            return refuse(format!("the underlay {} does not exist (see: ip -br link)", e.underlay));
+        }
+        if !su::addresses(&e.underlay).iter().any(|a| a.split('/').next() == Some(e.local.as_str())) {
+            return refuse(format!("{} does not hold {}, where the mirror is sent; configure the address first", e.underlay, e.local));
+        }
+    }
     for p in &tap.ports {
+        if tap.erspan.is_some() && !su::exists(p) {
+            continue; // goatrope makes it
+        }
         if !su::exists(p) {
             return refuse(format!("no interface {p} (see: ip -br link)"));
         }
         let k = su::kind(p);
-        if p == "lo" || matches!(k.as_deref(), Some("bridge") | Some("bond") | Some("wireguard") | Some("tun") | Some("vlan")) {
+        if p == "lo"
+            || matches!(k.as_deref(), Some("bridge") | Some("bond") | Some("wireguard") | Some("tun") | Some("vlan"))
+            || (k.as_deref() == Some("erspan") && tap.erspan.is_none())
+        {
             return refuse(format!("{p} is a {} interface, not an Ethernet port", k.unwrap_or_else(|| "loopback".into())));
         }
         if Path::new(&format!("{SYS_NET}/{p}/wireless")).exists() {
@@ -722,9 +771,18 @@ pub fn install(cfg: &Config) -> R<()> {
     if !state["created_dirs"].is_array() {
         state["created_dirs"] = json!([]);
     }
+    if tap.erspan.is_some() {
+        let p = tap.ports[0].clone();
+        let mut made: Vec<Value> = state["created_links"].as_array().cloned().unwrap_or_default();
+        if !su::exists(&p) && !made.contains(&json!(p)) {
+            made.push(json!(p));
+        }
+        state["created_links"] = Value::Array(made);
+    }
     for p in &tap.ports {
-        // first sight of a port: remember how it was
-        if state["ports"].get(p).is_none() {
+        // first sight of a port: remember how it was (a link goatrope makes is removed instead)
+        let made = state["created_links"].as_array().map(|a| a.contains(&json!(p))).unwrap_or(false);
+        if state["ports"].get(p).is_none() && !made {
             state["ports"][p] = snapshot_port(p);
         }
     }
@@ -794,6 +852,11 @@ pub fn install(cfg: &Config) -> R<()> {
     }
     su::systemctl(&["enable", "--now", "systemd-networkd.service"]);
     su::run(&["networkctl", "reload"]);
+    for p in &tap.ports {
+        if tap.erspan.is_some() {
+            wait_for(p, 10.0);
+        }
+    }
     if tap.mode == "listen" && su::exists(BRIDGE) {
         su::run(&["ip", "link", "del", BRIDGE]); // left from an earlier inline declaration
     }
@@ -848,6 +911,14 @@ pub fn uninstall(purge: bool) -> R<()> {
     su::run(&["networkctl", "reload"]);
     if su::exists(BRIDGE) {
         su::run(&["ip", "link", "del", BRIDGE]);
+    }
+    // links goatrope made (the erspan interface): networkd does not remove a netdev whose file is gone
+    if let Some(made) = state["created_links"].as_array() {
+        for l in made.iter().filter_map(|v| v.as_str()) {
+            if su::exists(l) && su::kind(l).as_deref() == Some("erspan") {
+                crate::link::delete(l);
+            }
+        }
     }
     if let Some(ports) = state["ports"].as_object() {
         for (p, prior) in ports {
@@ -1159,6 +1230,25 @@ pub fn check(cfg: &Config) -> Vec<Item> {
         }
     }
 
+    if let Some(e) = &tap.erspan {
+        let p = &tap.ports[0];
+        let k = su::kind(p);
+        item(
+            &mut items,
+            format!("erspan:{p}"),
+            Some(k.as_deref() == Some("erspan")),
+            "an erspan interface",
+            k.unwrap_or_else(|| "absent".into()),
+        );
+        let held = su::addresses(&e.underlay).iter().any(|a| a.split('/').next() == Some(e.local.as_str()));
+        item(
+            &mut items,
+            format!("erspan-underlay:{}", e.underlay),
+            Some(held),
+            format!("holds {}", e.local),
+            if held { format!("holds {}", e.local) } else { format!("does not hold {}", e.local) },
+        );
+    }
     if su::nm_active() {
         let st = su::nm_states();
         for p in &tap.ports {
@@ -1387,6 +1477,17 @@ pub fn status(cfg: &Config) -> i32 {
         let drop =
             if tap.mode == "listen" { format!("  egress-drop={}", if su::egress_drop(p) { "yes" } else { "NO" }) } else { String::new() };
         println!("  port {p:<16} carrier={carrier} speed={speed} Mb/s  addresses={}{drop}", su::addresses(p).len());
+    }
+    if let Some(e) = &tap.erspan {
+        println!(
+            "  erspan {:<14} session {} (type {}) from {} to {} on {}",
+            tap.ports[0],
+            e.session_id,
+            if e.version == 1 { "II" } else { "III" },
+            e.remote,
+            e.local,
+            e.underlay
+        );
     }
     if tap.mode == "inline" {
         if su::exists(BRIDGE) {
