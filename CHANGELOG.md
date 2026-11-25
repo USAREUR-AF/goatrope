@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- ADR 0003 (Proposed): goatrope is written in Rust; the declaration, commands, exit codes,
+  release shape and namespace tests stay as they are.
 - landing page (site/) and its Pages workflow.
 
 ## 0.1.0 (2026-11-24)
