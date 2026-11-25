@@ -181,7 +181,7 @@ def worm_wide():
         o += [ring(x, y, 22)]
     for i, p in enumerate(ropes):
         o += [packet(path_d(p), 3.2, i * .7), packet(path_d(p), 3.2, 1.6 + i * .7, True)]
-    o += [text(576, 206, "one WireGuard tunnel per pair", "b", "middle"), text(576, 230, "only the declared addresses,", "s", "middle"),
+    o += [text(576, 206, "the existing mesh between sites", "b", "middle"), text(576, 230, "only the declared addresses,", "s", "middle"),
           text(576, 250, "ports and directions cross", "s", "middle")]
     return "".join(o) + "</svg>"
 
@@ -195,7 +195,7 @@ def worm_narrow():
     for cx, a, n in ((91, "101", "1"), (267, "102", "2")):
         o += [line(cx, 118, cx, 166), box(cx - 66, 166, 132, 46, "ghost"), text(cx, 186, f"192.0.2.{a}", "m", "middle"), text(cx, 203, f"is sensor {n} here", "s", "middle")]
     ropes = [bez((91, 222), (91, 270), (84, 280), (84, 330)), bez((267, 222), (267, 270), (274, 280), (274, 330))]
-    o += [text(179, 262, "one WireGuard", "s", "middle"), text(179, 279, "tunnel per pair", "s", "middle")]
+    o += [text(179, 262, "the existing", "s", "middle"), text(179, 279, "mesh", "s", "middle")]
     for x, n in ((1, "1"), (183, "2")):
         c = x + 87
         o += [box(x, 310, 174, 249, "site", 10), box(x + 10, 330, 154, 92, "gr"), text(c, 352, "goatrope", "b on", "middle")]
