@@ -1,0 +1,27 @@
+# goatrope declaration: A relay at a site that is treated as outside the deployment. The controller's
+# side is reached through one declared boundary point, over a WireGuard interface of
+# goatrope's own that has exactly that one peer (ADR 0002, Transport). Use it when the
+# site cannot or may not join the deployment's mesh. Addresses, ports and the key are
+# documentation values.
+schema = 1
+
+[relay]
+wip = true
+transport = "boundary"
+remote_interface = "grb0"          # goatrope's boundary interface; made by `goatrope boundary up` or the relay
+link_interface = "eth1"            # the sensor's network, an interface of its own
+link_address = "192.0.2.50/24"     # the relay's address on that network
+allow = [
+  # every rule's remote is the boundary point's tunnel address
+  { direction = "both", protocol = "udp", remote = "10.200.0.1", listen_port = 40000, target = "192.0.2.10", target_port = 40000 },
+]
+
+[relay.boundary]
+listen_port = 51900                                    # not 51820, the mesh's own WireGuard port
+private_key_file = "/etc/goatrope/boundary.key"        # made on this machine by `goatrope boundary key`; mode 600
+address = "10.200.0.2/30"                              # this end of the tunnel
+peer_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="   # the boundary point's public key
+peer_endpoint = "203.0.113.7:51900"                    # the boundary point, an address and a port
+peer_address = "10.200.0.1"                            # the only tunnel address the interface accepts
+keepalive_s = 25                                       # optional: keep a NAT on the way open
+# preshared_key_file = "/etc/goatrope/boundary.psk"    # optional, where policy asks for one

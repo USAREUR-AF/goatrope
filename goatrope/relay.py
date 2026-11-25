@@ -21,7 +21,7 @@ import socket
 import sys
 import time
 
-from . import config as cfgmod, sysutil as su
+from . import boundary as bnd, config as cfgmod, sysutil as su
 
 SO_BINDTODEVICE = 25
 HEALTH = "/var/lib/goatrope/relay.health"
@@ -35,9 +35,12 @@ def preflight(cfg: cfgmod.Config) -> None:
     r = cfg.relay
     if r is None:
         raise RelayRefusal("this declaration has no [relay]")
-    if su.kind(r.remote_interface) != "wireguard":
+    if r.transport == "mesh" and su.kind(r.remote_interface) != "wireguard":
         raise RelayRefusal(f"{r.remote_interface} is not a WireGuard interface; the relay authenticates the "
                            "remote machine through WireGuard and accepts nothing else")
+    if r.transport == "boundary" and su.exists(r.remote_interface) and su.kind(r.remote_interface) != "wireguard":
+        raise RelayRefusal(f"{r.remote_interface} exists and is not a WireGuard interface; it cannot be the "
+                           "boundary interface")
     if not su.exists(r.link_interface):
         raise RelayRefusal(f"no interface {r.link_interface}")
     if su.kind(r.link_interface) in ("bridge", "wireguard") or su.master(r.link_interface):
@@ -59,6 +62,13 @@ def preflight(cfg: cfgmod.Config) -> None:
     if r.link_address not in addrs:
         raise RelayRefusal(f"{r.link_interface} does not hold {r.link_address} (it has {', '.join(addrs) or 'none'}); "
                            "configure the relay's own address on its interface first")
+    if r.transport == "boundary":  # last, so a refusal above leaves the machine as it was
+        try:
+            made = bnd.up(r.boundary, r.remote_interface)
+        except bnd.BoundaryRefusal as e:
+            raise RelayRefusal(str(e)) from None
+        print(f"goatrope relay (WIP): boundary interface {r.remote_interface} "
+              f"{'made' if made else 'present'}, one peer {r.boundary.peer_address} at {r.boundary.peer_endpoint}", flush=True)
 
 
 def _forwarding(r: cfgmod.Relay) -> list[str]:
@@ -136,6 +146,12 @@ def run(cfg: cfgmod.Config, max_seconds: float | None = None) -> int:
             if fwd:
                 print(f"goatrope relay: stopping: IP forwarding was turned on ({', '.join(fwd)})", file=sys.stderr)
                 return 1
+            if r.transport == "boundary":
+                drift = bnd.check(r.boundary, r.remote_interface)
+                if drift:
+                    print(f"goatrope relay: stopping: {r.remote_interface} no longer matches the declaration: "
+                          + "; ".join(drift), file=sys.stderr)
+                    return 1
     _health(state)
     return 0
 

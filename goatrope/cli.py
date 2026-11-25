@@ -9,6 +9,10 @@
   goatrope uninstall [--purge]                 remove everything install wrote and restore the ports
   goatrope validate  [--config PATH]           check the declaration alone, without touching the machine
   goatrope relay     [--config PATH]           run the relay (WIP; see docs/adr/0002)
+  goatrope boundary  key|sheet|up|check|down [--config PATH]
+                                               the relay's boundary interface (transport = "boundary"):
+                                               make the private key, print what the boundary point needs,
+                                               bring the interface up, check it (0 matches, 3 differs), remove it
 
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 """
@@ -35,6 +39,38 @@ def _load(path: str) -> cfgmod.Config:
     return cfg
 
 
+def _boundary(cfg: cfgmod.Config, action: str) -> int:
+    from . import boundary as bnd
+    r = cfg.relay
+    if r is None or r.transport != "boundary":
+        print("goatrope boundary: this declaration's [relay] does not use transport = \"boundary\"", file=sys.stderr)
+        return EXIT_REFUSED
+    b, ifname = r.boundary, r.remote_interface
+    if action == "sheet":
+        print(bnd.sheet(b, ifname))
+        return EXIT_OK
+    _need_root()
+    try:
+        if action == "key":
+            print(f"wrote {b.private_key_file} (mode 600); public key {bnd.make_key(b.private_key_file)}")
+            print(bnd.sheet(b, ifname))
+        elif action == "up":
+            made = bnd.up(b, ifname)
+            print(f"{ifname}: {'made; ' if made else ''}matches the declaration")
+        elif action == "check":
+            problems = bnd.check(b, ifname)
+            for p in problems:
+                print(f"  DIFF {p}")
+            print(f"{ifname}: {'matches the declaration' if not problems else 'differs'}")
+            return EXIT_OK if not problems else EXIT_DIFFERS
+        elif action == "down":
+            print(f"{ifname}: {'removed' if bnd.down(ifname) else 'not present'}")
+    except bnd.BoundaryRefusal as e:
+        print(f"goatrope boundary: refused: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="goatrope", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -45,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
         if name == "check":
             p.add_argument("--json", action="store_true")
+    p = sub.add_parser("boundary")
+    p.add_argument("action", choices=["key", "sheet", "up", "check", "down"])
+    p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
     p = sub.add_parser("deploy")
     p.add_argument("--config", default=cfgmod.DEFAULT_PATH)
     p.add_argument("--dry-run", action="store_true", help="make every refusal, change nothing")
@@ -75,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
             from . import relay
             _need_root()
             return relay.run(cfg)
+        if a.cmd == "boundary":
+            return _boundary(cfg, a.action)
         if cfg.tap is None:
             print("goatrope: this declaration has no [tap]; only `goatrope relay` applies", file=sys.stderr)
             return EXIT_REFUSED
