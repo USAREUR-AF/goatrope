@@ -12,7 +12,7 @@ into a machine on one network link, in up to three declared roles:
 |---|---|---|
 | **tap** | records the link: **inline** (the machine bridges the link) or **listen** (a tap device or mirror port hands it a copy) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
 | **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
-| **relay** | lets a remote machine exchange named datagrams with machines on the link through WireGuard | WIP; design in [ADR 0002](docs/adr/0002-relay.md) |
+| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs (goatrope creates no tunnel) | WIP; design in [ADR 0002](docs/adr/0002-relay.md) |
 
 It runs with no goat component installed. Why it is a repository of its own, and
 what it leaves to other repositories: [ADR 0001](docs/adr/0001-goatrope-is-its-own-repository.md).

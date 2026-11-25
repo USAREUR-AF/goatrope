@@ -1,0 +1,14 @@
+# goatrope declaration: A relay at one sensor site, reached by a controller at another site over the
+# WireGuard mesh both sites already run (ADR 0002, Transport). goatrope creates no
+# tunnel: wt0 is the mesh's interface. Addresses and ports are documentation values.
+schema = 1
+
+[relay]
+wip = true
+remote_interface = "wt0"          # the mesh's kernel WireGuard interface
+link_interface = "eth1"           # the sensor's network, an interface of its own
+link_address = "192.0.2.50/24"    # the relay's address on that network
+allow = [
+  # the controller's mesh address; the sensor answers the relay, the relay answers the controller
+  { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000 },
+]

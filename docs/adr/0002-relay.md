@@ -86,12 +86,41 @@ its own address; replies from that target go back to the remote machine.
   dropped and counted.
 - Latency added is the tunnel's plus one user-space hop.
 
+## Transport: the WireGuard the site already runs
+
+goatrope creates no tunnel. The relay's `remote_interface` names a WireGuard
+interface that already exists on the machine.
+
+- **In a deployment that runs a WireGuard mesh between its sites** (a NetBird
+  mesh, whose interface is a kernel WireGuard device, usually `wt0`), the relay
+  uses that interface. The controller and the relay are both peers of the mesh.
+  The mesh authenticates each peer by its key and assigns its address, so a rule's
+  `remote` names a peer the mesh admitted. The mesh's own access policy decides
+  which peers may reach the relay at all; the relay's rules then narrow that to
+  named ports, targets and directions. Peers, keys and access stay with the mesh's
+  owner; goatrope holds none of them.
+- **With no mesh** (goatrope used on its own), the operator brings up a WireGuard
+  interface with the usual tools and names it. goatrope does not create or manage
+  it.
+- A mesh client that runs WireGuard in user space presents a TUN device, not a
+  WireGuard interface. The relay refuses it, because it cannot then tell that the
+  source address inside the tunnel was authenticated.
+
+**Several sensor sites and one controller site.** One relay runs at each sensor
+site, on that site's mesh peer. The controller reaches each sensor at the mesh
+address of that site's relay and a port. Sensor sites may reuse the same link
+addresses, because the controller never sees them: it sees one mesh address per
+site. A sensor that answers whatever address last spoke to it sees the relay's link
+address and answers the relay, which returns the datagram to the controller
+(direction `both`). `examples/relay-over-mesh.toml` is this case. No address-level
+proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
+
 ## What the relay requires and refuses
 
 | Property | Rule |
 |---|---|
 | Off unless declared | no `[relay]` table, no relay; `wip = true` is required while it is WIP |
-| Remote authentication | the remote side must be a WireGuard interface. WireGuard authenticates each peer by its key and accepts from a peer only the tunnel addresses listed for it, so the source address inside the tunnel names an authenticated machine. A rule names that address |
+| Remote authentication | the remote side must be an existing WireGuard interface (the site mesh's, or one the operator made; see Transport). WireGuard authenticates each peer by its key and accepts from a peer only the tunnel addresses listed for it, so the source address inside the tunnel names an authenticated machine. A rule names that address |
 | Default deny | each rule names direction, protocol, remote tunnel address, tunnel port, target address and target port; everything else is dropped and counted |
 | Directions | `remote-to-link`, or `both`: replies are accepted only from the rule's target address and port, and go only to the remote machine that last used the rule |
 | Its own interface | the link side is a plain interface holding the declared address; never a tap port, the tap's bridge, a bridge member or a tunnel |
