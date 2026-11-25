@@ -120,7 +120,7 @@ for _ in 1 2 3 4 5; do  # the guest may still be finishing its boot under emulat
     sleep 30
 done
 phase reboot-verify uninstall
-phase listen uninstall send relay boundary uninstall units
+phase listen uninstall send relay boundary uninstall units erspan
 vm 'cat /root/gt/results.jsonl' > "$out/ubuntu-$v-arm64.results.jsonl" 2>/dev/null || true
 echo "log: $log"
 exit $rc
