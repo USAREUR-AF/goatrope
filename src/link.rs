@@ -117,3 +117,129 @@ pub fn peer_devices(peer: &str, scope: Option<&str>) -> BTreeSet<String> {
     };
     dev.map(|d| lowers(&d)).unwrap_or_default()
 }
+
+// ---------------------------------------------------------------- netlink dumps
+
+fn request(msg: RouteNetlinkMessage, dump: bool) -> Vec<RouteNetlinkMessage> {
+    let mut header = NetlinkHeader::default();
+    header.flags = NLM_F_REQUEST | if dump { netlink_packet_core::NLM_F_DUMP } else { 0 };
+    let mut req = NetlinkMessage::new(header, NetlinkPayload::from(msg));
+    req.finalize();
+    let mut buf = vec![0u8; req.buffer_len()];
+    req.serialize(&mut buf);
+    let mut out = Vec::new();
+    let Ok(mut sock) = Socket::new(NETLINK_ROUTE) else { return out };
+    if sock.bind_auto().is_err() || sock.connect(&SocketAddr::new(0, 0)).is_err() || sock.send(&buf, 0).is_err() {
+        return out;
+    }
+    loop {
+        let Ok((data, _)) = sock.recv_from_full() else { return out };
+        let mut off = 0;
+        while off < data.len() {
+            let Ok(m) = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&data[off..]) else { return out };
+            let len = m.header.length as usize;
+            match m.payload {
+                NetlinkPayload::InnerMessage(i) => out.push(i),
+                NetlinkPayload::Done(_) | NetlinkPayload::Error(_) => return out,
+                _ => {}
+            }
+            if !dump {
+                return out;
+            }
+            if len == 0 {
+                return out;
+            }
+            off += (len + 3) & !3;
+        }
+    }
+}
+
+fn index_of(ifname: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(ifname).ok()?;
+    // SAFETY: c is a valid NUL-terminated string.
+    let i = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    (i != 0).then_some(i)
+}
+
+/// The link's kind as `ip -d link` names it ("bridge", "wireguard", "veth"), or None for a plain device.
+pub fn kind(ifname: &str) -> Option<String> {
+    use netlink_packet_route::link::{LinkAttribute, LinkInfo, LinkMessage};
+    let index = index_of(ifname)?;
+    let mut m = LinkMessage::default();
+    m.header.index = index;
+    for r in request(RouteNetlinkMessage::GetLink(m), false) {
+        if let RouteNetlinkMessage::NewLink(l) = r {
+            for a in &l.attributes {
+                if let LinkAttribute::LinkInfo(infos) = a {
+                    for i in infos {
+                        if let LinkInfo::Kind(k) = i {
+                            return Some(k.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Every address on ifname as "address/prefix", as `ip -j addr show dev` lists them.
+pub fn addresses(ifname: &str) -> Vec<String> {
+    use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+    let Some(index) = index_of(ifname) else { return vec![] };
+    let mut out = Vec::new();
+    for r in request(RouteNetlinkMessage::GetAddress(AddressMessage::default()), true) {
+        if let RouteNetlinkMessage::NewAddress(a) = r {
+            if a.header.index != index {
+                continue;
+            }
+            let mut local = None;
+            let mut address = None;
+            for at in &a.attributes {
+                match at {
+                    AddressAttribute::Local(ip) => local = Some(*ip),
+                    AddressAttribute::Address(ip) => address = Some(*ip),
+                    _ => {}
+                }
+            }
+            if let Some(ip) = local.or(address) {
+                out.push(format!("{ip}/{}", a.header.prefix_len));
+            }
+        }
+    }
+    out
+}
+
+/// Every device a default route in any table leaves through, ECMP next hops included.
+pub fn default_route_devs() -> Vec<String> {
+    let mut devs = BTreeSet::new();
+    for fam in [AddressFamily::Inet, AddressFamily::Inet6] {
+        let mut m = RouteMessage::default();
+        m.header.address_family = fam;
+        for r in request(RouteNetlinkMessage::GetRoute(m), true) {
+            if let RouteNetlinkMessage::NewRoute(rt) = r {
+                if rt.header.destination_prefix_length != 0 {
+                    continue;
+                }
+                for a in &rt.attributes {
+                    match a {
+                        RouteAttribute::Oif(i) => {
+                            if let Some(n) = ifname_of(*i) {
+                                devs.insert(n);
+                            }
+                        }
+                        RouteAttribute::MultiPath(hops) => {
+                            for h in hops {
+                                if let Some(n) = ifname_of(h.interface_index) {
+                                    devs.insert(n);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    devs.into_iter().collect()
+}
