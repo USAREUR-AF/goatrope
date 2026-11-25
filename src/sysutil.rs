@@ -63,11 +63,6 @@ pub fn have(tool: &str) -> bool {
         .any(|d| fs::metadata(Path::new(d).join(tool)).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false))
 }
 
-/// A file's text, stripped, or None when it cannot be read.
-pub fn read(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
-}
-
 /// Replace path atomically and durably: a power cut leaves the old file or the new one, never half.
 pub fn write_file(path: &str, content: &str, mode: u32) -> std::io::Result<()> {
     let p = Path::new(path);
@@ -94,15 +89,6 @@ pub fn fsync_dir(d: &Path) {
     }
 }
 
-/// Write a value to a sysfs or procfs file; false when it cannot be written.
-pub fn write(path: &str, value: &str) -> bool {
-    fs::write(path, value).is_ok()
-}
-
-pub fn exists(ifname: &str) -> bool {
-    Path::new(&format!("{SYS_NET}/{ifname}")).exists()
-}
-
 /// Devices stacked on ifname (VLAN, macvlan, ipvlan, a bridge or bond it belongs to).
 pub fn uppers(ifname: &str) -> Vec<String> {
     let mut out: Vec<String> = fs::read_dir(format!("{SYS_NET}/{ifname}"))
@@ -110,11 +96,6 @@ pub fn uppers(ifname: &str) -> Vec<String> {
         .unwrap_or_default();
     out.sort();
     out
-}
-
-pub fn master(ifname: &str) -> Option<String> {
-    let p = format!("{SYS_NET}/{ifname}/master");
-    fs::read_link(&p).ok().and_then(|t| t.file_name().map(|n| n.to_string_lossy().to_string()))
 }
 
 const IFF_UP: u32 = 0x1;
@@ -132,13 +113,8 @@ pub fn is_noarp(ifname: &str) -> bool {
     ifflags(ifname) & IFF_NOARP != 0
 }
 
-pub fn kind(ifname: &str) -> Option<String> {
-    link::kind(ifname)
-}
-
-pub fn addresses(ifname: &str) -> Vec<String> {
-    link::addresses(ifname)
-}
+pub use crate::nl::{addresses, kind};
+pub use crate::sys::{exists, master, read, write};
 
 /// "[fe80::1%tp0]:22" or "192.0.2.1:22" or "fe80::1%tp0" -> (address, scope interface or None).
 pub fn split_scope(hostport: &str) -> (String, Option<String>) {
@@ -216,16 +192,6 @@ pub fn nm_states() -> BTreeMap<String, String> {
         }
     }
     out
-}
-
-/// Which IP families forward packets arriving on ifname.
-#[allow(dead_code)] // the relay uses it once it is ported (ADR 0003 step 3)
-pub fn forwarding(ifname: &str) -> Vec<String> {
-    ["ipv4", "ipv6"]
-        .iter()
-        .filter(|f| read(&format!("/proc/sys/net/{f}/conf/{ifname}/forwarding")).as_deref() == Some("1"))
-        .map(|f| f.to_string())
-        .collect()
 }
 
 pub const OFFLOADS: [(&str, &str); 4] = [

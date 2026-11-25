@@ -103,7 +103,7 @@ pub fn destination_devices(host: &str) -> Result<BTreeSet<String>, String> {
             continue;
         }
         let scope = match a {
-            SocketAddr::V6(v6) if v6.scope_id() != 0 => ifname_of(v6.scope_id()),
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => link::ifname_of(v6.scope_id()),
             _ => None,
         };
         let found = link::peer_devices(&ip.to_string(), scope.as_deref());
@@ -113,17 +113,6 @@ pub fn destination_devices(host: &str) -> Result<BTreeSet<String>, String> {
         devs.extend(found);
     }
     Ok(devs)
-}
-
-fn ifname_of(index: u32) -> Option<String> {
-    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
-    // SAFETY: buf is IF_NAMESIZE bytes, as if_indextoname requires.
-    let p = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: if_indextoname wrote a NUL-terminated name into buf.
-    Some(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned())
 }
 
 // ---------------------------------------------------------------- frames

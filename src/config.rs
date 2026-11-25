@@ -120,6 +120,7 @@ pub struct Send {
 #[derive(Debug, Clone)]
 pub struct Decode {
     pub name: String,
+    #[allow(dead_code)] // the one decoder component today; kept as declared
     pub component: String,
     pub binary: String,
     pub sha256: String,
@@ -138,6 +139,7 @@ pub struct RelayRule {
     pub listen_port: u16,
     pub target: String,
     pub target_port: u16,
+    #[allow(dead_code)] // "udp", the one protocol built; kept as declared
     pub protocol: String,
 }
 

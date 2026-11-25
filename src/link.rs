@@ -143,62 +143,6 @@ fn request(msg: RouteNetlinkMessage, dump: bool) -> Vec<RouteNetlinkMessage> {
     }
 }
 
-fn index_of(ifname: &str) -> Option<u32> {
-    let c = std::ffi::CString::new(ifname).ok()?;
-    // SAFETY: c is a valid NUL-terminated string.
-    let i = unsafe { libc::if_nametoindex(c.as_ptr()) };
-    (i != 0).then_some(i)
-}
-
-/// The link's kind as `ip -d link` names it ("bridge", "wireguard", "veth"), or None for a plain device.
-pub fn kind(ifname: &str) -> Option<String> {
-    use netlink_packet_route::link::{LinkAttribute, LinkInfo, LinkMessage};
-    let index = index_of(ifname)?;
-    let mut m = LinkMessage::default();
-    m.header.index = index;
-    for r in request(RouteNetlinkMessage::GetLink(m), false) {
-        if let RouteNetlinkMessage::NewLink(l) = r {
-            for a in &l.attributes {
-                if let LinkAttribute::LinkInfo(infos) = a {
-                    for i in infos {
-                        if let LinkInfo::Kind(k) = i {
-                            return Some(k.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Every address on ifname as "address/prefix", as `ip -j addr show dev` lists them.
-pub fn addresses(ifname: &str) -> Vec<String> {
-    use netlink_packet_route::address::{AddressAttribute, AddressMessage};
-    let Some(index) = index_of(ifname) else { return vec![] };
-    let mut out = Vec::new();
-    for r in request(RouteNetlinkMessage::GetAddress(AddressMessage::default()), true) {
-        if let RouteNetlinkMessage::NewAddress(a) = r {
-            if a.header.index != index {
-                continue;
-            }
-            let mut local = None;
-            let mut address = None;
-            for at in &a.attributes {
-                match at {
-                    AddressAttribute::Local(ip) => local = Some(*ip),
-                    AddressAttribute::Address(ip) => address = Some(*ip),
-                    _ => {}
-                }
-            }
-            if let Some(ip) = local.or(address) {
-                out.push(format!("{ip}/{}", a.header.prefix_len));
-            }
-        }
-    }
-    out
-}
-
 /// Every device a default route in any table leaves through, ECMP next hops included.
 pub fn default_route_devs() -> Vec<String> {
     let mut devs = BTreeSet::new();

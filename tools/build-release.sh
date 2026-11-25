@@ -21,7 +21,7 @@ for a in x86_64 aarch64; do
     [ -x "$repo/bin/$a/goatrope" ] || { echo "bin/$a/goatrope is missing: tools/build-bin.sh $a" >&2; exit 1; }
 done
 git -C "$repo" archive --format=tar --prefix="$name/" HEAD \
-    bin goatrope deploy examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
+    bin deploy examples docs LICENSE LICENSES NOTICE INTENT.md README.md VERSION CHANGELOG.md \
     > "$dist/$name.tar"
 # The binaries are built, not committed; they go in with the commit's time and root ownership.
 tar -C "$repo" --append -f "$dist/$name.tar" --transform "s,^,$name/," --owner=0 --group=0 --numeric-owner \

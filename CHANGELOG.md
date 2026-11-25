@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- goatrope is one static Rust binary for amd64 and arm64 (ADR 0003): the declaration,
+  commands, exit codes, installed files and state file are unchanged, and a machine installed
+  by 0.1.0 is checked, upgraded and removed by this release. The release archive holds both
+  binaries and `bin/goatrope`, which runs the one for the machine.
+- relay boundary transport: keys and the peer are set through netlink; the `wg` tool is not needed.
 - ADR 0003 (Proposed): goatrope is written in Rust; the declaration, commands, exit codes,
   release shape and namespace tests stay as they are.
 - landing page (site/) and its Pages workflow.

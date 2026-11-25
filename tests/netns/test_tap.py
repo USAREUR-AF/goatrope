@@ -1441,7 +1441,7 @@ def make_release(version: str, d: str = "/opt/gt-dist") -> dict:
     name = f"goatrope-{version}"
     path = f"{d}/{name}.tar.gz"
     with tarfile.open(path, "w:gz") as t:
-        for x in ("bin", "goatrope", "deploy", "examples"):
+        for x in ("bin", "deploy", "examples"):
             t.add(f"{SRC}/{x}", f"{name}/{x}", filter=lambda i: None if "__pycache__" in i.name else i)
         data = (version + "\n").encode()
         i = tarfile.TarInfo(f"{name}/VERSION")
