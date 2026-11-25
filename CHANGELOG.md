@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- ADR 0003 (Proposed): goatrope is written in Rust; the declaration, commands, exit codes,
+  release shape and namespace tests stay as they are.
 - landing page (site/) and its Pages workflow.
 - relay: `transport = "mesh"` (default) uses the site's existing WireGuard mesh and creates no tunnel;
   `transport = "boundary"` reaches a site outside the deployment through a dedicated WireGuard
