@@ -318,7 +318,7 @@ def build():
     for href in re.findall(r'https://github\.com/USAREUR-AF/goatrope/blob/main/([^"#]+)', page):
         if not os.path.exists(os.path.join(REPO, href)):
             sys.exit(f"site: the page links to {href}, which is not in the tree")
-    if re.search(r'(?:src|href)="(?!https://github\.com/|#|data:)', page):
+    if re.search(r'(?:src|href)="(?!https://github\.com/|https://usareur-af\.github\.io/|#|data:)', page):
         sys.exit("site: the page loads something from elsewhere")
     return page.replace("<!doctype html>\n", "<!doctype html>\n" + SPDX, 1)
 
