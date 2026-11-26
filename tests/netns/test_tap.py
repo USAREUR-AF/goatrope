@@ -1657,7 +1657,10 @@ def topo_erspan() -> None:
     sh("ip netns del sw", check=False)
     sh("ip link del er0", check=False)
     sh("ip netns add sw && ip -n sw link set lo up")
-    sh("ip link add er0 type veth peer name sw1 && ip link set sw1 netns sw")
+    # Fixed addresses: udev's MACAddressPolicy=persistent rewrites a randomly addressed veth after it
+    # is up, and the switch then sends the GRE frames to the old address, where they are dropped.
+    sh("ip link add er0 address 02:00:00:00:e7:01 type veth peer name sw1 address 02:00:00:00:e7:02"
+       " && ip link set sw1 netns sw")
     sh("ip addr add 203.0.113.10/24 dev er0 && ip link set er0 up")
     sh("ip -n sw addr add 203.0.113.1/24 dev sw1 && ip -n sw link set sw1 up")
     for name, key in (("span100", 100), ("span200", 200)):
