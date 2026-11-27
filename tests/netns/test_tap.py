@@ -2446,6 +2446,473 @@ def phase_bench() -> None:
 PHASES["bench"] = phase_bench
 
 
+# ---------------------------------------------------------------- address proxy (ADR 0004 module 4)
+
+PROXY_IP = "192.0.2.60"
+PROXY_RULES = f"""
+  {{ direction = "link-to-remote", protocol = "udp", remote = "10.99.0.2", listen_port = 7100, remote_port = 7100, sources = ["192.0.2.2"], link_address = "{PROXY_IP}" }},
+  {{ direction = "remote-to-link", protocol = "tcp", remote = "10.99.0.2", listen_port = 7200, target = "192.0.2.2", target_port = 7200, link_address = "{PROXY_IP}" }},
+  {{ direction = "link-to-remote", protocol = "tcp", remote = "10.99.0.2", listen_port = 7300, remote_port = 7300, sources = ["192.0.2.2"], link_address = "{PROXY_IP}" }},
+]"""
+PROXY = RELAY.replace("target_port = 7000 }", f'target_port = 7000, link_address = "{PROXY_IP}" }}') \
+    .replace("target_port = 7002 }", f'target_port = 7002, link_address = "{PROXY_IP}" }}') \
+    .replace("\n]", PROXY_RULES, 1) + f"""
+[[relay.proxy]]
+address = "{PROXY_IP}"
+remote = "10.99.0.2"
+"""
+
+# A remote machine sends n datagrams to the relay's port through its tunnel and counts the replies.
+PROXY_SENDER = """
+import socket, sys
+src, port, n, tag, dev = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
+s.bind((src, 0)); s.settimeout(0.3)
+replies = 0
+for i in range(n):
+    s.sendto(f"{tag}{i}".encode(), ("10.99.0.1", port))
+    try:
+        if s.recv(65535).startswith(b"reply-"): replies += 1
+    except socket.timeout: pass
+print(replies)
+"""
+
+# The link host: every datagram it receives on 7000 and 7002, with its source, one JSON line each;
+# it answers on 7000.
+PROXY_RX = """
+import socket, json, select, sys
+out = open(sys.argv[1], "a")
+socks = {}
+for p in (7000, 7002):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", p)); socks[s] = p
+while True:
+    for s in select.select(list(socks), [], [], 1)[0]:
+        d, a = s.recvfrom(65535)
+        out.write(json.dumps([socks[s], d.decode(errors="replace"), a[0]]) + "\\n"); out.flush()
+        if socks[s] == 7000: s.sendto(b"reply-" + d, a)
+"""
+
+
+# Clients and servers for the TCP and link-to-remote rules, run in a namespace:
+#   serve-remote: on 10.99.0.2 (the remote), echo UDP 7100 and TCP 7300
+#   serve-link: on 192.0.2.2 (the target), echo TCP 7200 and log each peer address
+#   udp <dst> <port> <n> <tag>: n datagrams, count echoed replies from dst:port
+#   tcp <dst> <port> <n> <tag> [bind dev]: n connections, count echoes
+#   hold <dst> <port> <out>: one connection, held open; writes the seconds until it was closed
+PROXY_TOOL = """
+import json, select, socket, sys, threading, time
+mode = sys.argv[1]
+def echo_tcp(addr, port, log=None):
+    l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); l.bind((addr, port)); l.listen(64)
+    def one(c, a):
+        if log:
+            with open(log, "a") as f: f.write(json.dumps([port, "tcp", a[0]]) + "\\n")
+        try:
+            while True:
+                d = c.recv(65535)
+                if not d: break
+                c.sendall(d)
+        except OSError: pass
+        c.close()
+    while True:
+        c, a = l.accept(); threading.Thread(target=one, args=(c, a), daemon=True).start()
+if mode == "serve-remote":
+    threading.Thread(target=echo_tcp, args=("10.99.0.2", 7300), daemon=True).start()
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("10.99.0.2", 7100))
+    while True:
+        d, a = u.recvfrom(65535); u.sendto(d, a)
+elif mode == "serve-link":
+    echo_tcp("192.0.2.2", 7200, sys.argv[2])
+elif mode == "udp":
+    dst, port, n, tag = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", 0)); s.settimeout(0.5)
+    got = 0
+    for i in range(n):
+        s.sendto(f"{tag}{i}".encode(), (dst, port))
+        try:
+            d, a = s.recvfrom(65535)
+            got += d == f"{tag}{i}".encode() and a == (dst, port)
+        except socket.timeout: pass
+    print(got)
+elif mode == "tcp":
+    dst, port, n, tag = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+    got = 0
+    for i in range(n):
+        try:
+            s = socket.socket()
+            if len(sys.argv) > 7:
+                s.setsockopt(socket.SOL_SOCKET, 25, sys.argv[7].encode()); s.bind((sys.argv[6], 0))
+            s.settimeout(3); s.connect((dst, port)); m = f"{tag}{i}".encode(); s.sendall(m)
+            got += s.recv(65535) == m
+            s.close()
+        except OSError: pass
+    print(got)
+elif mode == "hold":
+    s = socket.socket(); s.settimeout(5); s.connect((sys.argv[2], int(sys.argv[3]))); s.sendall(b"hold"); s.recv(100)
+    s.settimeout(250); t0 = time.time()
+    try:
+        s.recv(100)
+    except OSError: pass
+    open(sys.argv[4], "w").write(str(time.time() - t0))
+"""
+
+
+def proxy_tool(ns: str, *args: str, bg: bool = False):
+    path = f"{WORK}/proxy_tool.py"
+    if not os.path.exists(path):
+        open(path, "w").write(PROXY_TOOL)
+    argv = ["ip", "netns", "exec", ns, sys.executable, "-I", path, *args]
+    if bg:
+        return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    return int((p.stdout.strip() or "0").splitlines()[-1])
+
+
+def proxy_held() -> bool:
+    return f"inet {PROXY_IP}/32" in sh("ip -o -4 addr show dev r0", check=False).stdout
+
+
+FWD_SAMPLES: list[bool] = []
+
+
+def forwarding_off() -> bool:
+    """IPv4 forwards per receiving interface; IPv6 on the global setting (what the relay's preflight reads)."""
+    vals = [sh(f"sysctl -n {k}", check=False).stdout.strip() for k in
+            ("net.ipv4.conf.r0.forwarding", "net.ipv4.conf.wg0.forwarding", "net.ipv6.conf.all.forwarding")]
+    ok = all(v == "0" for v in vals)
+    FWD_SAMPLES.append(ok)
+    return ok
+
+
+def wait_for(cond, timeout: float, step: float = 0.5) -> float | None:
+    """Seconds until cond() held, sampling forwarding at each step; None on timeout."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        forwarding_off()
+        if cond():
+            return time.monotonic() - t0
+        time.sleep(step)
+    return None
+
+
+def link_arps(frames: list[bytes], mac: bytes) -> dict:
+    """ARP frames r0 sent on the link: probes (sender 0.0.0.0) and announcements (sender = target) for the proxy address."""
+    ip = socket.inet_aton(PROXY_IP)
+    n = {"probes": 0, "announcements": 0, "replies": 0}
+    for f in frames:
+        if f[12:14] != b"\x08\x06" or f[6:12] != mac:
+            continue
+        a = f[14:42]
+        op, spa, tpa = a[6:8], a[14:18], a[24:28]
+        if op == b"\x00\x01" and spa == b"\0\0\0\0" and tpa == ip:
+            n["probes"] += 1
+        elif op == b"\x00\x01" and spa == ip and tpa == ip:
+            n["announcements"] += 1
+        elif op == b"\x00\x02" and spa == ip:
+            n["replies"] += 1
+    return n
+
+
+ARPING_LAST: list[str] = [""]
+
+
+def arping(n: int) -> tuple[int, set[str]]:
+    """n ARP requests for the proxy address from the link host: how many answered, and from which MACs."""
+    p = sh(f"ip netns exec linkhost arping -I l0 -c {n} -w {n + 3} {PROXY_IP}", check=False)
+    ARPING_LAST[0] = f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-200:]}"
+    got = 0
+    for ln in p.stdout.splitlines():
+        if ln.startswith("Received"):
+            got = int(ln.split()[1])
+    found = {w.strip("[]").lower() for ln in p.stdout.splitlines() if "reply from" in ln for w in ln.split() if w.startswith("[")}
+    return got, found
+
+
+def proxy_health() -> dict:
+    try:
+        h = json.load(open("/var/lib/goatrope/relay.health"))
+    except (OSError, ValueError):
+        return {}
+    row = next((x for x in h.get("proxies", []) if x["address"] == PROXY_IP), {})
+    row["rules"] = {r["listen_port"]: r for r in h.get("rules", [])}
+    return row
+
+
+def phase_proxy() -> None:
+    """ADR 0004 module 4: a remote machine appears on the link under a proxy address of its own."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    tap_pub = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/tap.key").read(), capture_output=True, text=True).stdout.strip()
+    allowed_pub = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/allowed.key").read(), capture_output=True,
+                                 text=True).stdout.strip()
+    # the remote keeps its tunnel up, as a mesh peer with a persistent keepalive does
+    sh(f"ip netns exec remote wg set wga peer {tap_pub} persistent-keepalive 5")
+    r0_mac = open("/sys/class/net/r0/address").read().strip()
+    mac = bytes.fromhex(r0_mac.replace(":", ""))
+
+    # refusals in the declaration
+    bad = {
+        "an IPv6 proxy address": (PROXY.replace(f'address = "{PROXY_IP}"', 'address = "2001:db8::60"'), "a proxy address is IPv4"),
+        "a proxy no rule uses": (RELAY + f'[[relay.proxy]]\naddress = "{PROXY_IP}"\nremote = "10.99.0.2"\n', "no rule uses it"),
+        "a proxy for a remote no rule names": (PROXY.replace('remote = "10.99.0.2"\n', 'remote = "10.99.0.3"\n'), "is the remote of no rule"),
+        "a proxy address off the link": (PROXY.replace(PROXY_IP, "203.0.113.60"), "is not on the link"),
+    }
+    for what, (text, msg) in bad.items():
+        write_cfg(text)
+        p = gr("validate", "--config", CFG)
+        result(p.returncode == 2 and msg in p.stderr, f"proxy refused: {what}", p.stderr.strip()[-140:])
+    write_cfg(PROXY)
+    sh(f"ip addr add {PROXY_IP}/24 dev r0")
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "remove it" in p.stderr, "proxy refused: the operator put the address on the link interface",
+           p.stderr.strip()[-160:])
+    sh(f"ip addr del {PROXY_IP}/24 dev r0")
+
+    rx_log = f"{WORK}/proxy-rx.jsonl"
+    open(rx_log, "w").close()
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", PROXY_RX, rx_log])
+    if os.path.exists(f"{WORK}/proxy_tool.py"):
+        os.remove(f"{WORK}/proxy_tool.py")
+    servers = [proxy_tool("remote", "serve-remote", bg=True), proxy_tool("linkhost", "serve-link", rx_log, bg=True)]
+    time.sleep(1)
+
+    def received(tag: str) -> list:
+        return [x for x in (json.loads(ln) for ln in open(rx_log)) if x[1].startswith(tag)]
+
+    def send(port: int, n: int, tag: str) -> int:
+        out = sh(f"ip netns exec remote python3 -c '{PROXY_SENDER}' 10.99.0.2 {port} {n} {tag} wga", check=False).stdout.strip()
+        time.sleep(0.5)
+        return int(out or 0)
+
+    # 1. another machine on the link holds the address: the relay probes, finds it, and does not take it
+    sh(f"ip -n linkhost addr add {PROXY_IP}/24 dev l0")
+    cap = Capture("linkhost", "l0", "proxy-conflict")
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    absent = 0
+    for _ in range(28):  # 14 s: a first probe round, a conflict, the 10 s wait, a second round
+        forwarding_off()
+        absent += not proxy_held()
+        time.sleep(0.5)
+    send(7000, 5, "elsewhere")
+    tcp_away = proxy_tool("remote", "tcp", "10.99.0.1", "7200", "3", "away", "10.99.0.2", "wga")
+    time.sleep(2.5)
+    h = proxy_health()
+    frames = cap.stop()
+    arps = link_arps(frames, mac)
+    result(absent == 28 and h.get("held") is False and h.get("conflicts", 0) >= 1 and "another machine" in h.get("why", ""),
+           "proxy: not taken while another machine on the link holds the address",
+           f"absent {absent} of 28 samples, conflicts {h.get('conflicts')}, why: {h.get('why', '')[:90]}")
+    # the holder answers the first probe of each round, which ends that round (RFC 5227 §2.1.1)
+    result(arps["probes"] >= 2 and arps["announcements"] == 0,
+           "proxy: a probe from 0.0.0.0 in each of two rounds 10 s apart, each answered by the holder, and no announcement",
+           f"{arps['probes']} probes, {arps['announcements']} announcements, conflicts {h.get('conflicts')}")
+    errs = h.get("rules", {}).get(7000, {}).get("send_errors", 0)
+    result(not received("elsewhere") and errs == 5, "proxy: while the address is not held, datagrams for its rule are send errors",
+           f"{len(received('elsewhere'))} reached the link, send_errors {errs} of 5")
+    terr = h.get("rules", {}).get(7200, {}).get("send_errors", 0)
+    result(tcp_away == 0 and terr == 3 and not received("away"),
+           "proxy: while the address is not held, a TCP connection for its rule is not made toward the link (send errors)",
+           f"{tcp_away} of 3 echoed, send_errors {terr} of 3")
+
+    # 2. the other machine lets it go: probed, taken, announced
+    cap = Capture("linkhost", "l0", "proxy-take")
+    sh(f"ip -n linkhost addr del {PROXY_IP}/24 dev l0 && ip -n linkhost neigh flush dev l0")
+    took = wait_for(proxy_held, 30)
+    time.sleep(4.5)  # the second announcement comes 2 s after the first
+    arps = link_arps(cap.stop(), mac)
+    result(took is not None and "noprefixroute" in sh("ip -o -4 addr show dev r0", check=False).stdout,
+           "proxy: taken once no other machine holds it, as a /32 with noprefixroute",
+           f"after {took if took is None else round(took, 1)} s: {sh('ip -o -4 addr show dev r0', check=False).stdout.strip()[-120:]}")
+    result(arps["probes"] >= 3 and arps["announcements"] == 2,
+           "proxy: probed (3) before it was taken, and announced (2) after",
+           f"{arps['probes']} probes, {arps['announcements']} announcements")
+    routes = [ln for ln in sh("ip -4 route show table all", check=False).stdout.splitlines()
+              if not ln.startswith(("local ", "broadcast "))]
+    bad_routes = [ln for ln in routes if ln.startswith(PROXY_IP) or PROXY_IP + " " in ln or ("10.99." in ln and "dev r0" in ln)]
+    result(not bad_routes, "proxy: no route for the proxy address and none to the remote through the link (local table aside)",
+           "; ".join(bad_routes) or f"{len(routes)} routes")
+    cap = Capture("linkhost", "l0", "proxy-arping")
+    got, macs_seen = arping(10)
+    wire = link_arps(cap.stop(), mac)["replies"]
+    result(got == 10 and macs_seen == {r0_mac} and wire >= 10, "proxy: answers ARP from the link while the peer handshakes",
+           f"{got} of 10, from {sorted(macs_seen)} (r0 is {r0_mac}); {wire} replies from r0 on the wire"
+           + ("" if got == 10 else f"; arping {ARPING_LAST[0]}; neigh {sh('ip -n linkhost neigh', check=False).stdout.strip()[:120]}"))
+
+    # 3. traffic: the target sees the remote at the proxy address, and its replies to that address reach the remote
+    rep = send(7000, 20, "via")
+    time.sleep(1)
+    via = received("via")
+    result(len(via) == 20 and all(src == PROXY_IP for _, _, src in via),
+           "proxy: a remote's datagrams reach the link from the proxy address", f"{len(via)} of 20 from {sorted({x[2] for x in via})}")
+    result(rep == 20, "proxy: the target's replies to the proxy address reach the remote", f"{rep} of 20")
+    send(7002, 5, "oneway")
+    ow = received("oneway")
+    result(len(ow) == 5 and all(src == PROXY_IP for _, _, src in ow), "proxy: a one-way rule also sends from the proxy address",
+           f"{len(ow)} of 5")
+    n = proxy_tool("linkhost", "udp", PROXY_IP, "7100", "20", "l2r")
+    result(n == 20, "proxy: datagrams a link machine sends to <proxy address>:7100 reach the remote, and its replies come from the proxy address",
+           f"{n} of 20")
+    n = proxy_tool("remote", "tcp", "10.99.0.1", "7200", "10", "tcpin", "10.99.0.2", "wga")
+    peers = [x for x in (json.loads(ln) for ln in open(rx_log)) if x[0] == 7200 and x[1] == "tcp"]
+    result(n == 10 and len(peers) >= 10 and all(p[2] == PROXY_IP for p in peers),
+           "proxy: a TCP rule from the remote connects to the target from the proxy address",
+           f"{n} of 10 echoed; target saw {sorted({p[2] for p in peers})}")
+    n = proxy_tool("linkhost", "tcp", PROXY_IP, "7300", "10", "tcpout")
+    result(n == 10, "proxy: a link machine's TCP connection to <proxy address>:7300 reaches the remote", f"{n} of 10 echoed")
+    # another machine claims the address while it is held (an ARP announcement from its MAC): the relay
+    # gives it up at once (RFC 5227 §2.4 (a)), closes the TCP connection on it, and probes again 10 s later
+    hold_out = f"{WORK}/proxy-hold.txt"
+    if os.path.exists(hold_out):
+        os.remove(hold_out)
+    holder = proxy_tool("linkhost", "hold", PROXY_IP, "7300", hold_out, bg=True)
+    time.sleep(1.5)
+    c0 = proxy_health().get("conflicts", 0)
+    l0_mac = bytes.fromhex(sh("ip -n linkhost -o link show l0").stdout.split("link/ether ")[1].split()[0].replace(":", ""))
+    claim = (b"\xff" * 6 + l0_mac + b"\x08\x06" + bytes([0, 1, 8, 0, 6, 4, 0, 1]) + l0_mac + socket.inet_aton(PROXY_IP)
+             + b"\0" * 6 + socket.inet_aton(PROXY_IP))
+    sh(f"ip netns exec linkhost python3 -c \"import socket;s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW);"
+       f"s.bind(('l0',0));s.send(bytes.fromhex('{claim.hex()}'))\"")
+    gave_up = wait_for(lambda: not proxy_held(), 5, 0.1)
+    try:
+        holder.wait(timeout=5)
+        closed = True
+    except subprocess.TimeoutExpired:
+        holder.kill()
+        closed = False
+    time.sleep(2.5)
+    h = proxy_health()
+    result(gave_up is not None and closed and h.get("conflicts", 0) == c0 + 1 and "holds" in h.get("why", ""),
+           "proxy: another machine claiming the address while it is held: given up at once, its open TCP connection closed",
+           f"removed after {gave_up if gave_up is None else round(gave_up, 1)} s, connection closed {closed}, conflicts {c0} -> "
+           f"{h.get('conflicts')}")
+    back = wait_for(proxy_held, 25)
+    result(back is not None, "proxy: no machine answers the next probe round, so it is taken back",
+           f"after {back if back is None else round(back, 1)} s")
+    sh(f"ip -n linkhost route add 10.99.0.0/24 via {PROXY_IP}")
+    ping = sh("ip netns exec linkhost ping -c 5 -i 0.3 -W 1 10.99.0.2", check=False).stdout
+    rcvd = next((ln.split(",")[1].split()[0] for ln in ping.splitlines() if "packets transmitted" in ln), "?")
+    result(rcvd == "0", "proxy: the kernel does not route to the remote through the proxy address", f"{rcvd} of 5 pings answered")
+    sh(f"ip -n linkhost route del 10.99.0.0/24 via {PROXY_IP}")
+
+    # 4. the peer stops handshaking: the address is removed within 180 s of its latest handshake (+ one 2 s tick)
+    def last_hs() -> int:
+        for ln in sh("wg show wg0 latest-handshakes", check=False).stdout.splitlines():
+            k, t = ln.split()
+            if k == allowed_pub:
+                return int(t)
+        return 0
+    hold_out = f"{WORK}/proxy-hold.txt"
+    if os.path.exists(hold_out):
+        os.remove(hold_out)
+    holder = proxy_tool("linkhost", "hold", PROXY_IP, "7300", hold_out, bg=True)
+    time.sleep(1.5)
+    sh("ip -n remote link set wga down")
+    t_stop = time.time()
+    hs = last_hs()
+    held_for = wait_for(lambda: not proxy_held(), 200)
+    t_rm = time.time()
+    after_hs = t_rm - hs
+    result(held_for is not None and after_hs <= 180 + 2 + 1.5 and after_hs >= 178,
+           "proxy: removed within 180 s of the peer's latest handshake (+ one 2 s tick), and held until then",
+           f"handshake {t_stop - hs:.0f} s before the stop; removed {held_for if held_for is None else round(held_for)} s after the stop, "
+           f"{after_hs:.1f} s after the handshake")
+    time.sleep(2.5)
+    h = proxy_health()
+    try:
+        holder.wait(timeout=10)
+        closed_after = float(open(hold_out).read())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        holder.kill()
+        closed_after = None
+    result(closed_after is not None and closed_after <= (held_for or 0) + 3,
+           "proxy: an open TCP connection on the proxy address is closed no later than the address is given up (3 s margin)",
+           f"closed {closed_after if closed_after is None else round(closed_after)} s after it was opened; address removed "
+           f"{held_for if held_for is None else round(held_for)} s after the stop")
+    got, _ = arping(3)
+    result(got == 0 and h.get("held") is False and "latest handshake" in h.get("why", "") and h.get("removed", 0) >= 1,
+           "proxy: once removed, no ARP answer, and the health file says why", f"{got} of 3 answered; why: {h.get('why', '')[:100]}")
+
+    # 5. the peer comes back: probed again, re-added, and the rule's socket binds again
+    cap = Capture("linkhost", "l0", "proxy-back")
+    sh("ip -n remote link set wga up && ip -n remote route replace 10.99.0.1/32 dev wga metric 1")
+    send(7002, 3, "wake")
+    back = wait_for(proxy_held, 40)
+    time.sleep(4.5)
+    arps = link_arps(cap.stop(), mac)
+    via2 = send(7000, 20, "again")
+    time.sleep(1)
+    again = received("again")
+    result(back is not None and arps["probes"] >= 3 and arps["announcements"] == 2,
+           "proxy: when the handshake is fresh again it probes again, then takes the address back",
+           f"after {back if back is None else round(back, 1)} s; {arps['probes']} probes, {arps['announcements']} announcements")
+    result(len(again) == 20 and via2 == 20 and all(src == PROXY_IP for _, _, src in again),
+           "proxy: after it is taken back, traffic flows from it again",
+           f"{len(again)} of 20 to the link, {via2} of 20 replies")
+    n1 = proxy_tool("linkhost", "udp", PROXY_IP, "7100", "10", "back")
+    n2 = proxy_tool("linkhost", "tcp", PROXY_IP, "7300", "5", "backtcp")
+    result(n1 == 10 and n2 == 5, "proxy: after it is taken back, the link-to-remote UDP and TCP rules on it work again",
+           f"UDP {n1} of 10, TCP {n2} of 5")
+
+    # 6. a relay that was killed leaves the address; the next run removes it and probes before taking it again
+    relay.kill()
+    relay.wait(timeout=10)
+    left = proxy_held()
+    os.remove("/var/lib/goatrope/relay.health")  # the killed run's counters; the new run writes its own
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    retaken = wait_for(lambda: proxy_held() and proxy_health().get("added", 0) >= 1 and proxy_health().get("probes", 0) >= 3, 30, 0.2)
+    result(left and retaken is not None, "proxy: an address a killed relay left is removed at the next start and taken again after a probe",
+           f"left after kill: {left}; held again after {retaken if retaken is None else round(retaken, 1)} s")
+    relay.terminate()
+    try:
+        rc = relay.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        relay.kill()
+        rc = None
+    out = relay.stdout.read()
+    result(rc == 0 and not proxy_held() and "earlier run" in out, "proxy: SIGTERM: the relay removes the address and exits 0",
+           f"exit {rc}, held {proxy_held()}")
+
+    # 7. as a service: systemd stop removes it; check and status report it
+    for f in ("/var/lib/goatrope/relay.health", "/var/lib/goatrope/relay.health.new"):
+        if os.path.exists(f):
+            os.remove(f)  # left by the foreground runs above
+    before = snapshot()
+    p = gr("install", "--config", CFG)
+    unit = open("/etc/systemd/system/goatrope-relay.service").read() if os.path.exists("/etc/systemd/system/goatrope-relay.service") else ""
+    u = wait_unit("active")
+    svc = wait_for(proxy_held, 20)
+    time.sleep(2.5)
+    result(p.returncode == 0 and u.get("ActiveState") == "active" and svc is not None and "AF_PACKET" in unit,
+           "proxy: the service (AF_PACKET allowed in its unit) takes the address",
+           f"install {p.returncode}, {u.get('ActiveState')}, held after {svc}")
+    j = check_exit(0, "proxy service: held", "--json") or {}
+    row = next((i for i in j.get("items", []) if i.get("id") == f"relay-proxy-{PROXY_IP}"), {})
+    result(row.get("ok") is True and "held" in str(row.get("have")), "proxy: check reports the address held and on r0", str(row)[:200])
+    st = gr("status", "--config", CFG).stdout
+    result(f"proxy  {PROXY_IP}" in st and "held (handshake" in st, "proxy: status shows it",
+           " | ".join(ln for ln in st.splitlines() if "proxy" in ln)[:200])
+    n = send(7000, 10, "svc")
+    result(n == 10, "proxy: the service relays through the proxy address", f"{n} of 10 replies")
+    sh("systemctl stop goatrope-relay.service")
+    gone = wait_for(lambda: not proxy_held(), 5, 0.2)
+    result(gone is not None, "proxy: systemctl stop removes the address", f"after {gone} s")
+    gr("uninstall", "--purge")
+    left = diff(before, snapshot())
+    result(not left and not proxy_held(), "proxy: uninstall --purge leaves nothing", "; ".join(left)[:300])
+    rx.kill()
+    for srv in servers:
+        srv.kill()
+    forwarding_off()
+    result(bool(FWD_SAMPLES) and all(FWD_SAMPLES), "proxy: IP forwarding stayed off throughout (r0 and wg0 IPv4, IPv6 all)",
+           f"{sum(FWD_SAMPLES)} of {len(FWD_SAMPLES)} samples off")
+
+
+PHASES["proxy"] = phase_proxy
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

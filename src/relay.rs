@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::boundary;
 use crate::config::{Config, Relay, RelayRule};
 use crate::nl;
+use crate::proxy::{self, Hold, Proxies};
 use crate::relay_tcp;
 use crate::sys;
 use crate::sysutil as su;
@@ -86,6 +87,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             fwd.join(", ")
         ));
     }
+    proxy::preflight(r).map_err(RelayRefusal)?;
     let addrs = nl::addresses(&r.link_interface);
     if !addrs.contains(&r.link_address) {
         let have = if addrs.is_empty() { "none".to_string() } else { addrs.join(", ") };
@@ -160,8 +162,11 @@ fn setopt<T>(fd: libc::c_int, level: libc::c_int, name: libc::c_int, v: &T) -> i
     Ok(())
 }
 
-/// A socket of type `ty` (SOCK_DGRAM, SOCK_STREAM) bound to one device (SO_BINDTODEVICE) and to addr:port.
-pub(crate) fn bound_fd(dev: &str, addr: IpAddr, port: u16, ty: libc::c_int) -> io::Result<OwnedFd> {
+/// A socket of type `ty` (SOCK_DGRAM, SOCK_STREAM) bound to one device (SO_BINDTODEVICE) and to
+/// addr:port. With `freebind` (IP_FREEBIND), addr need not be on the machine yet. A proxy address
+/// (ADR 0004 §4) is bound that way: the kernel delivers to the socket only while the address is
+/// on the link interface, and the relay sends from it only while it holds it.
+pub(crate) fn bound_fd_free(dev: &str, addr: IpAddr, port: u16, ty: libc::c_int, freebind: bool) -> io::Result<OwnedFd> {
     let fam = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: plain socket(2) call; the descriptor is owned by the OwnedFd below.
     let fd = unsafe { libc::socket(fam, ty | libc::SOCK_CLOEXEC, 0) };
@@ -177,6 +182,9 @@ pub(crate) fn bound_fd(dev: &str, addr: IpAddr, port: u16, ty: libc::c_int) -> i
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
+    if freebind {
+        setopt(fd, libc::IPPROTO_IP, libc::IP_FREEBIND, &(1 as libc::c_int))?;
+    }
     if ty == libc::SOCK_STREAM && port != 0 {
         setopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &(1 as libc::c_int))?; // a restart binds again at once
     }
@@ -190,7 +198,11 @@ pub(crate) fn bound_fd(dev: &str, addr: IpAddr, port: u16, ty: libc::c_int) -> i
 
 /// A UDP socket bound to one device (SO_BINDTODEVICE) and to addr:port, non-blocking.
 fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::from(bound_fd(dev, addr, port, libc::SOCK_DGRAM)?);
+    bound_free(dev, addr, port, false)
+}
+
+fn bound_free(dev: &str, addr: IpAddr, port: u16, freebind: bool) -> io::Result<UdpSocket> {
+    let sock = UdpSocket::from(bound_fd_free(dev, addr, port, libc::SOCK_DGRAM, freebind)?);
     sock.set_nonblocking(true)?;
     Ok(sock)
 }
@@ -219,6 +231,8 @@ struct RuleState<'a> {
     /// each client's last address and port, where its replies go
     peers: Vec<Option<SocketAddr>>,
     replies: bool,
+    /// the rule's proxy address is held (None: the rule sends from the relay's own address)
+    held: Option<Hold>,
     to_link: u64,
     to_remote: u64,
     denied: u64,
@@ -256,7 +270,7 @@ fn dest_of(rule: &RelayRule) -> String {
     }
 }
 
-fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)]) -> String {
+fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> String {
     let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
@@ -275,15 +289,15 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
             c.json()
         )
     }));
-    format!("{{\"time\": {}, \"rules\": [{}]}}", json_float(time), rows.join(", "))
+    format!("{{\"time\": {}, \"rules\": [{}], \"proxies\": {}}}", json_float(time), rows.join(", "), proxies.health_json())
 }
 
-fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)]) -> Result<(), String> {
+fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> Result<(), String> {
     let dir = std::path::Path::new(HEALTH).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| sys::oserror(&e, &dir.to_string_lossy()))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let tmp = format!("{HEALTH}.new");
-    let res = std::fs::write(&tmp, health_json(now, state, tcp))
+    let res = std::fs::write(&tmp, health_json(now, state, tcp, proxies))
         .map_err(|e| sys::oserror(&e, &tmp))
         .and_then(|_| std::fs::rename(&tmp, HEALTH).map_err(|e| sys::oserror(&e, &tmp)));
     if let Err(e) = res {
@@ -293,6 +307,8 @@ fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)]) -
 }
 
 pub fn run(cfg: &Config) -> i32 {
+    // first, so a stop request during start-up still ends in the loop, which removes what it added
+    proxy::catch_stop_signals();
     if let Err(e) = preflight(cfg) {
         eprintln!("goatrope relay: refused: {}", e.0);
         return crate::EXIT_REFUSED;
@@ -313,7 +329,15 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     let ip = |s: &str| -> Result<IpAddr, String> { s.parse().map_err(|_| format!("bad address {s}")) };
     let mut state: Vec<RuleState> = Vec::new();
     let mut tcp: Vec<(&RelayRule, Arc<relay_tcp::Counters>)> = Vec::new();
+    // dropped on every path out of serve, which removes the proxy addresses it added
+    let mut proxies = Proxies::new(r)?;
+    proxies.check_tunnels();
+    let own = link_addr;
     for rule in &r.rules {
+        let link_addr = rule_link_ip(rule, own);
+        let held = proxies.hold(link_addr);
+        let free = held.is_some();
+        let link_ip = link_addr.to_string();
         let l2r = rule.link_initiated();
         let remote = ip(&rule.remote)?;
         let (clients, dest) = if l2r {
@@ -346,18 +370,18 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             )
         };
         if rule.protocol == "tcp" {
-            let c = relay_tcp::start(r, rule, link_addr, clients, dest)?;
+            let c = relay_tcp::start(r, rule, link_addr, held, clients, dest)?;
             tcp.push((rule, c));
             println!("goatrope relay: {shown}");
             continue;
         }
         let (listen, outs) = if l2r {
-            let listen = bound(&r.link_interface, link_addr, rule.listen_port).map_err(|e| sys::strerror(&e))?;
+            let listen = bound_free(&r.link_interface, link_addr, rule.listen_port, free).map_err(|e| sys::strerror(&e))?;
             let outs = clients.iter().map(|_| bound(&r.remote_interface, any_of(remote), 0)).collect::<io::Result<Vec<_>>>();
             (listen, outs.map_err(|e| sys::strerror(&e))?)
         } else {
             let listen = bound(&r.remote_interface, any_of(remote), rule.listen_port).map_err(|e| sys::strerror(&e))?;
-            (listen, vec![bound(&r.link_interface, link_addr, 0).map_err(|e| sys::strerror(&e))?])
+            (listen, vec![bound_free(&r.link_interface, link_addr, 0, free).map_err(|e| sys::strerror(&e))?])
         };
         let n = clients.len();
         state.push(RuleState {
@@ -368,6 +392,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             outs,
             peers: vec![None; n],
             replies: l2r || rule.direction == "both",
+            held,
             to_link: 0,
             to_remote: 0,
             denied: 0,
@@ -381,11 +406,16 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         .enumerate()
         .flat_map(|(i, s)| std::iter::once((i, None)).chain((0..s.outs.len()).map(move |k| (i, Some(k)))))
         .collect();
-    health(&state, &tcp)?; // at once, so a service manager sees it running
+    health(&state, &tcp, &proxies)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut last_denied_log: Option<Instant> = None;
     let mut buf = vec![0u8; 65535];
     loop {
+        if proxy::stop_requested() {
+            println!("goatrope relay: stopping on a signal");
+            return Ok(crate::EXIT_OK);
+        }
+        proxies.step();
         let mut fds: Vec<libc::pollfd> = slots
             .iter()
             .map(|&(i, o)| match o {
@@ -394,14 +424,16 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             })
             .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
+        if let Some(fd) = proxies.fd() {
+            fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 }); // last; read in proxies.step()
+        }
         // SAFETY: fds is a valid array of pollfd of the length given (poll with none is a sleep).
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, proxies.timeout_ms(1000)) };
         if n > 0 {
-            for (j, pfd) in fds.iter().enumerate() {
+            for (pfd, &(i, out)) in fds.iter().zip(slots.iter()) {
                 if pfd.revents == 0 {
                     continue;
                 }
-                let (i, out) = slots[j];
                 let st = &mut state[i];
                 let l2r = st.rule.link_initiated();
                 let sock = match out {
@@ -413,6 +445,8 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                 };
                 let data = &buf[..len];
                 let rule = st.rule;
+                // a send toward the link from a proxy address the relay does not hold is a send error
+                let link_blocked = st.held.as_ref().is_some_and(|h| !h.held());
                 match out {
                     None => {
                         let Some(c) = st.clients.iter().position(|a| *a == src.ip()) else {
@@ -429,6 +463,10 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                             st.send_errors += 1;
                             continue;
                         };
+                        if !l2r && link_blocked {
+                            st.send_errors += 1;
+                            continue;
+                        }
                         match st.outs[c].send_to(data, to) {
                             Ok(_) => st.count(!l2r),
                             // dropped and counted; the relay keeps running
@@ -440,6 +478,10 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                             st.denied += 1;
                             continue;
                         };
+                        if l2r && link_blocked {
+                            st.send_errors += 1;
+                            continue;
+                        }
                         match st.listen.send_to(data, peer) {
                             Ok(_) => st.count(l2r),
                             // the tunnel is down or the peer has no endpoint: dropped and counted
@@ -450,7 +492,8 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             }
         }
         if last.elapsed() >= Duration::from_secs(2) {
-            health(&state, &tcp)?;
+            proxies.check_tunnels();
+            health(&state, &tcp, &proxies)?;
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
@@ -468,16 +511,28 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     }
 }
 
+/// The address a rule's link-side sockets bind to: its proxy address, else the relay's own.
+fn rule_link_ip(rule: &RelayRule, own: IpAddr) -> IpAddr {
+    rule.link_address.as_deref().and_then(|a| a.parse().ok()).unwrap_or(own)
+}
+
 // ---------------------------------------------------------------- install time: unit, check, status
 
 pub fn banner(r: &Relay) -> String {
-    format!(
+    let mut b = format!(
         "relay: default deny. It forwards only the {} declared rule(s) between {} and machines on {}, from its own address {}; everything else is dropped and counted.",
         r.rules.len(),
         r.remote_interface,
         r.link_interface,
         r.link_address
-    )
+    );
+    for p in &r.proxies {
+        b.push_str(&format!(
+            " Proxy address {} stands for {} on the link, held only while its tunnel is up and no other machine answers for it.",
+            p.address, p.remote
+        ));
+    }
+    b
 }
 
 /// The relay's unit, keyed by its path. Empty without a [relay].
@@ -486,6 +541,7 @@ pub fn render(cfg: &Config) -> std::collections::BTreeMap<String, String> {
     if cfg.relay.is_none() {
         return files;
     }
+    let proxy = !cfg.relay.as_ref().unwrap().proxies.is_empty();
     let h = format!(
         "# Written by goatrope {} from {}/goatrope.toml. goatrope uninstall removes it; do not edit.\n",
         crate::version(),
@@ -506,7 +562,7 @@ Restart=on-failure
 RestartSec=3
 # a refusal (exit {refused}) is not restarted: the unit stays failed, and goatrope check shows it
 RestartPreventExitStatus={refused}
-# SO_BINDTODEVICE needs CAP_NET_RAW; the boundary interface (netlink) needs CAP_NET_ADMIN
+# SO_BINDTODEVICE (and ARP probes for a proxy address) need CAP_NET_RAW; the boundary interface and proxy addresses (netlink) need CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=yes
@@ -518,7 +574,7 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX{packet}
 
 [Install]
 WantedBy=multi-user.target
@@ -527,6 +583,8 @@ WantedBy=multi-user.target
             etc = crate::tap::ETC,
             state = crate::tap::STATE_DIR,
             refused = crate::EXIT_REFUSED,
+            // ARP probes and announcements for a proxy address go through a packet socket
+            packet = if proxy { " AF_PACKET" } else { "" },
         ),
     );
     files
@@ -575,6 +633,8 @@ pub fn check(cfg: &Config) -> Vec<Item> {
         None => (Some(false), "absent".to_string()),
     };
     item(&mut items, "relay-health", want, format!("written in the last {STALE_S:.0} s"), have);
+    let health = read_health();
+    proxy::check(cfg.relay.as_ref().unwrap(), health.as_ref().map(|(v, _)| v), &mut items);
     items
 }
 
@@ -586,6 +646,7 @@ pub fn status(cfg: &Config) {
         Some((_, age)) => println!("  relay  counters written {age:.1} s ago{}", if *age > STALE_S { " (stale)" } else { "" }),
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
     }
+    proxy::status(r, health.as_ref().map(|(v, _)| v));
     for rule in &r.rules {
         let line = match (rule.link_initiated(), rule.protocol.as_str()) {
             (true, "tcp") => format!(
@@ -618,7 +679,8 @@ pub fn status(cfg: &Config) {
                 if rule.direction == "both" { ", and the target's replies back" } else { "" }
             ),
         };
-        println!("  rule   {line}");
+        let from = rule.link_address.as_ref().map(|a| format!(" (on the link as proxy address {a})")).unwrap_or_default();
+        println!("  rule   {line}{from}");
         let row = health.as_ref().and_then(|(v, _)| {
             v["rules"]
                 .as_array()?

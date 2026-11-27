@@ -9,7 +9,7 @@ FROM ubuntu:${UBUNTU}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends systemd systemd-sysv iproute2 ethtool tcpdump \
-      python3 iputils-ping kmod util-linux dbus udev wireguard-tools \
+      python3 iputils-ping iputils-arping kmod util-linux dbus udev wireguard-tools \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask systemd-resolved.service getty.target console-getty.service 2>/dev/null; true
 # NM=1: NetworkManager too, set up as on a desktop image where it manages wired ports (tp*), while
