@@ -34,7 +34,7 @@ goatrope command line.
   goatrope check     [--config PATH] [--json]  exit 0: matches the declaration; 3: differs; other: error
   goatrope uninstall [--purge]                 remove everything install wrote and restore the ports
   goatrope validate  [--config PATH]           check the declaration alone, without touching the machine
-  goatrope relay     [--config PATH]           run the relay (WIP; see docs/adr/0002)
+  goatrope relay     [--config PATH]           run the relay in the foreground (install runs it as a service)
   goatrope boundary  key|sheet|up|check|down [--config PATH]
                                                the relay's boundary interface (transport = \"boundary\"):
                                                make the private key, print what the boundary point needs,
@@ -173,25 +173,24 @@ fn run(verb: &str, rest: &[String]) -> i32 {
     match verb {
         "validate" => {
             println!("{}: valid", a.config);
-            if let Some(t) = &cfg.tap {
-                println!("{}", tap::banner(t));
-            }
+            println!("{}", banner(&cfg));
             return EXIT_OK;
         }
         "run-send" => return send::run_send(&cfg, &a.pos[0]),
         "verify-component" => return send::verify_component(&cfg, &a.pos[0], &a.pos[1]),
         _ => {}
     }
-    let Some(t) = &cfg.tap else {
-        eprintln!("goatrope: this declaration has no [tap]; only `goatrope relay` applies");
+    if verb == "apply-ports" && cfg.tap.is_none() {
+        eprintln!("goatrope: this declaration has no [tap]; there are no tap ports to prepare");
         return EXIT_REFUSED;
-    };
+    }
+    let banner = banner(&cfg);
     match verb {
         "install" => {
             if !need_root() {
                 return EXIT_REFUSED;
             }
-            println!("{}", tap::banner(t));
+            println!("{banner}");
             if let Err(e) = tap::install(&cfg) {
                 return refused(e);
             }
@@ -207,7 +206,7 @@ fn run(verb: &str, rest: &[String]) -> i32 {
             if !need_root() {
                 return EXIT_REFUSED;
             }
-            println!("{}", tap::banner(t));
+            println!("{banner}");
             let outcome = match tap::deploy(&cfg, flag("--dry-run")) {
                 Ok(o) => o,
                 Err(e) => return refused(e),
@@ -231,7 +230,7 @@ fn run(verb: &str, rest: &[String]) -> i32 {
             if flag("--json") {
                 println!("{}", tap::check_json(&cfg, &items, nbad > 0));
             } else {
-                println!("{}", tap::banner(t));
+                println!("{banner}");
                 for i in &items {
                     let mark = match i.ok {
                         Some(true) => "ok  ",
@@ -266,6 +265,13 @@ fn run(verb: &str, rest: &[String]) -> i32 {
         }
         _ => EXIT_ERROR,
     }
+}
+
+/// What each declared role does, one line per role.
+fn banner(cfg: &config::Config) -> String {
+    let mut lines: Vec<String> = cfg.tap.iter().map(tap::banner).collect();
+    lines.extend(cfg.relay.iter().map(relay::banner));
+    lines.join("\n")
 }
 
 fn root_or_refuse() -> Result<(), i32> {

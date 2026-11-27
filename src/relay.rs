@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 // SPDX-License-Identifier: Apache-2.0
-//! Relay, WORK IN PROGRESS: the smallest case of docs/adr/0002, a fixed-port UDP forwarder.
+//! Relay: the fixed-port UDP forwarder of docs/adr/0002, run as a service (docs/adr/0004 §1).
 //!
 //! A remote machine reaches the relay through a WireGuard interface. WireGuard
 //! authenticates the remote machine by its key and binds its tunnel address to that
@@ -9,8 +9,10 @@
 //! address and port on the link. Everything else is dropped and counted.
 //!
 //! The relay TRANSMITS on the link, from its own interface and address. It never
-//! uses a tap port, never bridges, forwards no broadcast or multicast, and runs in
-//! the foreground only: `goatrope install` installs no relay unit.
+//! uses a tap port, never bridges and forwards no broadcast or multicast.
+//! `goatrope install` installs goatrope-relay.service, which runs `goatrope relay`;
+//! a refusal exits with the refusal code, which the unit does not restart.
+//! `goatrope relay` also runs it in the foreground.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -21,8 +23,13 @@ use crate::boundary;
 use crate::config::{Config, Relay, RelayRule};
 use crate::nl;
 use crate::sys;
+use crate::sysutil as su;
+use crate::tap::{item, Item};
 
 pub const HEALTH: &str = "/var/lib/goatrope/relay.health";
+pub const UNIT: &str = "goatrope-relay.service";
+/// relay.health is rewritten every 2 s while the relay runs; older than this, it is stale.
+pub const STALE_S: f64 = 10.0;
 
 pub struct RelayRefusal(pub String);
 
@@ -87,7 +94,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
         let b = r.boundary.as_ref().expect("transport boundary has a [relay.boundary]");
         let made = boundary::up(b, &r.remote_interface).map_err(|e| RelayRefusal(e.0))?;
         println!(
-            "goatrope relay (WIP): boundary interface {} {}, one peer {} at {}",
+            "goatrope relay: boundary interface {} {}, one peer {} at {}",
             r.remote_interface,
             if made { "made" } else { "present" },
             b.peer_address,
@@ -242,10 +249,11 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             send_errors: 0,
         });
         println!(
-            "goatrope relay (WIP): {} -> {}:{} => {link_ip} -> {}:{} on {} ({})",
+            "goatrope relay: {} -> {}:{} => {link_ip} -> {}:{} on {} ({})",
             rule.remote, r.remote_interface, rule.listen_port, rule.target, rule.target_port, r.link_interface, rule.direction
         );
     }
+    health(&state)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut last_denied_log: Option<Instant> = None;
     let mut buf = vec![0u8; 65535];
@@ -321,6 +329,146 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                     return Ok(crate::EXIT_ERROR);
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- install time: unit, check, status
+
+pub fn banner(r: &Relay) -> String {
+    format!(
+        "relay: default deny. It forwards only the {} declared rule(s) from {} to machines on {}, from its own address {}; everything else is dropped and counted.",
+        r.rules.len(),
+        r.remote_interface,
+        r.link_interface,
+        r.link_address
+    )
+}
+
+/// The relay's unit, keyed by its path. Empty without a [relay].
+pub fn render(cfg: &Config) -> std::collections::BTreeMap<String, String> {
+    let mut files = std::collections::BTreeMap::new();
+    if cfg.relay.is_none() {
+        return files;
+    }
+    let h = format!(
+        "# Written by goatrope {} from {}/goatrope.toml. goatrope uninstall removes it; do not edit.\n",
+        crate::version(),
+        crate::tap::ETC
+    );
+    files.insert(
+        format!("/etc/systemd/system/{UNIT}"),
+        format!(
+            "{h}[Unit]
+Description=goatrope: relay, the declared rules only (default deny)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart={bin} relay --config {etc}/goatrope.toml
+Restart=on-failure
+RestartSec=3
+# a refusal (exit {refused}) is not restarted: the unit stays failed, and goatrope check shows it
+RestartPreventExitStatus={refused}
+# SO_BINDTODEVICE needs CAP_NET_RAW; the boundary interface (netlink) needs CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={state}
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
+",
+            bin = crate::tap::BIN,
+            etc = crate::tap::ETC,
+            state = crate::tap::STATE_DIR,
+            refused = crate::EXIT_REFUSED,
+        ),
+    );
+    files
+}
+
+pub fn units(cfg: &Config) -> Vec<String> {
+    if cfg.relay.is_some() {
+        vec![UNIT.to_string()]
+    } else {
+        vec![]
+    }
+}
+
+fn now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+}
+
+/// relay.health as the relay wrote it, parsed, and its age in seconds.
+fn read_health() -> Option<(serde_json::Value, f64)> {
+    let v: serde_json::Value = serde_json::from_str(&su::read(HEALTH)?).ok()?;
+    let t = v.get("time")?.as_f64()?;
+    Some((v, now() - t))
+}
+
+/// Wait up to `seconds` for the relay to write relay.health or for its unit to stop.
+pub fn settle(cfg: &Config, seconds: f64) {
+    if cfg.relay.is_none() {
+        return;
+    }
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    while Instant::now() < end {
+        if read_health().is_some_and(|(_, age)| age < 1.5) || su::unit_active(UNIT) != "active" {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+pub fn check(cfg: &Config) -> Vec<Item> {
+    let mut items = Vec::new();
+    if cfg.relay.is_none() {
+        return items;
+    }
+    let (want, have) = match read_health() {
+        Some((_, age)) => (Some(age <= STALE_S), format!("written {age:.1} s ago")),
+        None => (Some(false), "absent".to_string()),
+    };
+    item(&mut items, "relay-health", want, format!("written in the last {STALE_S:.0} s"), have);
+    items
+}
+
+pub fn status(cfg: &Config) {
+    let Some(r) = &cfg.relay else { return };
+    println!("  relay  {} ({UNIT}), from {} to {} as {}", su::unit_active(UNIT), r.remote_interface, r.link_interface, r.link_address);
+    let health = read_health();
+    match &health {
+        Some((_, age)) => println!("  relay  counters written {age:.1} s ago{}", if *age > STALE_S { " (stale)" } else { "" }),
+        None => println!("  relay  no counters yet ({HEALTH} absent)"),
+    }
+    for rule in &r.rules {
+        let replies = if rule.direction == "both" { ", and the target's replies back" } else { "" };
+        println!(
+            "  rule   {} port {}: from {} to {}:{}{replies}",
+            rule.protocol, rule.listen_port, rule.remote, rule.target, rule.target_port
+        );
+        let row = health
+            .as_ref()
+            .and_then(|(v, _)| v["rules"].as_array()?.iter().find(|x| x["listen_port"].as_u64() == Some(rule.listen_port as u64)).cloned());
+        if let Some(x) = row {
+            let n = |k: &str| x[k].as_u64().unwrap_or(0);
+            println!(
+                "         {} sent to the link, {} sent back to the remote, {} denied, {} could not be sent",
+                n("to_link"),
+                n("to_remote"),
+                n("denied"),
+                n("send_errors")
+            );
         }
     }
 }

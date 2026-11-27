@@ -432,14 +432,14 @@ link_interface = "tp1"
 link_address = "192.0.2.50/24"
 allow = [{ direction = "remote-to-link", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000 }]
 """, "listen port")
-    refused("relay not marked work in progress", ok_cfg + """
+    refused("relay wip that is not true or false", ok_cfg + """
 [relay]
-wip = false
+wip = "yes"
 remote_interface = "eth0"
 link_interface = "r0"
 link_address = "192.0.2.50/24"
 allow = [{ direction = "remote-to-link", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000 }]
-""", "wip must be true")
+""", "wip must be true or false")
     refused("send destination reached through a tap port", ok_cfg + """
 [[send]]
 name = "s"
@@ -883,7 +883,6 @@ PHASES = {"refusals": phase_refusals, "inline": phase_inline, "reboot-verify": p
 
 RELAY = """schema = 1
 [relay]
-wip = true
 remote_interface = "wg0"
 link_interface = "r0"
 link_address = "192.0.2.50/24"
@@ -984,13 +983,13 @@ print(replies)
     frames = cap.stop()
     ok7000 = [d for d, a in got["7000"] if d.startswith("ok")]
     result(len(ok7000) == 20 and all(a == "192.0.2.50" for _, a in got["7000"]),
-           "relay (WIP): an allowed datagram reaches its one target, from the relay's own address", f"{len(ok7000)} of 20")
-    result(rep == "20", "relay (WIP): replies from the target return to the remote machine (direction both)", f"{rep} of 20")
-    result(len(got["7002"]) == 5, "relay (WIP): a one-way rule forwards", f"{len(got['7002'])} of 5")
-    result(not got["7001"], "relay (WIP): a port with no rule forwards nothing", f"{len(got['7001'])}")
+           "relay: an allowed datagram reaches its one target, from the relay's own address", f"{len(ok7000)} of 20")
+    result(rep == "20", "relay: replies from the target return to the remote machine (direction both)", f"{rep} of 20")
+    result(len(got["7002"]) == 5, "relay: a one-way rule forwards", f"{len(got['7002'])} of 5")
+    result(not got["7001"], "relay: a port with no rule forwards nothing", f"{len(got['7001'])}")
     result(not any(d.startswith("otherpeer") for d, _ in got["7000"]),
-           "relay (WIP): an authenticated peer that is not the rule's remote is denied", "denied" if "denied" in out else out[-200:])
-    result(not any(d.startswith("outside") for d, _ in got["7000"]), "relay (WIP): nothing from outside the tunnel is relayed")
+           "relay: an authenticated peer that is not the rule's remote is denied", "denied" if "denied" in out else out[-200:])
+    result(not any(d.startswith("outside") for d, _ in got["7000"]), "relay: nothing from outside the tunnel is relayed")
     bad = []
     for f in frames:
         et = f[12:14]
@@ -1000,7 +999,7 @@ print(replies)
                 and int.from_bytes(f[36:38], "big") in (7000, 7002):
             continue
         bad.append(f[:40].hex())
-    result(not bad, "relay (WIP): on the link, only ARP and the allowed datagrams were sent", f"{len(frames)} frames, {len(bad)} other: {bad[:3]}")
+    result(not bad, "relay: on the link, only ARP and the allowed datagrams were sent", f"{len(frames)} frames, {len(bad)} other: {bad[:3]}")
     # refusals
     write_cfg(RELAY.replace('remote_interface = "wg0"', 'remote_interface = "u0"'))
     p = gr("relay", "--config", CFG)
@@ -1040,7 +1039,7 @@ print(replies)
     time.sleep(3)
     health = json.load(open("/var/lib/goatrope/relay.health"))
     errs = sum(r.get("send_errors", 0) for r in health["rules"])
-    result(relay.poll() is None and errs >= 1, "relay (WIP): a reply it cannot send is counted and the relay keeps running",
+    result(relay.poll() is None and errs >= 1, "relay: a reply it cannot send is counted and the relay keeps running",
            f"running={relay.poll() is None}, send_errors={errs}, primed={primed}, port={port}, health={health['rules']}")
     sh(f"wg set wg0 peer {allowed} allowed-ips 10.99.0.2/32")
     sh("sysctl -qw net.ipv4.conf.r0.forwarding=1")
@@ -1049,7 +1048,7 @@ print(replies)
     except subprocess.TimeoutExpired:
         relay.kill()
         rc = None
-    result(rc == 1, "relay (WIP): it stops when IP forwarding is turned on while it runs", f"exit {rc}")
+    result(rc == 1, "relay: it stops when IP forwarding is turned on while it runs", f"exit {rc}")
     sh("sysctl -qw net.ipv4.conf.r0.forwarding=0")
 
 
@@ -1058,7 +1057,6 @@ PHASES["relay"] = phase_relay
 
 BOUNDARY = """schema = 1
 [relay]
-wip = true
 transport = "boundary"
 remote_interface = "grb0"
 link_interface = "r0"
@@ -1194,6 +1192,156 @@ print(n)
 
 
 PHASES["boundary"] = phase_boundary
+
+
+def unit_props(unit: str = "goatrope-relay.service") -> dict:
+    out = sh(f"systemctl show {unit} -p ActiveState -p SubState -p NRestarts -p ExecMainStatus -p Result", check=False).stdout
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
+def wait_unit(want: str, timeout: float = 20) -> dict:
+    end = time.monotonic() + timeout
+    while True:
+        u = unit_props()
+        if u.get("ActiveState") == want or time.monotonic() > end:
+            return u
+        time.sleep(0.5)
+
+
+def relay_through(n: int, tag: str) -> int:
+    """n datagrams from the allowed peer to rule port 7002; how many reached the link host."""
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
+import socket, select, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", 7002))
+n = 0; end = time.time() + 6
+while time.time() < end:
+    if select.select([s], [], [], 0.3)[0]:
+        n += s.recv(65535).startswith(sys.argv[1].encode())
+print(n)
+""", tag], stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    code = ("import socket,sys,time\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.SOL_SOCKET,25,b'wga')\n"
+            "s.bind(('10.99.0.2',0))\nfor i in range(int(sys.argv[1])):\n s.sendto(f'{sys.argv[2]}{i}'.encode(),('10.99.0.1',7002)); time.sleep(0.02)\n")
+    sh(f"ip netns exec remote python3 -c \"{code}\" {n} {tag}", check=False)
+    return int(rx.communicate(timeout=30)[0].strip() or 0)
+
+
+def phase_relay_service() -> None:
+    """ADR 0004 module 1: install writes and starts goatrope-relay.service; check reads it."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    write_cfg(RELAY.replace("[relay]\n", "[relay]\nwip = true\n"))
+    p = gr("validate", "--config", CFG)
+    result(p.returncode == 0, "relay service: wip = true still parses (and does nothing)", p.stderr.strip()[-120:])
+    write_cfg(RELAY)
+    before = snapshot()
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "relay service: install of a declaration with only [relay]",
+           f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
+    unit = "/etc/systemd/system/goatrope-relay.service"
+    text = open(unit).read() if os.path.exists(unit) else ""
+    want = ("ExecStart=/usr/local/sbin/goatrope relay --config /etc/goatrope/goatrope.toml", "Restart=on-failure",
+            "RestartPreventExitStatus=2", "CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN")
+    result(all(w in text for w in want), "relay service: install writes the unit (on-failure; the refusal code is not restarted)",
+           f"{sum(w in text for w in want)} of {len(want)} lines present")
+    after = snapshot()
+    tapish = [k for k in after["files"] if k not in before["files"]
+              and ("/systemd/network/" in k or "goatrope-ports" in k or "goatrope-record" in k or k.endswith("90-goatrope.conf")
+                   or "system.conf.d" in k)]
+    result(not tapish and after["networkd"] == before["networkd"] and after["watchdog"] == before["watchdog"],
+           "relay service: install touches no tap port and writes no tap file", f"{tapish}; networkd {after['networkd']}")
+    u = wait_unit("active")
+    result(u.get("ActiveState") == "active", "relay service: the unit is enabled and active",
+           f"{u}, {sh('systemctl is-enabled goatrope-relay.service', check=False).stdout.strip()}")
+    check_exit(0, "relay service: active")
+    n = relay_through(20, "svc")
+    result(n == 20, "relay service: the service forwards an allowed rule", f"{n} of 20")
+    time.sleep(2.5)
+    p = gr("status", "--config", CFG)
+    result("rule" in p.stdout and "sent to the link" in p.stdout and "active" in p.stdout,
+           "relay service: status shows the rules and counters", " | ".join(p.stdout.splitlines()[1:6])[:400])
+
+    sh("systemctl stop goatrope-relay.service")
+    check_exit(3, "relay service: stopped")
+    sh("systemctl start goatrope-relay.service")
+    wait_unit("active")
+    time.sleep(1)
+    check_exit(0, "relay service: started again")
+    sh("systemctl kill --signal=SIGSTOP goatrope-relay.service")
+    time.sleep(12)
+    p = gr("check", "--config", CFG)
+    stale = [ln for ln in p.stdout.splitlines() if "DIFF" in ln]
+    result(p.returncode == 3 and any("relay-health" in ln for ln in stale) and unit_props().get("ActiveState") == "active",
+           "relay service: a hung relay (unit active, relay.health older than 10 s): check exits 3",
+           f"exit {p.returncode}: {'; '.join(stale)[:200]}")
+    sh("systemctl kill --signal=SIGCONT goatrope-relay.service")
+    time.sleep(3)
+    check_exit(0, "relay service: after it resumes")
+
+    # IP forwarding turned on while it runs: the relay exits 1 and is restarted once; that start is a refusal
+    # (exit 2), which is not restarted.
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=1")
+    time.sleep(15)
+    u = unit_props()
+    result(u.get("ActiveState") == "failed" and u.get("ExecMainStatus") == "2" and u.get("NRestarts") == "1",
+           "relay service: a failure is restarted, and the refusal that follows is not", str(u))
+    time.sleep(10)
+    u2 = unit_props()
+    result(u2.get("NRestarts") == "1" and u2.get("ActiveState") == "failed", "relay service: 10 s later it is still stopped, not restarted",
+           str(u2))
+    check_exit(3, "relay service: refused")
+    sh("systemctl reset-failed goatrope-relay.service", check=False)
+    sh("systemctl start goatrope-relay.service")
+    time.sleep(5)
+    u = unit_props()
+    result(u.get("ActiveState") == "failed" and u.get("ExecMainStatus") == "2" and u.get("NRestarts") == "0",
+           "relay service: a refusal at start (IP forwarding on) is not restarted", str(u))
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0")
+    sh("systemctl reset-failed goatrope-relay.service", check=False)
+    sh("systemctl start goatrope-relay.service")
+    wait_unit("active")
+    time.sleep(1)
+    check_exit(0, "relay service: forwarding off and started again")
+
+    p = gr("uninstall")
+    left = diff(before, snapshot())
+    allowed = [x for x in left if x.startswith("file /etc/goatrope")]
+    result(p.returncode == 0 and set(left) == set(allowed) and not os.path.exists("/var/lib/goatrope/relay.health"),
+           "relay service: uninstall removes the unit and relay.health; only the declaration remains",
+           "; ".join(x for x in left if x not in allowed)[:400] or "; ".join(allowed)[:200])
+    gr("uninstall", "--purge")
+    left = diff(before, snapshot())
+    result(not left, "relay service: uninstall --purge leaves nothing", "; ".join(left)[:400])
+
+    # A declaration with both [tap] and [relay]: both are installed and checked.
+    topo_listen()
+    stand_in_watchdog()
+    before = snapshot()
+    both = LISTEN + RELAY.replace("schema = 1\n", "")
+    write_cfg(both)
+    p = gr("install", "--config", CFG)
+    wait_unit("active")
+    time.sleep(1)
+    result(p.returncode == 0 and unit_props().get("ActiveState") == "active"
+           and sh("systemctl is-active goatrope-ports.service", check=False).stdout.strip() == "active",
+           "relay service: a declaration with [tap] and [relay] installs both", f"exit {p.returncode}: {p.stdout.strip()[-200:]}")
+    check_exit(0, "relay service: tap and relay")
+    n = relay_through(10, "both")
+    result(n == 10, "relay service: with a tap beside it, the relay forwards", f"{n} of 10")
+    write_cfg(RELAY)
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 2 and "uninstall first" in p.stderr,
+           "relay service: a relay-only declaration over an installed tap is refused", p.stderr.strip()[-160:])
+    write_cfg(both)
+    gr("uninstall", "--purge")
+    left = diff(before, snapshot())
+    result(not left, "relay service: uninstall --purge of tap and relay leaves nothing", "; ".join(left)[:400])
+
+
+PHASES["relay-service"] = phase_relay_service
 
 COMPONENTS = "/opt/gt-components"  # run.sh copies the real binaries here when GOATROPE_TEST_COMPONENTS is set
 REMOTE_ID = "122624160b42bf241b6ed1b4b69808ac0870086b53150e0200"  # goat-transformers' README example message

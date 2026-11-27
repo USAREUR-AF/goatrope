@@ -27,7 +27,7 @@ On the machine that receives the copy, goatrope runs in up to three declared rol
 |---|---|---|
 | **tap** | records the link: **listen** (a tap device or mirror port hands the machine a copy) or **inline** (the machine bridges the link) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
 | **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
-| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | WIP; design in [ADR 0002](docs/adr/0002-relay.md) |
+| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
 
 It runs with no goat component installed. Why it is a repository of its own, and
 what it leaves to other repositories: [ADR 0001](docs/adr/0001-goatrope-is-its-own-repository.md).
@@ -86,11 +86,11 @@ listen tap with decode-and-send.
 |---|---|
 | `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, carries a VLAN or other device, holds an address, carries the default route, the operator's session or any established connection (link-local ones included), when the rings (one per recorded port) and file destinations do not fit on disk, or when the state file of an earlier install is unreadable |
 | `goatrope deploy [--dry-run]` | `install`, only when the machine does not already have this software and declaration and match it. With `--dry-run`, makes every refusal and changes nothing. [docs/deploy.md](docs/deploy.md): the Ansible play that runs it from a verified release file |
-| `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each recorder and its ring, each send and decoder, and the check result |
+| `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each recorder and its ring, each send and decoder, the relay's rules and counters, and the check result |
 | `goatrope check [--json]` | compares the machine with the declaration. Exit **0** matches, **3** differs, anything else is an error (2: invalid or unreadable declaration) |
-| `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
+| `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, `relay.health` and the relay's boundary interface, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
 | `goatrope validate` | checks the declaration alone |
-| `goatrope relay` | runs the WIP relay in the foreground |
+| `goatrope relay` | runs the relay in the foreground (`install` runs it as `goatrope-relay.service`) |
 | `goatrope boundary key\|sheet\|up\|check\|down` | the relay's boundary interface (`transport = "boundary"`): make the key, print what the boundary point needs, bring it up, check it (exit 0 or 3), remove it |
 
 ## What the tap sets, and what `check` reads
@@ -143,6 +143,33 @@ A pinned binary is hashed and copied to `/var/lib/goatrope/components/<sha256>`
 in one read, and the copy is what runs: a binary replaced after the check never
 runs, and `check` reports it.
 
+## Relay
+
+A `[relay]` forwards the UDP datagrams its `allow` rules name between a remote machine,
+authenticated by WireGuard, and one machine on the link, from the relay's own interface
+and address. Everything else is dropped and counted. The rules and the refusals are in
+[ADR 0002](docs/adr/0002-relay.md).
+
+A declaration may hold only `[relay]`. `goatrope install` then installs the software, the
+declaration and `goatrope-relay.service`, and touches no tap port, network file, sysctl or
+watchdog setting. With a `[tap]` too, it installs both.
+
+| Property | What `check` reads |
+|---|---|
+| `goatrope-relay.service` is installed as rendered, enabled and active | `file:`, `enabled:` and `unit:` items |
+| the relay is running, not hung: it rewrites `/var/lib/goatrope/relay.health` every 2 s | `relay-health`: written in the last 10 s |
+
+The unit has `Restart=on-failure`, so a relay that stops (for example because IP forwarding
+was turned on while it ran, exit 1) is started again. A refusal (exit 2: IPv6 or IP forwarding
+on, an interface missing or not WireGuard, the address not held) is not restarted
+(`RestartPreventExitStatus=2`): the unit stays failed and `check` exits 3 until the cause is
+fixed and the unit is started again. The relay runs with `CAP_NET_RAW` (to bind its sockets to
+an interface) and `CAP_NET_ADMIN` (the boundary interface) only, on a read-only system except
+`/var/lib/goatrope`. `wip` is no longer needed; `wip = true` is accepted and does nothing.
+
+Installing a declaration with no `[tap]` over an installed tap is refused: run `goatrope
+uninstall` first, so the tap ports are restored.
+
 ## Tests
 
 `tests/netns/run.sh` runs the tests in a privileged container with systemd as PID 1,
@@ -175,7 +202,12 @@ the host's kernel. No hardware is involved. They cover:
 - `networkmanager`, in an image with NetworkManager managing the wired ports:
   install takes the ports from it at once and leaves the management port alone,
   and uninstall gives them back;
-- the WIP relay (ADR 0002): default deny, refusals, IP forwarding, send errors;
+- the relay (ADR 0002): default deny, refusals, IP forwarding, send errors;
+- `relay-service` (ADR 0004 module 1): install of a relay-only declaration writes and starts the
+  unit and writes no tap file; check exits 0 while it runs, 3 when it is stopped and 3 when it is
+  hung (relay.health older than 10 s); a failure is restarted and a refusal is not; uninstall
+  leaves only the declaration and `--purge` leaves nothing; a declaration with a tap and a relay
+  installs, checks and removes both;
 - the relay's boundary transport: its own interface with one peer, drift and refusals;
 - `deploy`, in an image with Ansible: the play from a release file. Refusals leave the machine,
   `current` and the ledger as they were; install, a second run that changes nothing, repair,

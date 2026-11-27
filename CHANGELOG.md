@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- relay service (ADR 0004 module 1): `goatrope install` writes and starts `goatrope-relay.service`
+  for a declaration with `[relay]`, which may now be the only role; a refusal is not restarted.
+  `check` reads the unit and the age of `relay.health` (stale after 10 s); `status` shows the rules
+  and counters; `uninstall` removes the unit, `relay.health` and a boundary interface. `wip` is no
+  longer required (`wip = true` is accepted and does nothing). Namespace phase `relay-service`.
 - ADR 0004 (Accepted): the relay reaches 1.0 in six modules: a service, TCP and link-initiated
   traffic, multicast, an address proxy, a remote mirror over ERSPAN, and an opt-in layer-2 lane.
 
