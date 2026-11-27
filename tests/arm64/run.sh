@@ -64,8 +64,10 @@ runcmd:
   - [sh, -c, "echo GOATROPE-VM-READY > /dev/console"]
 EOF
 
-docker build -q -t goatrope-qemu-arm64 "$here" >/dev/null
-docker run -d --name "$c" -e WATCHDOG_ACTION="${WATCHDOG_ACTION:-none}" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.img:ro" goatrope-qemu-arm64 sh -c '
+# named by a hash of the Dockerfile, so runs from trees whose Dockerfiles differ never share an image
+image="goatrope-qemu-arm64-$(sha256sum "$here/Dockerfile" | cut -c1-12)"
+docker build -q -t "$image" "$here" >/dev/null
+docker run -d --name "$c" -e WATCHDOG_ACTION="${WATCHDOG_ACTION:-none}" --user "$(id -u):$(id -g)" -v "$w:/w" -v "$img:/base.img:ro" "$image" sh -c '
   set -e
   qemu-img create -q -f qcow2 -F qcow2 -b /base.img /w/disk.qcow2 16G
   cloud-localds --network-config /w/network-config /w/seed.img /w/user-data /w/meta-data
