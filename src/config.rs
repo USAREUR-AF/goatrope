@@ -149,6 +149,12 @@ pub struct Decode {
     pub publishers: String,
 }
 
+pub const DEFAULT_MAX_CONNECTIONS: i64 = 64;
+
+/// One allow rule. "remote-to-link" and "both": the relay listens on the remote interface at
+/// listen_port and sends to target:target_port on the link. "link-to-remote": it listens on its
+/// link address at listen_port, accepts only `sources`, and sends to remote:remote_port; target is
+/// empty and target_port 0.
 #[derive(Debug, Clone)]
 pub struct RelayRule {
     pub direction: String,
@@ -156,8 +162,20 @@ pub struct RelayRule {
     pub listen_port: u16,
     pub target: String,
     pub target_port: u16,
-    #[allow(dead_code)] // "udp", the one protocol built; kept as declared
+    /// "udp" or "tcp"
     pub protocol: String,
+    /// link-to-remote: the port on the remote
+    pub remote_port: u16,
+    /// link-to-remote: the link addresses accepted
+    pub sources: Vec<String>,
+    /// tcp: connections open at once on this rule
+    pub max_connections: usize,
+}
+
+impl RelayRule {
+    pub fn link_initiated(&self) -> bool {
+        self.direction == "link-to-remote"
+    }
 }
 
 /// A WireGuard interface of the relay's own with exactly one peer, the boundary point (ADR 0002, Transport).
@@ -985,39 +1003,89 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     for (j, a) in allow.iter().enumerate() {
         let aw = format!("{w}.allow[{j}]");
         let a = as_table(a, &aw)?;
-        let req = ["direction", "protocol", "remote", "listen_port", "target", "target_port"];
-        keys(a, &aw, &req, &req)?;
-        let direction = match a["direction"].as_str() {
-            Some(d) if d == "remote-to-link" || d == "both" => d.to_string(),
-            _ => return err(format!("{aw}.direction must be \"remote-to-link\" or \"both\" (replies from the target only)")),
+        let direction = match a.get("direction").and_then(|d| d.as_str()) {
+            Some(d) if d == "remote-to-link" || d == "both" || d == "link-to-remote" => d.to_string(),
+            _ => {
+                return err(format!(
+                    "{aw}.direction must be \"remote-to-link\", \"both\" (replies from the target only) or \"link-to-remote\" (a machine on the link sends first)"
+                ))
+            }
         };
-        if a["protocol"].as_str() != Some("udp") {
-            return err(format!("{aw}.protocol: only \"udp\" is built"));
-        }
-        let target = addr(&a["target"], &format!("{aw}.target"))?;
-        let t = parse_ip(&target).unwrap();
-        if !link.contains(t) {
-            return err(format!("{aw}.target {target} is not on the link ({})", link.network()));
-        }
-        if t == link.ip || (link.num_addresses() > 2 && (t == link.network_address() || t == link.broadcast_address())) || t.is_multicast()
-        {
+        let protocol = match a.get("protocol").and_then(|p| p.as_str()) {
+            Some(p) if p == "udp" || p == "tcp" => p.to_string(),
+            _ => return err(format!("{aw}.protocol must be \"udp\" or \"tcp\"")),
+        };
+        if protocol == "tcp" && direction == "both" {
             return err(format!(
-                "{aw}.target {target} is the relay's own, the network, a broadcast or a multicast address; a rule names one machine"
+                "{aw}: direction \"both\" is refused for TCP: a connection always carries both directions; name who opens it, \"remote-to-link\" or \"link-to-remote\""
             ));
         }
+        let l2r = direction == "link-to-remote";
+        let mut req = vec!["direction", "protocol", "remote", "listen_port"];
+        req.extend(if l2r { ["remote_port", "sources"] } else { ["target", "target_port"] });
+        let mut allowed = req.clone();
+        if protocol == "tcp" {
+            allowed.push("max_connections");
+        }
+        keys(a, &aw, &allowed, &req)?;
+        // a machine on the link: one host address, not the relay's own, the network or a broadcast
+        let on_link = |v: &Value, wk: &str| -> R<String> {
+            let x = addr(v, wk)?;
+            let t = parse_ip(&x).unwrap();
+            if !link.contains(t) {
+                return err(format!("{wk} {x} is not on the link ({})", link.network()));
+            }
+            if t == link.ip
+                || (link.num_addresses() > 2 && (t == link.network_address() || t == link.broadcast_address()))
+                || t.is_multicast()
+            {
+                return err(format!(
+                    "{wk} {x} is the relay's own, the network, a broadcast or a multicast address; a rule names one machine"
+                ));
+            }
+            Ok(x)
+        };
+        let (target, target_port, remote_port, sources) = if l2r {
+            let list = match &a["sources"] {
+                Value::Array(l) if !l.is_empty() => l,
+                _ => {
+                    return err(format!(
+                        "{aw}.sources must list at least one link address: the link is not authenticated, so the list is the control"
+                    ))
+                }
+            };
+            let mut sources = Vec::new();
+            for (k, v) in list.iter().enumerate() {
+                let x = on_link(v, &format!("{aw}.sources[{k}]"))?;
+                if sources.contains(&x) {
+                    return err(format!("{aw}.sources: {x} is listed twice"));
+                }
+                sources.push(x);
+            }
+            (String::new(), 0, int(a, "remote_port", &aw, 1, 65535)? as u16, sources)
+        } else {
+            (on_link(&a["target"], &format!("{aw}.target"))?, int(a, "target_port", &aw, 1, 65535)? as u16, 0, vec![])
+        };
+        let max_connections =
+            if a.contains_key("max_connections") { int(a, "max_connections", &aw, 1, 4096)? } else { DEFAULT_MAX_CONNECTIONS } as usize;
         rules.push(RelayRule {
             direction,
             remote: addr(&a["remote"], &format!("{aw}.remote"))?,
             listen_port: int(a, "listen_port", &aw, 1, 65535)? as u16,
             target,
-            target_port: int(a, "target_port", &aw, 1, 65535)? as u16,
-            protocol: "udp".into(),
+            target_port,
+            protocol,
+            remote_port,
+            sources,
+            max_connections,
         });
     }
     let mut seen = BTreeSet::new();
     for rule in &rules {
-        if !seen.insert(rule.listen_port) {
-            return err(format!("{w}.allow: listen_port {} is used twice", rule.listen_port));
+        // one socket per side, protocol and port: the remote interface, or the relay's link address
+        let side = if rule.link_initiated() { "link" } else { "remote" };
+        if !seen.insert((side, rule.protocol.clone(), rule.listen_port)) {
+            return err(format!("{w}.allow: {} listen_port {} on the {side} side is used twice", rule.protocol, rule.listen_port));
         }
     }
     if let Some(b) = &bnd {
@@ -1127,6 +1195,24 @@ allow = [{ direction = "both", protocol = "udp", remote = "198.51.100.5", listen
         assert!(parse(&with("true"), "x.toml").is_ok());
         assert!(parse(&with("false"), "x.toml").is_ok());
         assert!(e(&with("\"yes\"")).contains("wip must be true or false"));
+    }
+
+    #[test]
+    fn relay_tcp_and_link_to_remote() {
+        let tcp = RELAY.replace("\"both\", protocol = \"udp\"", "\"remote-to-link\", protocol = \"tcp\"");
+        let r = parse(&tcp, "x.toml").unwrap().relay.unwrap();
+        assert_eq!((r.rules[0].protocol.as_str(), r.rules[0].max_connections), ("tcp", 64));
+        assert!(e(&RELAY.replace("protocol = \"udp\"", "protocol = \"tcp\"")).contains("refused for TCP"));
+        let l2r = RELAY.replace(
+            "{ direction = \"both\", protocol = \"udp\", remote = \"198.51.100.5\", listen_port = 7000, target = \"192.0.2.2\", target_port = 7000 }",
+            "{ direction = \"link-to-remote\", protocol = \"udp\", remote = \"198.51.100.5\", listen_port = 7000, remote_port = 9000, sources = [\"192.0.2.2\"] }",
+        );
+        let r = parse(&l2r, "x.toml").unwrap().relay.unwrap();
+        assert_eq!((r.rules[0].remote_port, r.rules[0].sources.clone()), (9000, vec!["192.0.2.2".to_string()]));
+        assert!(e(&l2r.replace(", sources = [\"192.0.2.2\"]", "")).contains("missing required key(s) sources"));
+        assert!(e(&l2r.replace("[\"192.0.2.2\"]", "[]")).contains("sources must list"));
+        assert!(e(&l2r.replace("[\"192.0.2.2\"]", "[\"192.0.2.50\"]")).contains("the relay's own"));
+        assert!(e(&l2r.replace("remote_port = 9000", "remote_port = 9000, target = \"192.0.2.2\"")).contains("unknown key"));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+# goatrope declaration: A relay where both sides start traffic. A controller reaches a sensor's
+# TCP service over the WireGuard mesh, and the sensor sends its own UDP reports and opens its own
+# TCP connection to the controller (ADR 0004 §2). Addresses and ports are documentation values.
+schema = 1
+
+[relay]
+remote_interface = "wt0"          # the mesh's kernel WireGuard interface
+link_interface = "eth1"           # the sensor's network, an interface of its own
+link_address = "192.0.2.50/24"    # the relay's address on that network
+allow = [
+  # the controller connects to the sensor's service; at most 8 connections at once
+  { direction = "remote-to-link", protocol = "tcp", remote = "203.0.113.20", listen_port = 40100, target = "192.0.2.10", target_port = 40100, max_connections = 8 },
+  # the sensor sends reports to 192.0.2.50:40200; they go to the controller, and its replies come back
+  { direction = "link-to-remote", protocol = "udp", remote = "203.0.113.20", listen_port = 40200, remote_port = 40200, sources = ["192.0.2.10"] },
+  # the sensor opens a connection to 192.0.2.50:40300; the relay opens one to the controller
+  { direction = "link-to-remote", protocol = "tcp", remote = "203.0.113.20", listen_port = 40300, remote_port = 40300, sources = ["192.0.2.10"] },
+]

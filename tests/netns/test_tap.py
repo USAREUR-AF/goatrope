@@ -1343,6 +1343,263 @@ def phase_relay_service() -> None:
 
 PHASES["relay-service"] = phase_relay_service
 
+
+RELAY_TCP = """schema = 1
+[relay]
+remote_interface = "wg0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "remote-to-link", protocol = "tcp", remote = "10.99.0.2", listen_port = 7100, target = "192.0.2.2", target_port = 7100, max_connections = 3 },
+  { direction = "link-to-remote", protocol = "udp", remote = "10.99.0.2", listen_port = 8000, remote_port = 8000, sources = ["192.0.2.2"] },
+  { direction = "link-to-remote", protocol = "tcp", remote = "10.99.0.2", listen_port = 8001, remote_port = 8001, sources = ["192.0.2.2"] },
+]
+"""
+
+# A TCP server that logs each connection's peer, reads until the client closes its sending half,
+# answers b"echo:" + what it read, and closes. A UDP server that answers b"reply-" + the datagram.
+NET_SERVER = r"""
+import socket, sys, threading
+kind, host, port, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+def note(line):
+    with open(log, "a") as f:
+        f.write(line + "\n")
+if kind == "udp":
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind((host, port))
+    while True:
+        d, a = s.recvfrom(65535); note(f"udp {a[0]} {d.decode()}"); s.sendto(b"reply-" + d, a)
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((host, port)); s.listen(64)
+def serve(c, a):
+    note(f"accept {a[0]}")
+    data = b""
+    while True:
+        d = c.recv(65536)
+        if not d:
+            break
+        data += d
+    c.sendall(b"echo:" + data); c.close(); note(f"done {len(data)}")
+while True:
+    c, a = s.accept(); threading.Thread(target=serve, args=(c, a), daemon=True).start()
+"""
+
+# A TCP client: n connections from src (bound to dev), each sends size bytes, closes its sending half
+# and reads to the end. "hold": opens n connections, sends nothing, and reports which the relay closed.
+NET_CLIENT = r"""
+import json, socket, sys, time
+mode, dev, src, dst, port, n, size = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
+def conn():
+    c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, 25, dev.encode()); c.bind((src, 0)); c.settimeout(5)
+    c.connect((dst, port)); return c
+out = {"ok": 0, "closed": 0, "errors": []}
+if mode == "echo":
+    for i in range(n):
+        payload = bytes([65 + i % 26]) * size
+        try:
+            c = conn(); c.sendall(payload); c.shutdown(socket.SHUT_WR)
+            got = b""
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                got += d
+            if got == b"echo:" + payload:
+                out["ok"] += 1
+            else:
+                out["closed"] += 1
+        except OSError as e:
+            out["closed"] += 1; out["errors"].append(str(e))
+else:
+    held = []
+    for i in range(n):
+        try:
+            held.append(conn())
+        except OSError as e:
+            out["errors"].append(str(e))
+        time.sleep(0.2)
+    time.sleep(1.5)
+    for c in held:
+        c.settimeout(0.5)
+        try:
+            d = c.recv(1)
+            out["closed" if not d else "ok"] += 1
+        except socket.timeout:
+            out["ok"] += 1  # still open: nothing to read, no end
+        except OSError:
+            out["closed"] += 1
+    for c in held:
+        c.close()
+print(json.dumps(out))
+"""
+
+UDP_CLIENT = r"""
+import socket, sys
+dev, src, dst, port, n, tag = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
+s.bind((src, 0)); s.settimeout(0.3); replies = 0
+for i in range(n):
+    s.sendto(f"{tag}{i}".encode(), (dst, port))
+    try:
+        replies += s.recv(65535) == f"reply-{tag}{i}".encode()
+    except socket.timeout:
+        pass
+print(replies)
+"""
+
+
+def lines(path: str) -> list[str]:
+    try:
+        return open(path).read().splitlines()
+    except OSError:
+        return []
+
+
+def relay_rows() -> list[dict]:
+    try:
+        return json.load(open("/var/lib/goatrope/relay.health"))["rules"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def phase_relay_tcp() -> None:
+    """ADR 0004 module 2: TCP rules, and traffic a machine on the link starts (link-to-remote)."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()
+    sh("ip -n linkhost addr add 192.0.2.3/24 dev l0")  # a second machine on the link, not in any rule's sources
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    for name, text, want in (
+            ("tcp with direction both", RELAY_TCP.replace('"remote-to-link", protocol = "tcp"', '"both", protocol = "tcp"'),
+             "refused for TCP"),
+            ("link-to-remote without sources", RELAY_TCP.replace(', sources = ["192.0.2.2"] },\n  { direction = "link-to-remote", protocol = "tcp"',
+                                                                  ' },\n  { direction = "link-to-remote", protocol = "tcp"'),
+             "missing required key(s) sources"),
+            ("a source that is not on the link", RELAY_TCP.replace('sources = ["192.0.2.2"] },\n  { direction = "link-to-remote", protocol = "tcp"',
+                                                                   'sources = ["198.51.100.9"] },\n  { direction = "link-to-remote", protocol = "tcp"'),
+             "is not on the link"),
+            ("max_connections on a UDP rule", RELAY_TCP.replace("remote_port = 8000,", "remote_port = 8000, max_connections = 4,"),
+             "unknown key")):
+        write_cfg(text)
+        p = gr("validate", "--config", CFG)
+        result(p.returncode == 2 and want in p.stderr, f"relay tcp refused at validation: {name}", p.stderr.strip()[-160:])
+
+    srv = f"{WORK}/net-server.py"
+    cli = f"{WORK}/net-client.py"
+    ucli = f"{WORK}/udp-client.py"
+    for path, text in ((srv, NET_SERVER), (cli, NET_CLIENT), (ucli, UDP_CLIENT)):
+        with open(path, "w") as f:
+            f.write(text)
+    logs = {k: f"{WORK}/srv-{k}.log" for k in ("link", "remote-udp", "remote-tcp")}
+    for p in logs.values():
+        open(p, "w").close()
+    servers = [
+        subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, srv, "tcp", "192.0.2.2", "7100", logs["link"]]),
+        subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, srv, "udp", "10.99.0.2", "8000", logs["remote-udp"]]),
+        subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, srv, "tcp", "10.99.0.2", "8001", logs["remote-tcp"]]),
+    ]
+    write_cfg(RELAY_TCP)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2)
+
+    def client(ns: str, *args: str) -> dict:
+        p = sh(f"ip netns exec {ns} {sys.executable} {cli} {' '.join(args)}", check=False)
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            return {"ok": 0, "closed": 0, "errors": [p.stderr.strip()[-200:]]}
+
+    try:
+        # remote -> link, both ways, half-close passed on
+        r = client("remote", "echo", "wga", "10.99.0.2", "10.99.0.1", "7100", "5", "100000")
+        acc = [ln for ln in lines(logs["link"]) if ln.startswith("accept")]
+        done = [ln for ln in lines(logs["link"]) if ln == "done 100000"]
+        result(r["ok"] == 5 and len(done) == 5 and all(ln == "accept 192.0.2.50" for ln in acc),
+               "relay tcp: remote -> link both ways (100000 bytes each way, the client's half-close passed on), from the relay's address",
+               f"{r['ok']} of 5 echoed; target saw {len(done)} of 5 whole, from {sorted(set(acc))}; {r['errors'][:2]}")
+        before = len(lines(logs["link"]))
+        r = client("remote", "echo", "wgo", "10.99.0.3", "10.99.0.1", "7100", "3", "100")
+        time.sleep(0.5)
+        result(r["ok"] == 0 and len(lines(logs["link"])) == before,
+               "relay tcp: a connection from another authenticated peer is closed, and never reaches the target",
+               f"{r['closed']} of 3 closed; target saw {len(lines(logs['link'])) - before} lines")
+        before = len([ln for ln in lines(logs["link"]) if ln.startswith("accept")])
+        r = client("remote", "hold", "wga", "10.99.0.2", "10.99.0.1", "7100", "5", "0")
+        time.sleep(1)
+        held = len([ln for ln in lines(logs["link"]) if ln.startswith("accept")]) - before
+        result(r["ok"] == 3 and r["closed"] == 2 and held == 3, "relay tcp: max_connections = 3 enforced",
+               f"5 opened: {r['ok']} held open, {r['closed']} closed; the target saw {held}")
+        time.sleep(1)
+
+        # link -> remote, UDP
+        rep = sh(f"ip netns exec linkhost {sys.executable} {ucli} l0 192.0.2.2 192.0.2.50 8000 20 lu", check=False).stdout.strip()
+        got = [ln for ln in lines(logs["remote-udp"]) if " lu" in ln]
+        result(len(got) == 20 and all(ln.startswith("udp 10.99.0.1 ") for ln in got) and rep == "20",
+               "relay link-to-remote udp: a link machine's datagrams reach the remote, and the replies come back",
+               f"{len(got)} of 20 delivered, {rep} of 20 replies")
+        sh(f"ip netns exec linkhost {sys.executable} {ucli} l0 192.0.2.3 192.0.2.50 8000 5 lx", check=False)
+        got = [ln for ln in lines(logs["remote-udp"]) if " lx" in ln]
+        result(not got, "relay link-to-remote udp: a link address not in sources is denied", f"{len(got)} of 5 delivered")
+
+        # link -> remote, TCP
+        r = client("linkhost", "echo", "l0", "192.0.2.2", "192.0.2.50", "8001", "3", "50000")
+        acc = [ln for ln in lines(logs["remote-tcp"]) if ln.startswith("accept")]
+        result(r["ok"] == 3 and len(acc) == 3 and all(ln == "accept 10.99.0.1" for ln in acc),
+               "relay link-to-remote tcp: a link machine's connection reaches the remote through the tunnel, both ways",
+               f"{r['ok']} of 3 echoed (50000 bytes each way); remote saw {len(acc)} from {sorted(set(acc))}")
+        r = client("linkhost", "echo", "l0", "192.0.2.3", "192.0.2.50", "8001", "3", "100")
+        time.sleep(0.5)
+        acc2 = [ln for ln in lines(logs["remote-tcp"]) if ln.startswith("accept")]
+        result(r["ok"] == 0 and len(acc2) == len(acc), "relay link-to-remote tcp: a link address not in sources is denied",
+               f"{r['closed']} of 3 closed; remote saw {len(acc2) - len(acc)}")
+        time.sleep(2.5)
+        rows = {(x["protocol"], x["listen_port"]): x for x in relay_rows()}
+        t, lu, lt = rows.get(("tcp", 7100), {}), rows.get(("udp", 8000), {}), rows.get(("tcp", 8001), {})
+        result(t.get("denied") == 3 and t.get("over_limit") == 2 and t.get("bytes_to_link", 0) >= 500000
+               and t.get("bytes_to_remote", 0) >= 500000 and lu.get("denied") == 5 and lt.get("denied") == 3
+               and t.get("connections") == 0,
+               "relay tcp: relay.health counts connections, bytes each way and denials per rule",
+               f"7100 {t}; 8000 {lu}; 8001 {lt}")
+        p = gr("status", "--config", CFG)
+        result("over the limit" in p.stdout and "broken" in p.stdout and "link-to-remote" not in p.stdout and "connections from 192.0.2.2" in p.stdout,
+               "relay tcp: status shows the TCP and link-initiated rules in words",
+               " | ".join(ln.strip() for ln in p.stdout.splitlines() if "rule" in ln)[:400])
+
+        # A remote that vanishes without a FIN (its WireGuard interface taken down): keepalive and the
+        # user timeout free the slot within 120 s (60 s idle, then 6 probes 10 s apart).
+        held = subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, "-c",
+                                 "import socket,time\nc=socket.socket();c.setsockopt(socket.SOL_SOCKET,25,b'wga')\n"
+                                 "c.bind(('10.99.0.2',0));c.connect(('10.99.0.1',7100));time.sleep(600)\n"])
+        end = time.monotonic() + 20
+        while time.monotonic() < end and {(x["protocol"], x["listen_port"]): x for x in relay_rows()}.get(("tcp", 7100), {}).get("connections") != 1:
+            time.sleep(0.5)
+        t0 = time.monotonic()
+        sh("ip -n remote link set wga down")
+        row, freed = {}, None
+        while time.monotonic() < t0 + 200:
+            row = {(x["protocol"], x["listen_port"]): x for x in relay_rows()}.get(("tcp", 7100), {})
+            if row.get("connections") == 0:
+                freed = time.monotonic() - t0
+                break
+            time.sleep(1)
+        held.kill()
+        sh("ip -n remote link set wga up")
+        sh("ip -n remote route replace 10.99.0.1/32 dev wga metric 1")
+        result(freed is not None and freed <= 135 and row.get("broken") == 1,
+               "relay tcp: a remote that vanishes without a FIN frees its slot at the 120 s bound (relay.health is rewritten every 2 s)",
+               f"freed after {freed if freed is None else round(freed)} s; connections {row.get('connections')}, broken {row.get('broken')}")
+        result(relay.poll() is None, "relay tcp: the relay kept running", f"exit {relay.poll()}")
+    finally:
+        relay.terminate()
+        try:
+            relay.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
+        for s in servers:
+            s.terminate()
+
+
+PHASES["relay-tcp"] = phase_relay_tcp
+
 COMPONENTS = "/opt/gt-components"  # run.sh copies the real binaries here when GOATROPE_TEST_COMPONENTS is set
 REMOTE_ID = "122624160b42bf241b6ed1b4b69808ac0870086b53150e0200"  # goat-transformers' README example message
 NTP = ("240206e90000060000000a80c0000201ed135500c0000000ed13554040000000ed13554043000000ed13554043800000")

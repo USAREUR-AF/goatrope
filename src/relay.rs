@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 // SPDX-License-Identifier: Apache-2.0
-//! Relay: the fixed-port UDP forwarder of docs/adr/0002, run as a service (docs/adr/0004 §1).
+//! Relay: the fixed-port forwarder of docs/adr/0002, run as a service (docs/adr/0004 §1), for
+//! UDP and TCP (relay_tcp.rs), opened from the remote or from the link (docs/adr/0004 §2).
 //!
 //! A remote machine reaches the relay through a WireGuard interface. WireGuard
 //! authenticates the remote machine by its key and binds its tunnel address to that
 //! key, so a datagram's source address inside the tunnel names an authenticated
 //! machine. Each allow rule names that address, a port on the tunnel, and one
-//! address and port on the link. Everything else is dropped and counted.
+//! address and port on the link; or, for traffic a machine on the link starts
+//! (link-to-remote), a port on the relay's link address, the link addresses
+//! accepted, and the remote's port. Everything else is dropped and counted.
 //!
 //! The relay TRANSMITS on the link, from its own interface and address. It never
 //! uses a tap port, never bridges and forwards no broadcast or multicast.
@@ -16,12 +19,14 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::boundary;
 use crate::config::{Config, Relay, RelayRule};
 use crate::nl;
+use crate::relay_tcp;
 use crate::sys;
 use crate::sysutil as su;
 use crate::tap::{item, Item};
@@ -116,16 +121,55 @@ fn forwarding(r: &Relay) -> Vec<String> {
     on
 }
 
-/// A UDP socket bound to one device (SO_BINDTODEVICE) and to addr:port, non-blocking.
-fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
+/// addr:port as a sockaddr for bind(2) and connect(2).
+fn sockaddr(addr: IpAddr, port: u16) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: an all-zero sockaddr_storage is valid; the fields are filled below.
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        IpAddr::V4(a) => {
+            // SAFETY: sockaddr_storage is large enough and suitably aligned for a sockaddr_in.
+            let sa = unsafe { &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = port.to_be();
+            sa.sin_addr.s_addr = u32::from_ne_bytes(a.octets());
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        IpAddr::V6(a) => {
+            // SAFETY: sockaddr_storage is large enough and suitably aligned for a sockaddr_in6.
+            let sa = unsafe { &mut *(&mut ss as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6) };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = port.to_be();
+            sa.sin6_addr.s6_addr = a.octets();
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len as libc::socklen_t)
+}
+
+pub(crate) fn sockaddr_of(a: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    sockaddr(a.ip(), a.port())
+}
+
+fn setopt<T>(fd: libc::c_int, level: libc::c_int, name: libc::c_int, v: &T) -> io::Result<()> {
+    // SAFETY: v points to a value of the size given.
+    let rc =
+        unsafe { libc::setsockopt(fd, level, name, v as *const T as *const libc::c_void, std::mem::size_of::<T>() as libc::socklen_t) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A socket of type `ty` (SOCK_DGRAM, SOCK_STREAM) bound to one device (SO_BINDTODEVICE) and to addr:port.
+pub(crate) fn bound_fd(dev: &str, addr: IpAddr, port: u16, ty: libc::c_int) -> io::Result<OwnedFd> {
     let fam = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    // SAFETY: plain socket(2) call; the descriptor is owned by the UdpSocket below.
-    let fd = unsafe { libc::socket(fam, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    // SAFETY: plain socket(2) call; the descriptor is owned by the OwnedFd below.
+    let fd = unsafe { libc::socket(fam, ty | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: fd is a fresh socket that nothing else owns.
-    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: the option value is dev's bytes with their length.
     let rc = unsafe {
         libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE, dev.as_ptr() as *const libc::c_void, dev.len() as libc::socklen_t)
@@ -133,46 +177,62 @@ fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    let rc = match addr {
-        IpAddr::V4(a) => {
-            // SAFETY: an all-zero sockaddr_in is valid; the fields are filled below.
-            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            sa.sin_family = libc::AF_INET as libc::sa_family_t;
-            sa.sin_port = port.to_be();
-            sa.sin_addr.s_addr = u32::from_ne_bytes(a.octets());
-            // SAFETY: sa is a sockaddr_in of the size given.
-            unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) }
-        }
-        IpAddr::V6(a) => {
-            // SAFETY: an all-zero sockaddr_in6 is valid; the fields are filled below.
-            let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sa.sin6_port = port.to_be();
-            sa.sin6_addr.s6_addr = a.octets();
-            // SAFETY: sa is a sockaddr_in6 of the size given.
-            unsafe {
-                libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
-            }
-        }
-    };
-    if rc != 0 {
+    if ty == libc::SOCK_STREAM && port != 0 {
+        setopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &(1 as libc::c_int))?; // a restart binds again at once
+    }
+    let (sa, len) = sockaddr(addr, port);
+    // SAFETY: sa is a socket address of the length given.
+    if unsafe { libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(sock)
+}
+
+/// A UDP socket bound to one device (SO_BINDTODEVICE) and to addr:port, non-blocking.
+fn bound(dev: &str, addr: IpAddr, port: u16) -> io::Result<UdpSocket> {
+    let sock = UdpSocket::from(bound_fd(dev, addr, port, libc::SOCK_DGRAM)?);
     sock.set_nonblocking(true)?;
     Ok(sock)
 }
 
+/// The unspecified address of addr's family.
+pub(crate) fn any_of(addr: IpAddr) -> IpAddr {
+    if addr.is_ipv4() {
+        IpAddr::from([0u8; 4])
+    } else {
+        IpAddr::from([0u16; 8])
+    }
+}
+
+/// One UDP rule. `listen` receives from the side that sends first: the remote (remote-to-link,
+/// both) or machines on the link (link-to-remote). Each accepted sender has its own outgoing
+/// socket, so a reply goes back to the sender it answers.
 struct RuleState<'a> {
     rule: &'a RelayRule,
-    remote: Option<IpAddr>,
-    target: Option<IpAddr>,
-    remote_sock: UdpSocket,
-    link_sock: UdpSocket,
-    peer: Option<SocketAddr>,
+    /// the senders `listen` accepts
+    clients: Vec<IpAddr>,
+    /// where their datagrams go
+    dest: Option<SocketAddr>,
+    listen: UdpSocket,
+    /// one per client
+    outs: Vec<UdpSocket>,
+    /// each client's last address and port, where its replies go
+    peers: Vec<Option<SocketAddr>>,
+    replies: bool,
     to_link: u64,
     to_remote: u64,
     denied: u64,
     send_errors: u64,
+}
+
+impl RuleState<'_> {
+    fn count(&mut self, toward_link: bool) {
+        if toward_link {
+            self.to_link += 1;
+        } else {
+            self.to_remote += 1;
+        }
+    }
 }
 
 /// The time as Python's json module writes a float: the shortest form that reads back the
@@ -186,25 +246,44 @@ fn json_float(f: f64) -> String {
     }
 }
 
-fn health_json(time: f64, state: &[RuleState]) -> String {
-    let rows: Vec<String> = state
+/// Where a rule sends: the target on the link, or (link-to-remote) the remote.
+fn dest_of(rule: &RelayRule) -> String {
+    let (a, p) = if rule.link_initiated() { (&rule.remote, rule.remote_port) } else { (&rule.target, rule.target_port) };
+    if a.contains(':') {
+        format!("[{a}]:{p}")
+    } else {
+        format!("{a}:{p}")
+    }
+}
+
+fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)]) -> String {
+    let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
             format!(
-                "{{\"listen_port\": {}, \"target\": \"{}:{}\", \"to_link\": {}, \"to_remote\": {}, \"denied\": {}, \"send_errors\": {}}}",
-                s.rule.listen_port, s.rule.target, s.rule.target_port, s.to_link, s.to_remote, s.denied, s.send_errors
+                "{{\"listen_port\": {}, \"protocol\": \"udp\", \"direction\": \"{}\", \"target\": \"{}\", \"to_link\": {}, \"to_remote\": {}, \"denied\": {}, \"send_errors\": {}}}",
+                s.rule.listen_port, s.rule.direction, dest_of(s.rule), s.to_link, s.to_remote, s.denied, s.send_errors
             )
         })
         .collect();
+    rows.extend(tcp.iter().map(|(rule, c)| {
+        format!(
+            "{{\"listen_port\": {}, \"protocol\": \"tcp\", \"direction\": \"{}\", \"target\": \"{}\", {}}}",
+            rule.listen_port,
+            rule.direction,
+            dest_of(rule),
+            c.json()
+        )
+    }));
     format!("{{\"time\": {}, \"rules\": [{}]}}", json_float(time), rows.join(", "))
 }
 
-fn health(state: &[RuleState]) -> Result<(), String> {
+fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)]) -> Result<(), String> {
     let dir = std::path::Path::new(HEALTH).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| sys::oserror(&e, &dir.to_string_lossy()))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let tmp = format!("{HEALTH}.new");
-    let res = std::fs::write(&tmp, health_json(now, state))
+    let res = std::fs::write(&tmp, health_json(now, state, tcp))
         .map_err(|e| sys::oserror(&e, &tmp))
         .and_then(|_| std::fs::rename(&tmp, HEALTH).map_err(|e| sys::oserror(&e, &tmp)));
     if let Err(e) = res {
@@ -231,91 +310,147 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     let r = cfg.relay.as_ref().unwrap();
     let link_ip = r.link_address.split('/').next().unwrap_or_default();
     let link_addr: IpAddr = link_ip.parse().map_err(|_| format!("bad link address {link_ip}"))?;
+    let ip = |s: &str| -> Result<IpAddr, String> { s.parse().map_err(|_| format!("bad address {s}")) };
     let mut state: Vec<RuleState> = Vec::new();
+    let mut tcp: Vec<(&RelayRule, Arc<relay_tcp::Counters>)> = Vec::new();
     for rule in &r.rules {
-        let any: IpAddr = if rule.remote.contains(':') { "::".parse().unwrap() } else { "0.0.0.0".parse().unwrap() };
-        let remote_sock = bound(&r.remote_interface, any, rule.listen_port).map_err(|e| sys::strerror(&e))?;
-        let link_sock = bound(&r.link_interface, link_addr, 0).map_err(|e| sys::strerror(&e))?;
+        let l2r = rule.link_initiated();
+        let remote = ip(&rule.remote)?;
+        let (clients, dest) = if l2r {
+            (rule.sources.iter().map(|s| ip(s)).collect::<Result<Vec<_>, _>>()?, SocketAddr::new(remote, rule.remote_port))
+        } else {
+            (vec![remote], SocketAddr::new(ip(&rule.target)?, rule.target_port))
+        };
+        let shown = if l2r {
+            format!(
+                "{} -> {link_ip}:{} on {} => {} -> {} on {} ({} {})",
+                rule.sources.join(","),
+                rule.listen_port,
+                r.link_interface,
+                r.remote_interface,
+                dest_of(rule),
+                r.remote_interface,
+                rule.protocol,
+                rule.direction
+            )
+        } else {
+            format!(
+                "{} -> {}:{} => {link_ip} -> {} on {} ({} {})",
+                rule.remote,
+                r.remote_interface,
+                rule.listen_port,
+                dest_of(rule),
+                r.link_interface,
+                rule.protocol,
+                rule.direction
+            )
+        };
+        if rule.protocol == "tcp" {
+            let c = relay_tcp::start(r, rule, link_addr, clients, dest)?;
+            tcp.push((rule, c));
+            println!("goatrope relay: {shown}");
+            continue;
+        }
+        let (listen, outs) = if l2r {
+            let listen = bound(&r.link_interface, link_addr, rule.listen_port).map_err(|e| sys::strerror(&e))?;
+            let outs = clients.iter().map(|_| bound(&r.remote_interface, any_of(remote), 0)).collect::<io::Result<Vec<_>>>();
+            (listen, outs.map_err(|e| sys::strerror(&e))?)
+        } else {
+            let listen = bound(&r.remote_interface, any_of(remote), rule.listen_port).map_err(|e| sys::strerror(&e))?;
+            (listen, vec![bound(&r.link_interface, link_addr, 0).map_err(|e| sys::strerror(&e))?])
+        };
+        let n = clients.len();
         state.push(RuleState {
             rule,
-            remote: rule.remote.parse().ok(),
-            target: rule.target.parse().ok(),
-            remote_sock,
-            link_sock,
-            peer: None,
+            clients,
+            dest: Some(dest),
+            listen,
+            outs,
+            peers: vec![None; n],
+            replies: l2r || rule.direction == "both",
             to_link: 0,
             to_remote: 0,
             denied: 0,
             send_errors: 0,
         });
-        println!(
-            "goatrope relay: {} -> {}:{} => {link_ip} -> {}:{} on {} ({})",
-            rule.remote, r.remote_interface, rule.listen_port, rule.target, rule.target_port, r.link_interface, rule.direction
-        );
+        println!("goatrope relay: {shown}");
     }
-    health(&state)?; // at once, so a service manager sees it running
+    // each polled socket: (rule state, None for its listening socket or Some(client) for an outgoing one)
+    let slots: Vec<(usize, Option<usize>)> = state
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| std::iter::once((i, None)).chain((0..s.outs.len()).map(move |k| (i, Some(k)))))
+        .collect();
+    health(&state, &tcp)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut last_denied_log: Option<Instant> = None;
     let mut buf = vec![0u8; 65535];
     loop {
-        let mut fds: Vec<libc::pollfd> = state
+        let mut fds: Vec<libc::pollfd> = slots
             .iter()
-            .flat_map(|s| [s.remote_sock.as_raw_fd(), s.link_sock.as_raw_fd()])
+            .map(|&(i, o)| match o {
+                None => state[i].listen.as_raw_fd(),
+                Some(k) => state[i].outs[k].as_raw_fd(),
+            })
             .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
             .collect();
-        // SAFETY: fds is a valid array of pollfd of the length given.
+        // SAFETY: fds is a valid array of pollfd of the length given (poll with none is a sleep).
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
         if n > 0 {
-            for (i, pfd) in fds.iter().enumerate() {
+            for (j, pfd) in fds.iter().enumerate() {
                 if pfd.revents == 0 {
                     continue;
                 }
-                let st = &mut state[i / 2];
-                let from_remote = i % 2 == 0;
-                let sock = if from_remote { &st.remote_sock } else { &st.link_sock };
+                let (i, out) = slots[j];
+                let st = &mut state[i];
+                let l2r = st.rule.link_initiated();
+                let sock = match out {
+                    None => &st.listen,
+                    Some(k) => &st.outs[k],
+                };
                 let Ok((len, src)) = sock.recv_from(&mut buf) else {
                     continue;
                 };
                 let data = &buf[..len];
                 let rule = st.rule;
-                if from_remote {
-                    if Some(src.ip()) != st.remote {
-                        st.denied += 1;
-                        if last_denied_log.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
-                            println!("denied: {}:{} -> port {} (allowed: {})", src.ip(), src.port(), rule.listen_port, rule.remote);
-                            last_denied_log = Some(Instant::now());
-                        }
-                        continue;
-                    }
-                    st.peer = Some(src);
-                    let to = match st.target {
-                        Some(t) => SocketAddr::new(t, rule.target_port),
-                        None => {
+                match out {
+                    None => {
+                        let Some(c) = st.clients.iter().position(|a| *a == src.ip()) else {
+                            st.denied += 1;
+                            if last_denied_log.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+                                let allowed = if l2r { rule.sources.join(", ") } else { rule.remote.clone() };
+                                println!("denied: {}:{} -> port {} (allowed: {allowed})", src.ip(), src.port(), rule.listen_port);
+                                last_denied_log = Some(Instant::now());
+                            }
+                            continue;
+                        };
+                        st.peers[c] = Some(src);
+                        let Some(to) = st.dest else {
                             st.send_errors += 1;
                             continue;
+                        };
+                        match st.outs[c].send_to(data, to) {
+                            Ok(_) => st.count(!l2r),
+                            // dropped and counted; the relay keeps running
+                            Err(_) => st.send_errors += 1,
                         }
-                    };
-                    match st.link_sock.send_to(data, to) {
-                        Ok(_) => st.to_link += 1,
-                        // dropped and counted; the relay keeps running
-                        Err(_) => st.send_errors += 1,
                     }
-                } else {
-                    let from_target = Some(src.ip()) == st.target && src.port() == rule.target_port;
-                    let Some(peer) = st.peer.filter(|_| rule.direction == "both" && from_target) else {
-                        st.denied += 1;
-                        continue;
-                    };
-                    match st.remote_sock.send_to(data, peer) {
-                        Ok(_) => st.to_remote += 1,
-                        // the tunnel is down or the peer has no endpoint: dropped and counted
-                        Err(_) => st.send_errors += 1,
+                    Some(k) => {
+                        let Some(peer) = st.peers[k].filter(|_| st.replies && Some(src) == st.dest) else {
+                            st.denied += 1;
+                            continue;
+                        };
+                        match st.listen.send_to(data, peer) {
+                            Ok(_) => st.count(l2r),
+                            // the tunnel is down or the peer has no endpoint: dropped and counted
+                            Err(_) => st.send_errors += 1,
+                        }
                     }
                 }
             }
         }
         if last.elapsed() >= Duration::from_secs(2) {
-            health(&state)?;
+            health(&state, &tcp)?;
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
@@ -337,7 +472,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
 
 pub fn banner(r: &Relay) -> String {
     format!(
-        "relay: default deny. It forwards only the {} declared rule(s) from {} to machines on {}, from its own address {}; everything else is dropped and counted.",
+        "relay: default deny. It forwards only the {} declared rule(s) between {} and machines on {}, from its own address {}; everything else is dropped and counted.",
         r.rules.len(),
         r.remote_interface,
         r.link_interface,
@@ -452,23 +587,72 @@ pub fn status(cfg: &Config) {
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
     }
     for rule in &r.rules {
-        let replies = if rule.direction == "both" { ", and the target's replies back" } else { "" };
-        println!(
-            "  rule   {} port {}: from {} to {}:{}{replies}",
-            rule.protocol, rule.listen_port, rule.remote, rule.target, rule.target_port
-        );
-        let row = health
-            .as_ref()
-            .and_then(|(v, _)| v["rules"].as_array()?.iter().find(|x| x["listen_port"].as_u64() == Some(rule.listen_port as u64)).cloned());
+        let line = match (rule.link_initiated(), rule.protocol.as_str()) {
+            (true, "tcp") => format!(
+                "tcp port {} on {}: connections from {} go to {} (at most {} at once)",
+                rule.listen_port,
+                r.link_interface,
+                rule.sources.join(", "),
+                dest_of(rule),
+                rule.max_connections
+            ),
+            (true, _) => format!(
+                "udp port {} on {}: datagrams from {} go to {}, and its replies back",
+                rule.listen_port,
+                r.link_interface,
+                rule.sources.join(", "),
+                dest_of(rule)
+            ),
+            (false, "tcp") => format!(
+                "tcp port {}: connections from {} go to {} (at most {} at once)",
+                rule.listen_port,
+                rule.remote,
+                dest_of(rule),
+                rule.max_connections
+            ),
+            (false, _) => format!(
+                "udp port {}: from {} to {}{}",
+                rule.listen_port,
+                rule.remote,
+                dest_of(rule),
+                if rule.direction == "both" { ", and the target's replies back" } else { "" }
+            ),
+        };
+        println!("  rule   {line}");
+        let row = health.as_ref().and_then(|(v, _)| {
+            v["rules"]
+                .as_array()?
+                .iter()
+                .find(|x| {
+                    x["listen_port"].as_u64() == Some(rule.listen_port as u64)
+                        && x["protocol"].as_str().unwrap_or("udp") == rule.protocol
+                        && x["direction"].as_str().is_none_or(|d| d == rule.direction)
+                })
+                .cloned()
+        });
         if let Some(x) = row {
             let n = |k: &str| x[k].as_u64().unwrap_or(0);
-            println!(
-                "         {} sent to the link, {} sent back to the remote, {} denied, {} could not be sent",
-                n("to_link"),
-                n("to_remote"),
-                n("denied"),
-                n("send_errors")
-            );
+            if rule.protocol == "tcp" {
+                println!(
+                    "         {} open now, {} accepted, {} bytes to the link, {} bytes to the remote, {} denied, {} over the limit, {} could not connect, {} broken",
+                    n("connections"),
+                    n("accepted"),
+                    n("bytes_to_link"),
+                    n("bytes_to_remote"),
+                    n("denied"),
+                    n("over_limit"),
+                    n("send_errors"),
+                    n("broken")
+                );
+            } else {
+                println!(
+                    "         {} sent to the link, {} sent to the remote, {} denied, {} could not be sent",
+                    n("to_link"),
+                    n("to_remote"),
+                    n("denied"),
+                    n("send_errors")
+                );
+            }
         }
     }
 }
