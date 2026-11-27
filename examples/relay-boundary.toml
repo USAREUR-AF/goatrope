@@ -6,7 +6,6 @@
 schema = 1
 
 [relay]
-wip = true
 transport = "boundary"
 remote_interface = "grb0"          # goatrope's boundary interface; made by `goatrope boundary up` or the relay
 link_interface = "eth1"            # the sensor's network, an interface of its own

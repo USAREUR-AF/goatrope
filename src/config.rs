@@ -928,7 +928,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         r,
         w,
         &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow"],
-        &["wip", "remote_interface", "link_interface", "link_address", "allow"],
+        &["remote_interface", "link_interface", "link_address", "allow"],
     )?;
     let transport = match r.get("transport") {
         None => "mesh".to_string(),
@@ -946,8 +946,9 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         return err(format!("{w}: [relay.boundary] applies only with transport = \"boundary\""));
     }
     let bnd = if transport == "boundary" { Some(boundary(&r["boundary"], &format!("{w}.boundary"))?) } else { None };
-    if r["wip"].as_bool() != Some(true) {
-        return err(format!("{w}.wip must be true: the relay is work in progress and transmits on the link"));
+    // `wip` was required while the relay was work in progress; it is still accepted and does nothing
+    if r.get("wip").is_some_and(|v| v.as_bool().is_none()) {
+        return err(format!("{w}.wip must be true or false; it is no longer needed and does nothing"));
     }
     let remote_if = ifname(&r["remote_interface"], &format!("{w}.remote_interface"))?;
     let link_if = ifname(&r["link_interface"], &format!("{w}.link_interface"))?;
@@ -1109,6 +1110,23 @@ files = 4
         assert!(e(&INLINE.replace("[\"tp0\", \"tp1\"]", "[\"tp0\", \"tp0\"]")).contains("listed twice"));
         assert!(e(&(INLINE.to_string() + "\n[tap.extra]\nx = 1\n")).contains("unknown key"));
         assert!(e(&INLINE.replace("filter = \"\"", "filter = \"udp' or 1\"")).contains("quote"));
+    }
+
+    const RELAY: &str = r#"schema = 1
+[relay]
+remote_interface = "wg0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [{ direction = "both", protocol = "udp", remote = "198.51.100.5", listen_port = 7000, target = "192.0.2.2", target_port = 7000 }]
+"#;
+
+    #[test]
+    fn relay_wip_is_optional_and_does_nothing() {
+        assert!(parse(RELAY, "x.toml").unwrap().tap.is_none());
+        let with = |v: &str| RELAY.replace("[relay]\n", &format!("[relay]\nwip = {v}\n"));
+        assert!(parse(&with("true"), "x.toml").is_ok());
+        assert!(parse(&with("false"), "x.toml").is_ok());
+        assert!(e(&with("\"yes\"")).contains("wip must be true or false"));
     }
 
     #[test]

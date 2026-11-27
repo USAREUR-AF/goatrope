@@ -319,6 +319,23 @@ pub fn units(cfg: &Config) -> Vec<String> {
     u
 }
 
+/// Every file install writes for this declaration: the tap's (when it has a [tap]), the relay's
+/// unit and decode-and-send's; and the mode of each file not written 0644.
+fn all_files(cfg: &Config, nm_present: bool) -> (BTreeMap<String, String>, std::collections::HashMap<String, u32>) {
+    let mut files = if cfg.tap.is_some() { render(cfg, nm_present) } else { BTreeMap::new() };
+    files.extend(crate::relay::render(cfg));
+    let (sfiles, modes) = send::render(cfg);
+    files.extend(sfiles);
+    (files, modes)
+}
+
+fn all_units(cfg: &Config) -> Vec<String> {
+    let mut u = if cfg.tap.is_some() { units(cfg) } else { vec![] };
+    u.extend(crate::relay::units(cfg));
+    u.extend(send::units(cfg));
+    u
+}
+
 // ---------------------------------------------------------------- refusals
 
 fn os_release() -> BTreeMap<String, String> {
@@ -345,8 +362,8 @@ fn dir_size(d: &str) -> f64 {
     fs::read_dir(d).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len() as f64).sum()).unwrap_or(0.0)
 }
 
-pub fn preflight(cfg: &Config) -> R<()> {
-    let tap = tap_of(cfg);
+/// The machine goatrope runs on, for every role.
+fn platform() -> R<()> {
     let osr = os_release();
     if osr.get("ID").map(String::as_str) != Some("ubuntu")
         || !matches!(osr.get("VERSION_ID").map(String::as_str), Some("24.04") | Some("26.04"))
@@ -358,6 +375,12 @@ pub fn preflight(cfg: &Config) -> R<()> {
     if m != "aarch64" && m != "x86_64" {
         return refuse(format!("architecture {m} is not supported (arm64 and amd64 are)"));
     }
+    Ok(())
+}
+
+pub fn preflight(cfg: &Config) -> R<()> {
+    let tap = tap_of(cfg);
+    platform()?;
     for tool in ["tcpdump", "ethtool", "tc", "ip", "ss", "networkctl", "systemctl"] {
         if !su::have(tool) {
             return refuse(format!("{tool} is not installed: sudo apt-get install -y tcpdump ethtool iproute2 systemd"));
@@ -714,6 +737,10 @@ fn install_software() -> std::io::Result<()> {
 }
 
 fn refuse_all(cfg: &Config) -> R<()> {
+    if cfg.tap.is_none() {
+        // a relay alone: the relay checks its own interfaces when it starts, and a refusal leaves its unit failed
+        return platform();
+    }
     preflight(cfg)?;
     let bad = send::refuse_tap_routes(cfg);
     if !bad.is_empty() {
@@ -753,11 +780,13 @@ pub fn deploy(cfg: &Config, dry_run: bool) -> R<&'static str> {
 pub fn install(cfg: &Config) -> R<()> {
     let prior = load_state()?;
     refuse_all(cfg)?;
-    let tap = tap_of(cfg);
+    if cfg.tap.is_none() && prior.as_ref().is_some_and(|p| p.get("mode").is_some_and(|m| m.is_string())) {
+        return refuse(
+            "the installed declaration has a [tap] and this one has none; run goatrope uninstall first, so the tap ports are restored",
+        );
+    }
     let nm_present = Path::new("/etc/NetworkManager").is_dir();
-    let mut files = render(cfg, nm_present);
-    let (sfiles, modes) = send::render(cfg);
-    files.extend(sfiles);
+    let (files, modes) = all_files(cfg, nm_present);
 
     let mut state = prior.unwrap_or_else(|| {
         json!({
@@ -772,7 +801,8 @@ pub fn install(cfg: &Config) -> R<()> {
     if !state["created_dirs"].is_array() {
         state["created_dirs"] = json!([]);
     }
-    if tap.erspan.is_some() {
+    let tap_cfg = cfg.tap.as_ref();
+    if let Some(tap) = tap_cfg.filter(|t| t.erspan.is_some()) {
         let p = tap.ports[0].clone();
         let mut made: Vec<Value> = state["created_links"].as_array().cloned().unwrap_or_default();
         if !su::exists(&p) && !made.contains(&json!(p)) {
@@ -780,7 +810,7 @@ pub fn install(cfg: &Config) -> R<()> {
         }
         state["created_links"] = Value::Array(made);
     }
-    for p in &tap.ports {
+    for p in tap_cfg.map(|t| t.ports.as_slice()).unwrap_or_default() {
         // first sight of a port: remember how it was (a link goatrope makes is removed instead)
         let made = state["created_links"].as_array().map(|a| a.contains(&json!(p))).unwrap_or(false);
         if state["ports"].get(p).is_none() && !made {
@@ -788,14 +818,22 @@ pub fn install(cfg: &Config) -> R<()> {
         }
     }
     state["version"] = json!(crate::version());
-    state["mode"] = json!(tap.mode);
-    state["record_directory"] = json!(tap.record.directory);
+    if let Some(tap) = tap_cfg {
+        state["mode"] = json!(tap.mode);
+        state["record_directory"] = json!(tap.record.directory);
+    }
+    // uninstall removes a boundary interface the relay made
+    state["relay"] = match &cfg.relay {
+        Some(r) => json!({"transport": r.transport, "remote_interface": r.remote_interface}),
+        None => Value::Null,
+    };
     let stale: Vec<String> = state["files"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|f| !files.contains_key(*f)).map(String::from).collect())
         .unwrap_or_default();
 
-    let mut dirs: Vec<String> = vec![STATE_DIR.into(), ETC.into(), tap.record.directory.clone()];
+    let mut dirs: Vec<String> = vec![STATE_DIR.into(), ETC.into()];
+    dirs.extend(tap_cfg.map(|t| t.record.directory.clone()));
     let mut parents: Vec<String> = files.keys().filter_map(|f| Path::new(f).parent().map(|p| p.to_string_lossy().to_string())).collect();
     parents.sort();
     parents.dedup();
@@ -803,12 +841,12 @@ pub fn install(cfg: &Config) -> R<()> {
     for d in &dirs {
         makedirs(d, &mut state).map_err(io)?; // every directory install creates is in the state before anything is written
     }
-    if let Some((uid, gid)) = ids_of("tcpdump") {
+    if let (Some(tap), Some((uid, gid))) = (tap_cfg, ids_of("tcpdump")) {
         let c = std::ffi::CString::new(tap.record.directory.as_str()).unwrap();
         // SAFETY: c is a NUL-terminated path.
         unsafe { libc::chown(c.as_ptr(), uid, gid) };
     }
-    {
+    if let Some(tap) = tap_cfg {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tap.record.directory, fs::Permissions::from_mode(0o750));
     }
@@ -833,8 +871,7 @@ pub fn install(cfg: &Config) -> R<()> {
     for (path, content) in &files {
         su::write_file(path, content, *modes.get(path).unwrap_or(&0o644)).map_err(io)?;
     }
-    let mut want_units = units(cfg);
-    want_units.extend(send::units(cfg));
+    let want_units = all_units(cfg);
     if let Some(old) = state["units"].as_array() {
         for u in old.iter().filter_map(|v| v.as_str()) {
             if !want_units.iter().any(|w| w == u) {
@@ -846,6 +883,19 @@ pub fn install(cfg: &Config) -> R<()> {
     save_state(&state).map_err(io)?;
 
     su::systemctl(&["daemon-reload"]);
+    if let Some(tap) = tap_cfg {
+        install_tap(cfg, tap, nm_present);
+    }
+    if cfg.relay.is_some() {
+        su::systemctl(&["enable", crate::relay::UNIT]);
+        su::systemctl(&["restart", crate::relay::UNIT]);
+        crate::relay::settle(cfg, 5.0);
+    }
+    Ok(())
+}
+
+/// The tap's part of install, after its files are written: the ports, the bridge, the recorders.
+fn install_tap(cfg: &Config, tap: &Tap, nm_present: bool) {
     su::run(&["sysctl", "-q", "-p", SYSCTL]);
     if nm_present && su::nm_active() {
         su::run(&["nmcli", "general", "reload", "conf"]); // NetworkManager lets go of the tap ports now, not at reboot
@@ -877,7 +927,6 @@ pub fn install(cfg: &Config) -> R<()> {
     send::start(cfg);
     su::systemctl(&["daemon-reexec"]); // applies the watchdog setting
     settle(cfg);
-    Ok(())
 }
 
 // ---------------------------------------------------------------- uninstall
@@ -906,6 +955,12 @@ pub fn uninstall(purge: bool) -> R<()> {
         }
     }
     su::systemctl(&["daemon-reload"]);
+    if s(&state["relay"], "transport") == Some("boundary") {
+        if let Some(ifname) = s(&state["relay"], "remote_interface") {
+            let _ = crate::boundary::down(ifname); // the relay's own interface; a mesh interface is never touched
+        }
+    }
+    remove(crate::relay::HEALTH);
     if su::nm_active() {
         su::run(&["nmcli", "general", "reload", "conf"]);
     }
@@ -1027,9 +1082,6 @@ pub fn uninstall(purge: bool) -> R<()> {
     }
     remove(STATE);
     remove(&format!("{STATE}.bak"));
-    if purge {
-        remove(&format!("{STATE_DIR}/relay.health"));
-    }
     // Directories install created, deepest first, when empty.
     let mut created: Vec<String> =
         state["created_dirs"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).map(String::from).collect()).unwrap_or_default();
@@ -1109,7 +1161,6 @@ fn read_or(path: &str, d: &str) -> String {
 
 /// Every property the declaration implies, compared with the machine. ok is true, false or None (info).
 pub fn check(cfg: &Config) -> Vec<Item> {
-    let tap = tap_of(cfg);
     let mut items = Vec::new();
     let state = load_state().ok().flatten();
     item(&mut items, "installed", Some(state.is_some()), "goatrope state present", if state.is_some() { "present" } else { "absent" });
@@ -1117,8 +1168,7 @@ pub fn check(cfg: &Config) -> Vec<Item> {
     let v = crate::version();
     item(&mut items, "software", Some(inst.as_deref() == Some(v.as_str())), v.clone(), inst.unwrap_or_else(|| "absent".into()));
     let nm_present = Path::new("/etc/NetworkManager").is_dir();
-    let mut expected = render(cfg, nm_present);
-    expected.extend(send::render(cfg).0);
+    let expected = all_files(cfg, nm_present).0;
     for (path, content) in &expected {
         let have = su::read(path);
         let same = have.as_deref() == Some(content.trim());
@@ -1136,14 +1186,32 @@ pub fn check(cfg: &Config) -> Vec<Item> {
             },
         );
     }
-    let mut all_units = units(cfg);
-    all_units.extend(send::units(cfg));
-    for unit in &all_units {
+    for unit in &all_units(cfg) {
         let a = su::unit_active(unit);
         item(&mut items, format!("unit:{unit}"), Some(a == "active"), "active", a);
         let e = su::unit_enabled(unit);
         item(&mut items, format!("enabled:{unit}"), Some(e == "enabled"), "enabled", e);
     }
+    if let Some(tap) = &cfg.tap {
+        items.extend(check_tap(cfg, tap));
+    }
+    items.extend(crate::relay::check(cfg));
+    let src = su::run(&["findmnt", "-no", "SOURCE", "/"]).stdout.trim().to_string();
+    let crypt = su::run(&["lsblk", "-no", "TYPE", "-s", &src]).stdout.contains("crypt");
+    item(
+        &mut items,
+        "root-encryption",
+        None,
+        "encrypted root (deferred; not a check yet)",
+        if crypt { "dm-crypt" } else { "not encrypted (or not detected)" },
+    );
+    items.extend(send::check(cfg));
+    items
+}
+
+/// What a [tap] implies: networkd, the ports, the bridge, the rings, the watchdog.
+fn check_tap(cfg: &Config, tap: &Tap) -> Vec<Item> {
+    let mut items = Vec::new();
     let a = su::unit_active("systemd-networkd.service");
     item(&mut items, "unit:systemd-networkd.service", Some(a == "active"), "active", a);
 
@@ -1383,16 +1451,6 @@ pub fn check(cfg: &Config) -> Vec<Item> {
             if clash.is_empty() { "none".into() } else { clash.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") },
         );
     }
-    let src = su::run(&["findmnt", "-no", "SOURCE", "/"]).stdout.trim().to_string();
-    let crypt = su::run(&["lsblk", "-no", "TYPE", "-s", &src]).stdout.contains("crypt");
-    item(
-        &mut items,
-        "root-encryption",
-        None,
-        "encrypted root (deferred; not a check yet)",
-        if crypt { "dm-crypt" } else { "not encrypted (or not detected)" },
-    );
-    items.extend(send::check(cfg));
     items
 }
 
@@ -1454,7 +1512,7 @@ pub fn check_json(cfg: &Config, items: &[Item], bad: bool) -> String {
         &[
             ("goatrope", send::json_str(&crate::version())),
             ("config", send::json_str(&cfg.path)),
-            ("mode", send::json_str(&tap_of(cfg).mode)),
+            ("mode", send::json_str(cfg.tap.as_ref().map(|t| t.mode.as_str()).unwrap_or("relay"))),
             ("result", send::json_str(if bad { "differs" } else { "match" })),
             ("items", items_s),
         ],
@@ -1465,8 +1523,26 @@ pub fn check_json(cfg: &Config, items: &[Item], bad: bool) -> String {
 // ---------------------------------------------------------------- status
 
 pub fn status(cfg: &Config) -> i32 {
-    let tap = tap_of(cfg);
     println!("goatrope {}  config {}", crate::version(), cfg.path);
+    if let Some(tap) = &cfg.tap {
+        status_tap(tap);
+    }
+    if let Some(r) = &cfg.relay {
+        println!("{}", crate::relay::banner(r));
+        crate::relay::status(cfg);
+    }
+    send::status(cfg);
+    let items = check(cfg);
+    let bad = items.iter().filter(|i| i.ok == Some(false)).count();
+    if bad == 0 {
+        println!("  check  match");
+    } else {
+        println!("  check  differs in {bad} of {} items (goatrope check)", items.len());
+    }
+    0
+}
+
+fn status_tap(tap: &Tap) {
     println!("{}", banner(tap));
     for p in &tap.ports {
         if !su::exists(p) {
@@ -1529,13 +1605,4 @@ pub fn status(cfg: &Config) -> i32 {
             pystr(&filter)
         );
     }
-    send::status(cfg);
-    let items = check(cfg);
-    let bad = items.iter().filter(|i| i.ok == Some(false)).count();
-    if bad == 0 {
-        println!("  check  match");
-    } else {
-        println!("  check  differs in {bad} of {} items (goatrope check)", items.len());
-    }
-    0
 }
