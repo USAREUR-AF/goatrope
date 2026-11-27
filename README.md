@@ -257,6 +257,11 @@ lose up to the last second of frames that tcpdump had not yet written.
 Not tested: real hardware (a Raspberry Pi, USB adapters, a passive tap), the Pi's
 own watchdog, forced link speed (veth cannot be forced), and recording throughput.
 
+`bench`, in a container of its own after the others, measures the data paths: relay UDP
+over real WireGuard, the remote mirror, and decode-and-send with a converter. It records
+numbers and passes or fails nothing; [performance.md](docs/performance.md) has the method
+and the results.
+
 ## Layout
 
 | Path | Holds |
@@ -265,7 +270,7 @@ own watchdog, forced link speed (veth cannot be forced), and recording throughpu
 | `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `relay.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
-| `tests/netns/` | the namespace tests and their container |
+| `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |
 | `tools/` | `build-release.sh` (the archive and SHA256SUMS), `check-release.sh` (the release is exactly its three files) |
 | `docs/` | ADRs, hardware, install card |
 

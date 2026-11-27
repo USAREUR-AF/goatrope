@@ -2154,6 +2154,298 @@ print(json.dumps(sorted(got)))
 PHASES["erspan"] = phase_erspan
 
 
+# ---------------------------------------------------------------- bench: data-path ceilings (docs/performance.md)
+
+BENCH_SECONDS = float(os.environ.get("GOATROPE_BENCH_SECONDS", "2"))
+BENCH_STEPS = int(os.environ.get("GOATROPE_BENCH_STEPS", "6"))
+BENCHGEN = os.path.join(SRC, "tests", "netns", "benchgen.py")
+
+
+def host_line() -> str:
+    cpu = next((ln.split(":", 1)[1].strip() for ln in open("/proc/cpuinfo") if ln.startswith("model name")), "unknown")
+    load = open("/proc/loadavg").read().split()[0]
+    return f"{cpu}, {os.cpu_count()} threads, kernel {os.uname().release}, load {load}"
+
+
+def bench(name: str, detail: str, values: dict) -> None:
+    """A measurement: printed and recorded, never a pass or a failure."""
+    line = f"bench - {name}  [{detail}]"
+    print(line, flush=True)
+    RESULTS.append({"result": "bench", "name": name, "detail": detail, "values": values, "host": host_line()})
+
+
+def ns_prefix(ns: str) -> list[str]:
+    return ["ip", "netns", "exec", ns] if ns else []
+
+
+def udp_drops(ns: str) -> int:
+    """RcvbufErrors of the namespace's UDP: datagrams a socket's full buffer dropped."""
+    lines = [ln.split() for ln in sh(" ".join(ns_prefix(ns) + ["cat", "/proc/net/snmp"])).stdout.splitlines() if ln.startswith("Udp:")]
+    return int(dict(zip(lines[0][1:], lines[1][1:])).get("RcvbufErrors", 0))
+
+
+def gen(ns: str, *args) -> dict:
+    p = subprocess.run(ns_prefix(ns) + [sys.executable, "-I", BENCHGEN] + [str(a) for a in args], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"benchgen {args[0]}: {p.stderr.strip()[-300:]}")
+    return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+class Sink:
+    def __init__(self, ns: str, bind: str, port: int, seconds: float, run: int):
+        self.p = subprocess.Popen(ns_prefix(ns) + [sys.executable, "-I", BENCHGEN, "udp-sink", bind, str(port), str(seconds), str(run)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ready = self.p.stdout.readline()
+        if "ready" not in ready:
+            raise RuntimeError(f"udp-sink did not start: {self.p.stderr.read()[-300:]}")
+
+    def result(self) -> dict:
+        out, err = self.p.communicate(timeout=120)
+        if self.p.returncode != 0:
+            raise RuntimeError(f"udp-sink: {err.strip()[-300:]}")
+        return json.loads(out.strip().splitlines()[-1])
+
+
+RUN = [0]
+
+
+def next_run() -> int:
+    RUN[0] += 1
+    return RUN[0]
+
+
+def ceiling(trial, threshold: float) -> dict:
+    """The highest offered rate whose loss is at most `threshold`: one unpaced trial, then a binary search
+    between 0 and the unpaced rate. trial(rate) returns a dict with sent, received and offered_per_s."""
+    top = trial(0)
+    top["loss"] = 1 - top["received"] / max(1, top["sent"])
+    if top["loss"] <= threshold:
+        return {"rate": top["offered_per_s"], "loss": top["loss"], "unpaced": top, "trials": 1, "generator_bound": True}
+    lo, hi, best, trials = 0.0, float(top["offered_per_s"]), None, 1
+    for _ in range(BENCH_STEPS):
+        mid = (lo + hi) / 2
+        t = trial(mid)
+        trials += 1
+        t["loss"] = 1 - t["received"] / max(1, t["sent"])
+        if t["loss"] <= threshold:
+            lo, best = mid, t
+        else:
+            hi = mid
+    return {"rate": best["offered_per_s"] if best else 0, "loss": best["loss"] if best else None, "unpaced": top,
+            "trials": trials, "generator_bound": False}
+
+
+def fmt(n) -> str:
+    return f"{int(round(n)):,}"
+
+
+def bench_relay_udp() -> None:
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 net.ipv6.conf.all.forwarding=0")
+    # Fragments of a datagram the overloaded tunnel half-dropped hold reassembly memory for ipfrag_time (30 s by
+    # default), and every later fragmented datagram is then dropped; 2 s keeps one trial from spoiling the next.
+    sh("sysctl -qw net.ipv4.ipfrag_time=2")
+    sh("ip netns exec remote sysctl -qw net.ipv4.ipfrag_time=2")
+    write_cfg(RELAY)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    time.sleep(2)
+    D = BENCH_SECONDS
+
+    def trial_path(path: str, size: int):
+        def trial(rate: float) -> dict:
+            run = next_run()
+            if path == "wireguard":  # the generator and WireGuard alone: a socket on the relay machine, no relay
+                sink = Sink("", "10.99.0.1", 7100, D, run)
+                port = 7100
+            else:
+                sink = Sink("linkhost", "192.0.2.2", 7002, D, run)
+                port = 7002
+            d0 = udp_drops("")
+            s = gen("remote", "udp-send", "10.99.0.2", "10.99.0.1", port, size, rate, D, run, "wga")
+            r = sink.result()
+            time.sleep(0.5)
+            return s | {"received": r["received"], "p50_us": r["p50_us"], "p99_us": r["p99_us"],
+                        "relay_socket_drops": udp_drops("") - d0}
+        return trial
+
+    for size in (64, 512, 1400):
+        base = ceiling(trial_path("wireguard", size), 0.001)
+        rel = ceiling(trial_path("relay", size), 0.001)
+        lat_b = trial_path("wireguard", size)(10000)
+        lat_r = trial_path("relay", size)(10000)
+        add50 = round(lat_r["p50_us"] - lat_b["p50_us"], 1) if lat_r["p50_us"] is not None and lat_b["p50_us"] is not None else None
+        add99 = round(lat_r["p99_us"] - lat_b["p99_us"], 1) if lat_r["p99_us"] is not None and lat_b["p99_us"] is not None else None
+        un = rel["unpaced"]
+        frag = ", two fragments in the tunnel (WireGuard MTU 1,420)" if size + 28 > 1420 else ""
+        bench(f"relay UDP {size}-byte payload{frag}: {fmt(rel['rate'])} datagrams/s with loss under 0.1 %",
+              f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'] / max(un['seconds'], 1e-9))} delivered/s, "
+              f"{fmt(un['relay_socket_drops'])} dropped at the relay's socket; WireGuard alone (no relay) "
+              f"{fmt(base['rate'])}/s{' (generator-bound)' if base['generator_bound'] else ''}; "
+              f"latency at 10,000/s: relay path p50 {lat_r['p50_us']} us p99 {lat_r['p99_us']} us, WireGuard alone "
+              f"p50 {lat_b['p50_us']} us p99 {lat_b['p99_us']} us, added p50 {add50} us p99 {add99} us; "
+              f"{rel['trials']} trials of {D:g} s; {host_line()}",
+              {"path": "relay-udp", "size": size, "rate": rel["rate"], "loss": rel["loss"], "unpaced": un,
+               "wireguard_alone_rate": base["rate"], "wireguard_alone_generator_bound": base["generator_bound"],
+               "latency_relay": [lat_r["p50_us"], lat_r["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
+               "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
+    relay.terminate()
+    relay.wait(timeout=10)
+
+
+def bench_mirror() -> None:
+    """tc mirred from a port to an ERSPAN type II interface over WireGuard, as ADR 0004 module 5 sets it up; the
+    collector is an ERSPAN interface at the far end of the tunnel, and its receive counter is the count."""
+    topo_listen()
+    sh("ip link del grbm1", check=False)
+    sh("ip link add grbm1 mtu 9000 type erspan seq key 1 local 10.99.0.1 remote 10.99.0.2 erspan_ver 1 erspan 1 nopmtudisc ignore-df")
+    sh("sysctl -qw net.ipv6.conf.grbm1.disable_ipv6=1 && ip link set grbm1 arp off && ip link set grbm1 up")
+    sh("ip -n remote link add grbc1 mtu 9000 type erspan seq key 1 local 10.99.0.2 remote 10.99.0.1 erspan_ver 1 erspan 1")
+    sh("ip netns exec remote sysctl -qw net.ipv6.conf.grbc1.disable_ipv6=1")
+    sh("ip -n remote link set grbc1 arp off && ip -n remote link set grbc1 up")
+    sh("ip link set tp0 up && sysctl -qw net.ipv6.conf.tp0.disable_ipv6=1")
+    sh("tc qdisc add dev tp0 clsact")
+    sh("tc filter add dev tp0 ingress pref 1001 handle 1 matchall action mirred egress mirror dev grbm1")
+    D = BENCH_SECONDS
+
+    def rx() -> int:
+        return int(sh("ip netns exec remote cat /sys/class/net/grbc1/statistics/rx_packets").stdout)
+
+    def trial_size(size: int):
+        def trial(rate: float) -> dict:
+            before = rx()
+            s = gen("feed", "raw-send", "f0", size, rate, D, next_run(), 5000)
+            time.sleep(1.5)
+            return s | {"received": rx() - before}
+        return trial
+
+    for size in (64, 512, 1514):
+        c = ceiling(trial_size(size), 0.0)
+        un = c["unpaced"]
+        frag = ", outer packet in two fragments" if size + 46 > 1420 else ""
+        bench(f"remote mirror {size}-byte frames{frag}: {fmt(c['rate'])} frames/s with 0 lost at the collector",
+              f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'])} of {fmt(un['sent'])} arrived; "
+              f"{c['trials']} trials of {D:g} s{'; generator-bound' if c['generator_bound'] else ''}; {host_line()}",
+              {"path": "mirror", "size": size, "rate": c["rate"], "unpaced": un, "generator_bound": c["generator_bound"],
+               "trial_seconds": D})
+    sh("tc qdisc del dev tp0 clsact", check=False)
+    sh("ip link del grbm1", check=False)
+
+
+class SinkArgs(Sink):
+    def __init__(self, ns: str, bind: str, port: int, seconds: float, run: int, idle: float, deadline: float):
+        self.p = subprocess.Popen(ns_prefix(ns) + [sys.executable, "-I", BENCHGEN, "udp-sink", bind, str(port), str(seconds),
+                                                   str(run), str(idle), str(deadline)],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if "ready" not in self.p.stdout.readline():
+            raise RuntimeError(f"udp-sink did not start: {self.p.stderr.read()[-300:]}")
+
+
+def converted_rate(r: dict) -> float:
+    """Messages per second between the first and the last that arrived."""
+    return (r["received"] - 1) / r["span_s"] if r["received"] > 1 and r["span_s"] > 0 else 0.0
+
+
+def bench_send_convert() -> None:
+    """[[send]] with a converter on a listen tap: frames into the tap port, converted messages counted at UDP."""
+    real = os.path.exists(f"{COMPONENTS}/goat-xf")
+    if real:
+        xf, frm, to, packs, which = f"{COMPONENTS}/goat-xf", "remote-id", "cot-xml", f"{COMPONENTS}/packs", "the real goat-xf"
+        sh(f"chmod -R go+rX {COMPONENTS}")
+    else:
+        os.makedirs("/opt/gt-test", exist_ok=True)
+        xf = "/opt/gt-test/fake-goat-xf"
+        with open(xf, "w") as f:
+            f.write("#!/bin/sh\n# stand-in for goat-xf convert: upper-cases the hex it reads\ntr a-f A-F\n")
+        os.chmod(xf, 0o755)
+        frm, to, packs, which = "a", "b", "/opt/gt-test", "the stand-in (a shell script running tr)"
+    pin = hashlib.sha256(open(xf, "rb").read()).hexdigest()
+    topo_listen()
+    write_cfg(LISTEN + f"""
+[[send]]
+name = "bench"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5000 }}
+convert = {{ component = "goat-transformers", binary = "{xf}", version = "bench", sha256 = "{pin}", from = "{frm}", to = "{to}", packs = "{packs}" }}
+to = ["udp://127.0.0.1:9201"]
+""")
+    stand_in_watchdog()
+    p = gr("install", "--config", CFG)
+    if p.returncode != 0:
+        bench("decode-and-send: not measured", f"install exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}", {})
+        return
+    for _ in range(30):
+        if sh("systemctl is-active goatrope-send@bench.service", check=False).stdout.strip() == "active":
+            break
+        time.sleep(1)
+    time.sleep(2)
+    D = max(BENCH_SECONDS * 4, 10.0)
+
+    def trial(rate: float) -> dict:
+        sh("systemctl restart goatrope-send@bench.service")  # an empty socket buffer for each trial
+        time.sleep(1.5)
+        sink = SinkArgs("", "127.0.0.1", 9201, D, 0, 6, D + 8)
+        s = gen("feed", "raw-send", "f0", 0, rate, D, next_run(), 5000, REMOTE_ID)
+        r = sink.result()
+        return s | {"received": r["received"], "span_s": r["span_s"]}
+
+    over = trial(0)
+    conv = converted_rate(over)
+    check = trial(conv * 0.9) if conv >= 5 else None
+    gr("uninstall", "--config", CFG)
+    at90 = (f"at 90 % of that rate, {fmt(check['received'])} of {fmt(check['sent'])} arrived" if check
+            else "too slow for a second trial at 90 %")
+    bench(f"decode-and-send, the converter run once per message: {conv:,.1f} messages/s converted and sent",
+          f"converter: {which}; {fmt(over['offered_per_s'])}/s offered for {D:g} s, {fmt(over['received'])} converted "
+          f"in {over['span_s']:g} s; {at90}; {host_line()}",
+          {"path": "send-convert", "option": "exec-per-message", "converter": "goat-xf" if real else "stand-in",
+           "rate": round(conv, 2), "unpaced": over, "at_90_percent": check, "trial_seconds": D})
+    pipe = f"{COMPONENTS}/goat-xf-pipe"
+    if real and os.path.exists(pipe):
+        bench_pipe(pipe, packs, D)
+
+
+def bench_pipe(pipe: str, packs: str, D: float) -> None:
+    """goat-xf-pipe, one long-lived process, converting what arrives on UDP: the engine's rate with no per-message start."""
+    proc = subprocess.Popen([pipe, "--packs", packs, "--packs-only", "--from-format", "remote-id", "--in", "udp://127.0.0.1:9210",
+                             "--out", "udp://127.0.0.1:9211", "--to-format", "cot-xml", "--status-every", "3600"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    loaded = time.monotonic()
+    for _ in range(600):  # until it has loaded its packs and bound the port
+        if ":9210" in sh("ss -Huan", check=False).stdout:
+            break
+        time.sleep(0.1)
+    load_s = time.monotonic() - loaded
+
+    def trial(rate: float) -> dict:
+        run = next_run()
+        sink = SinkArgs("", "127.0.0.1", 9211, D / 4, 0, 1, D / 4 + 8)
+        s = gen("", "udp-send", "127.0.0.1", "127.0.0.1", 9210, 0, rate, D / 4, run, "", REMOTE_ID)
+        r = sink.result()
+        return s | {"received": r["received"], "span_s": r["span_s"]}
+
+    c = ceiling(trial, 0.001)
+    proc.terminate()
+    proc.wait(timeout=10)
+    bench(f"goat-xf-pipe, one long-lived process: {fmt(c['rate'])} messages/s converted with loss under 0.1 %",
+          f"remote-id to cot-xml over UDP on the loopback, outside goatrope; start-up and pack load {load_s:.1f} s; "
+          f"unpaced {fmt(c['unpaced']['offered_per_s'])} offered, {fmt(c['unpaced']['received'])} of {fmt(c['unpaced']['sent'])} converted; "
+          f"{c['trials']} trials of {D / 4:g} s; {host_line()}",
+          {"path": "send-convert", "option": "goat-xf-pipe", "rate": c["rate"], "unpaced": c["unpaced"], "load_s": round(load_s, 2),
+           "trial_seconds": D / 4})
+
+
+def phase_bench() -> None:
+    """Data-path ceilings: relay UDP over real WireGuard, the remote mirror, decode-and-send with a converter."""
+    print(f"# bench host: {host_line()}; {BENCH_SECONDS:g} s trials, {BENCH_STEPS} search steps", flush=True)
+    bench_relay_udp()
+    bench_mirror()
+    bench_send_convert()
+
+
+PHASES["bench"] = phase_bench
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:

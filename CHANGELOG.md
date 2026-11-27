@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- namespace phase `bench` and docs/performance.md: the sustained rate of relay UDP over WireGuard
+  (64, 512 and 1,400-byte payloads, loss under 0.1 %, added latency), of the remote mirror
+  (frames with none lost at the collector) and of decode-and-send with a converter run once per
+  message. Measurements only; run.sh runs it in its own container.
 - relay TCP and link-initiated traffic (ADR 0004 module 2): `protocol = "tcp"` rules (accepted only
   from the rule's remote, a connection opened from the link address, copied both ways with
   half-close, `max_connections`, default 64); `direction = "link-to-remote"` for UDP and TCP, with a

@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: The test scripts compile with the system interpreter
-        run: python3 -m py_compile tests/netns/test_tap.py site/build.py site/fitcheck.py
+        run: python3 -m py_compile tests/netns/test_tap.py tests/netns/benchgen.py site/build.py site/fitcheck.py
       - name: Rust formatting, lints and unit tests
         run: |
           rustup component add rustfmt clippy

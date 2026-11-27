@@ -11,6 +11,9 @@
 #                                      packs/, model/, mind, dictionaries/ntp (otherwise not run)
 #   GOATROPE_TEST_ARCHIVE=<file>   "deploy" phase: an archive tools/build-release.sh built (default: the test makes one)
 #   GOATROPE_TEST_ROLES=<dir>      "deploy" phase: the driver's real release-file role (default: a stand-in)
+#   GOATROPE_BENCH_SECONDS=<s>     "bench" phase, in a container of its own after the others: seconds per trial
+#                                  (default 0.5, a quick run; docs/performance.md used 3). GOATROPE_BENCH=0 skips it.
+#   GOATROPE_BENCH_STEPS=<n>       "bench": binary-search steps per ceiling (default 4; docs/performance.md used 7)
 #
 # Needs Docker on a Linux host. The container is privileged because it creates veth
 # pairs and namespaces; it uses the host kernel, so the kernel under test is the host's.
@@ -104,6 +107,15 @@ for v in "${versions[@]}"; do
     phase "$c" "$log" deploy
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
+
+    # Data-path ceilings: measurements, never a pass or a failure of a number (docs/performance.md).
+    if [ "${GOATROPE_BENCH:-1}" != 0 ]; then
+        start "$c" "$v"
+        docker exec -e "GOATROPE_BENCH_SECONDS=${GOATROPE_BENCH_SECONDS:-0.5}" -e "GOATROPE_BENCH_STEPS=${GOATROPE_BENCH_STEPS:-4}" \
+            "$c" python3 -I /src/tests/netns/test_tap.py bench 2>&1 | tee -a "$log" || rc=1
+        docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
+        docker rm -f "$c" >/dev/null
+    fi
 done
 echo "logs in $out"
 exit $rc
