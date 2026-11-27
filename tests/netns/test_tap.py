@@ -3272,6 +3272,8 @@ def phase_l2() -> None:
     result(p.returncode == 2 and "IPv6 is on for lp0" in p.stderr, "l2: relay refused: IPv6 on the lane port", p.stderr.strip()[-120:])
     sh("sysctl -qw net.ipv6.conf.lp0.disable_ipv6=1")
     sh("ip netns exec endB sysctl -qw net.ipv6.conf.lp1.disable_ipv6=1")
+    # br_netfilter: a VM loads it here for the refusal and unloads it after; a container cannot load modules
+    loaded = not os.path.exists("/proc/sys/net/bridge") and sh("modprobe br_netfilter", check=False).returncode == 0
     nf = [k for k in ("iptables", "ip6tables", "arptables") if os.path.exists(f"/proc/sys/net/bridge/bridge-nf-call-{k}")]
     if nf and any(open(f"/proc/sys/net/bridge/bridge-nf-call-{k}").read().strip() == "1" for k in nf):
         p = gr("relay", "--config", CFG)
@@ -3282,6 +3284,8 @@ def phase_l2() -> None:
     for pre in ("", "ip netns exec endB "):
         for k in nf:
             sh(f"{pre}sysctl -qw net.bridge.bridge-nf-call-{k}=0", check=False)
+    if loaded:
+        sh("modprobe -r br_netfilter", check=False)
     result(not sh("ip link show l2b-lane0", check=False).returncode == 0, "l2: a refused start made no lane interface")
 
     before = snapshot()
