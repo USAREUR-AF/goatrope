@@ -7,6 +7,7 @@
 mod boundary;
 mod config;
 mod engine;
+mod l2;
 mod link;
 mod nl;
 mod proxy;
@@ -38,6 +39,7 @@ goatrope command line.
   goatrope uninstall [--purge]                 remove everything install wrote and restore the ports
   goatrope validate  [--config PATH]           check the declaration alone, without touching the machine
   goatrope relay     [--config PATH]           run the relay in the foreground (install runs it as a service)
+  goatrope l2 down                             close every layer-2 lane (the relay unit runs it when the relay stops)
   goatrope boundary  key|sheet|up|check|down [--config PATH]
                                                the relay's boundary interface (transport = \"boundary\"):
                                                make the private key, print what the boundary point needs,
@@ -275,6 +277,7 @@ fn run(verb: &str, rest: &[String]) -> i32 {
 fn banner(cfg: &config::Config) -> String {
     let mut lines: Vec<String> = cfg.tap.iter().map(tap::banner).collect();
     lines.extend(cfg.relay.iter().map(relay::banner));
+    lines.extend(cfg.relay.iter().flat_map(l2::banner));
     lines.join("\n")
 }
 
@@ -420,6 +423,19 @@ fn packs_digest(rest: &[String]) -> i32 {
     }
 }
 
+/// `goatrope l2 down`: close every layer-2 lane goatrope made (the relay unit's ExecStopPost).
+fn l2_cmd(rest: &[String]) -> i32 {
+    if rest.len() != 1 || rest[0] != "down" {
+        eprintln!("usage: goatrope l2 down");
+        return EXIT_REFUSED;
+    }
+    if let Err(code) = root_or_refuse() {
+        return code;
+    }
+    println!("goatrope l2: {} lane(s) closed", l2::close_all());
+    EXIT_OK
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
@@ -438,6 +454,7 @@ fn main() {
         Some("relay") => relay_cmd(&args[1..]),
         Some("boundary") => boundary_cmd(&args[1..]),
         Some("packs-digest") => packs_digest(&args[1..]),
+        Some("l2") => l2_cmd(&args[1..]),
         Some(other) => usage_error(&format!("argument cmd: invalid choice: '{other}'")),
     };
     std::process::exit(code);

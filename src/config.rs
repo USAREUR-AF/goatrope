@@ -217,6 +217,23 @@ pub struct Relay {
     pub transport: String,
     pub boundary: Option<Boundary>,
     pub proxies: Vec<Proxy>,
+    /// opt-in layer-2 lanes (ADR 0004 §6); empty unless declared
+    pub l2: Vec<L2>,
+}
+
+/// A layer-2 lane (ADR 0004 §6): one dedicated port bridged with a GRETAP interface to one peer.
+#[derive(Debug, Clone)]
+pub struct L2 {
+    pub name: String,
+    pub port: String,
+    /// the far end's tunnel address on remote_interface
+    pub peer: String,
+    /// this end's tunnel address, held by remote_interface
+    pub local: String,
+    pub key: u32,
+    pub ethertypes: Vec<u16>,
+    /// source MAC addresses accepted from across the tunnel, lowercase
+    pub macs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -972,7 +989,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     keys(
         r,
         w,
-        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow", "proxy"],
+        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow", "proxy", "l2"],
         &["remote_interface", "link_interface", "link_address", "allow"],
     )?;
     let transport = match r.get("transport") {
@@ -1134,6 +1151,10 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         }
     }
     let proxies = proxies(r, &link, &rules)?;
+    let l2 = match r.get("l2") {
+        Some(v) => l2_lanes(v, &remote_if, &link_if, tap, bnd.as_ref())?,
+        None => vec![],
+    };
     Ok(Relay {
         remote_interface: remote_if,
         link_interface: link_if,
@@ -1142,6 +1163,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         transport,
         boundary: bnd,
         proxies,
+        l2,
     })
 }
 
@@ -1209,6 +1231,147 @@ fn proxies(r: &Table, link: &Iface, rules: &[RelayRule]) -> R<Vec<Proxy>> {
         }
     }
     Ok(out)
+}
+
+/// Most EtherTypes a lane may list, and most source MACs: every pair is one filter.
+pub const L2_MAX_ETHERTYPES: usize = 16;
+pub const L2_MAX_MACS: usize = 64;
+
+fn l2_ethertype(v: &Value, w: &str) -> R<u16> {
+    let bad = || err(format!("{w}: {} is not an EtherType; write it as a string of four hex digits, e.g. \"0x0806\"", pyrepr(v)));
+    let Value::String(s) = v else { return bad() };
+    let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) else { return bad() };
+    if h.len() != 4 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return bad();
+    }
+    let n = u16::from_str_radix(h, 16).unwrap();
+    if n < 0x0600 {
+        return err(format!("{w}: {s} is below 0x0600, a frame length (IEEE 802.3), not an EtherType"));
+    }
+    if [0x8100, 0x88a8, 0x9100].contains(&n) {
+        return err(format!(
+            "{w}: {s} is a VLAN tag; the filter sees only the outer EtherType, so a tag would carry any EtherType inside it"
+        ));
+    }
+    Ok(n)
+}
+
+fn l2_mac(v: &Value, w: &str) -> R<String> {
+    let bad = || err(format!("{w}: {} is not a MAC address (six pairs of hex digits joined by colons)", pyrepr(v)));
+    let Value::String(s) = v else { return bad() };
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 || !parts.iter().all(|p| p.len() == 2 && p.bytes().all(|c| c.is_ascii_hexdigit())) {
+        return bad();
+    }
+    let b: Vec<u8> = parts.iter().map(|p| u8::from_str_radix(p, 16).unwrap()).collect();
+    if b[0] & 1 == 1 || b.iter().all(|x| *x == 0) {
+        return err(format!("{w}: {s} is a group (multicast or broadcast) or all-zero address; a frame's source is one machine"));
+    }
+    Ok(s.to_lowercase())
+}
+
+/// `[[relay.l2]]`. The lane must be accepted by name: it carries the remote side's frames onto the port's link.
+fn l2_lanes(v: &Value, remote_if: &str, link_if: &str, tap: Option<&Tap>, bnd: Option<&Boundary>) -> R<Vec<L2>> {
+    let items: Vec<Value> = match v {
+        Value::Array(a) => a.clone(),
+        other => vec![other.clone()],
+    };
+    let mut lanes: Vec<L2> = Vec::new();
+    for (j, item) in items.iter().enumerate() {
+        let w = format!("[[relay.l2]][{j}]");
+        let t = as_table(item, &w)?;
+        let req = ["name", "port", "peer", "local", "key", "accept_layer2", "ethertypes", "macs"];
+        keys(t, &w, &req, &req)?;
+        let name = match &t["name"] {
+            Value::String(s) if is_name(s) && s.len() <= 11 => s.clone(),
+            other => {
+                return err(format!(
+                    "{w}.name: {} must be 1 to 11 lowercase letters, digits or hyphens; goatrope names the lane's interfaces after it",
+                    pyrepr(other)
+                ))
+            }
+        };
+        let w = format!("[[relay.l2]] {}", pystr(&name));
+        if t["accept_layer2"].as_bool() != Some(true) {
+            return err(format!(
+                "{w}: accept_layer2 = true is required. A layer-2 lane puts the far side's frames on this port's link: its ARP and \
+                 broadcasts, any address it claims, and the tunnel's loss and latency on every frame (ADR 0002, the encrypted \
+                 layer-2 tunnel). The declared ethertypes and macs bound it; they do not remove those risks"
+            ));
+        }
+        let port = ifname(&t["port"], &format!("{w}.port"))?;
+        if port == link_if || port == remote_if {
+            return err(format!(
+                "{w}.port {port} is the relay's {} interface; a lane takes a port of its own",
+                if port == link_if { "link" } else { "remote" }
+            ));
+        }
+        if let Some(tap) = tap {
+            if tap.ports.contains(&port) {
+                return err(format!("{w}.port {port} is a tap port; a lane takes a port of its own"));
+            }
+            if tap.management == port {
+                return err(format!("{w}.port {port} is the management interface; a lane takes a port of its own"));
+            }
+        }
+        let peer = addr(&t["peer"], &format!("{w}.peer"))?;
+        let local = addr(&t["local"], &format!("{w}.local"))?;
+        if peer.contains(':') || local.contains(':') {
+            return err(format!("{w}: IPv6 tunnel addresses are not built; peer and local are IPv4"));
+        }
+        if peer == local {
+            return err(format!("{w}: peer and local are the same address"));
+        }
+        if let Some(b) = bnd {
+            let mine = b.address.split('/').next().unwrap_or_default();
+            if peer != b.peer_address || local != mine {
+                return err(format!(
+                    "{w}: with transport \"boundary\", peer is the boundary point ({}) and local is this end's address ({mine})",
+                    b.peer_address
+                ));
+            }
+        }
+        let key = int(t, "key", &w, 1, u32::MAX as i64)? as u32;
+        let ethertypes = match &t["ethertypes"] {
+            Value::Array(a) if !a.is_empty() && a.len() <= L2_MAX_ETHERTYPES => {
+                a.iter().map(|x| l2_ethertype(x, &format!("{w}.ethertypes"))).collect::<R<Vec<u16>>>()?
+            }
+            _ => {
+                return err(format!(
+                    "{w}.ethertypes must list 1 to {L2_MAX_ETHERTYPES} EtherTypes, e.g. [\"0x0806\", \"0x0800\"]; every other EtherType is dropped"
+                ))
+            }
+        };
+        let macs = match &t["macs"] {
+            Value::Array(a) if !a.is_empty() && a.len() <= L2_MAX_MACS => {
+                a.iter().map(|x| l2_mac(x, &format!("{w}.macs"))).collect::<R<Vec<String>>>()?
+            }
+            _ => {
+                return err(format!(
+                    "{w}.macs must list 1 to {L2_MAX_MACS} source MAC addresses accepted from across the tunnel; frames from any other are dropped"
+                ))
+            }
+        };
+        if ethertypes.iter().collect::<BTreeSet<_>>().len() != ethertypes.len() {
+            return err(format!("{w}.ethertypes lists an EtherType twice"));
+        }
+        if macs.iter().collect::<BTreeSet<_>>().len() != macs.len() {
+            return err(format!("{w}.macs lists a MAC address twice"));
+        }
+        for other in &lanes {
+            if other.name == name {
+                return err(format!("{w}: the name is used twice"));
+            }
+            if other.port == port {
+                return err(format!("{w}.port {port} is also the port of lane {}", pystr(&other.name)));
+            }
+            if other.peer == peer && other.local == local && other.key == key {
+                return err(format!("{w}: lane {} has the same peer, local and key; each lane needs its own key", pystr(&other.name)));
+            }
+        }
+        lanes.push(L2 { name, port, peer, local, key, ethertypes, macs });
+    }
+    Ok(lanes)
 }
 
 pub fn parse(text: &str, path: &str) -> R<Config> {
@@ -1305,6 +1468,41 @@ allow = [{ direction = "both", protocol = "udp", remote = "198.51.100.5", listen
         assert!(parse(&with("true"), "x.toml").is_ok());
         assert!(parse(&with("false"), "x.toml").is_ok());
         assert!(e(&with("\"yes\"")).contains("wip must be true or false"));
+    }
+
+    const LANE: &str = r#"
+[[relay.l2]]
+name = "lane0"
+port = "lp0"
+peer = "198.51.100.5"
+local = "198.51.100.1"
+key = 4242
+accept_layer2 = true
+ethertypes = ["0x0806", "0x0800"]
+macs = ["02:00:00:00:b0:01"]
+"#;
+
+    #[test]
+    fn l2_lane_parses_and_refuses() {
+        let ok = format!("{RELAY}{LANE}");
+        let c = parse(&ok, "x.toml").unwrap();
+        let l = &c.relay.unwrap().l2[0];
+        assert_eq!((l.key, l.ethertypes.clone(), l.macs[0].as_str()), (4242, vec![0x0806, 0x0800], "02:00:00:00:b0:01"));
+        let bad = |from: &str, to: &str| e(&ok.replace(from, to));
+        assert!(bad("accept_layer2 = true\n", "").contains("missing required key(s) accept_layer2"));
+        assert!(bad("accept_layer2 = true", "accept_layer2 = false").contains("ADR 0002"));
+        assert!(bad("[\"0x0806\", \"0x0800\"]", "[]").contains("ethertypes must list"));
+        assert!(bad("\"0x0800\"", "\"0x8100\"").contains("VLAN tag"));
+        assert!(bad("\"0x0800\"", "\"0x05dc\"").contains("frame length"));
+        assert!(bad("\"0x0800\"", "\"0x0806\"").contains("twice"));
+        assert!(bad("02:00:00:00:b0:01", "ff:ff:ff:ff:ff:ff").contains("group"));
+        assert!(bad("02:00:00:00:b0:01", "02:00:00:00:b0").contains("not a MAC address"));
+        assert!(bad("port = \"lp0\"", "port = \"r0\"").contains("relay's link interface"));
+        assert!(bad("port = \"lp0\"", "port = \"wg0\"").contains("relay's remote interface"));
+        assert!(bad("peer = \"198.51.100.5\"", "peer = \"2001:db8::5\"").contains("IPv6"));
+        assert!(bad("key = 4242", "key = 0").contains("key must be a whole number"));
+        assert!(bad("name = \"lane0\"", "name = \"a-very-long-name\"").contains("1 to 11"));
+        assert!(e(&format!("{ok}{LANE}")).contains("used twice"));
     }
 
     #[test]

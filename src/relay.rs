@@ -96,6 +96,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             r.link_interface, r.link_address
         ));
     }
+    crate::l2::preflight(cfg).map_err(RelayRefusal)?;
     if r.transport == "boundary" {
         // last, so a refusal above leaves the machine as it was
         let b = r.boundary.as_ref().expect("transport boundary has a [relay.boundary]");
@@ -108,14 +109,14 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             b.peer_endpoint
         );
     }
+    crate::l2::up(cfg).map_err(RelayRefusal)?;
     Ok(())
 }
 
 fn forwarding(r: &Relay) -> Vec<String> {
-    let mut on: Vec<String> = [&r.remote_interface, &r.link_interface]
-        .iter()
-        .flat_map(|i| sys::forwarding(i).into_iter().map(move |fam| format!("{fam} on {i}")))
-        .collect();
+    let mut ifs = vec![r.remote_interface.clone(), r.link_interface.clone()];
+    ifs.extend(crate::l2::interfaces(r)); // a lane bridges and never routes
+    let mut on: Vec<String> = ifs.iter().flat_map(|i| sys::forwarding(i).into_iter().map(move |fam| format!("{fam} on {i}"))).collect();
     if sys::read("/proc/sys/net/ipv6/conf/all/forwarding").as_deref() == Some("1") {
         // IPv6 forwards on the global setting, whatever each interface says
         on.push("ipv6 on all interfaces".to_string());
@@ -465,6 +466,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     let mut denied_log = DeniedLog(None);
     loop {
         if proxy::stop_requested() {
+            crate::l2::close_all();
             println!("goatrope relay: stopping on a signal");
             return Ok(crate::EXIT_OK);
         }
@@ -496,6 +498,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
+                crate::l2::close_all();
                 eprintln!("goatrope relay: stopping: IP forwarding was turned on ({})", fwd.join(", "));
                 return Ok(crate::EXIT_ERROR);
             }
@@ -505,6 +508,10 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                     eprintln!("goatrope relay: stopping: {} no longer matches the declaration: {}", r.remote_interface, drift.join("; "));
                     return Ok(crate::EXIT_ERROR);
                 }
+            }
+            if let Err(e) = crate::l2::tick(r) {
+                eprintln!("goatrope relay: stopping: {e}");
+                return Ok(crate::EXIT_ERROR);
             }
         }
     }
@@ -785,7 +792,7 @@ Restart=on-failure
 RestartSec=3
 # a refusal (exit {refused}) is not restarted: the unit stays failed, and goatrope check shows it
 RestartPreventExitStatus={refused}
-# SO_BINDTODEVICE (and ARP probes for a proxy address) need CAP_NET_RAW; the boundary interface and proxy addresses (netlink) need CAP_NET_ADMIN
+{l2}# SO_BINDTODEVICE (and ARP probes for a proxy address) need CAP_NET_RAW; the boundary interface and proxy addresses (netlink) need CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=yes
@@ -808,6 +815,7 @@ WantedBy=multi-user.target
             refused = crate::EXIT_REFUSED,
             // ARP probes and announcements for a proxy address go through a packet socket
             packet = if proxy { " AF_PACKET" } else { "" },
+            l2 = crate::l2::unit_lines(cfg),
         ),
     );
     files

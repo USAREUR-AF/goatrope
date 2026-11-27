@@ -8,6 +8,7 @@
 #   tests/arm64/run.sh 24.04|26.04
 #   IMAGES=<dir>  where the cloud images are kept (default ~/.cache/goatrope-arm64)
 #   OUT=<dir>     where the logs go (default ./test-results)
+#   GOATROPE_ARM64_CONTAINER=<name>  the VM's container is <name>-<version> (default goatrope-arm64)
 #   WATCHDOG_ACTION=none|reset  what qemu does when the watchdog expires (default none: it is
 #                 logged to ubuntu-<v>-arm64.qemu.log; emulated daemon-reloads can take over 10 s)
 #
@@ -26,7 +27,7 @@ img="$images/ubuntu-$v-server-cloudimg-arm64.img"
 [ -f "$img" ] || curl -fsSL -o "$img" "https://cloud-images.ubuntu.com/releases/$v/release/ubuntu-$v-server-cloudimg-arm64.img"
 
 w="$(mktemp -d "$out/arm64-$v.XXXX")"
-c="goatrope-arm64-$v"
+c="${GOATROPE_ARM64_CONTAINER:-goatrope-arm64}-$v"   # another name lets two VMs share a host
 log="$out/ubuntu-$v-arm64.log"
 : > "$log"
 trap 'cp "$w/console.log" "$out/ubuntu-$v-arm64.console.log" 2>/dev/null; docker logs "$c" > "$out/ubuntu-$v-arm64.qemu.log" 2>&1; docker rm -f "$c" >/dev/null 2>&1 || true; rm -rf "$w"' EXIT
@@ -122,7 +123,7 @@ for _ in 1 2 3 4 5; do  # the guest may still be finishing its boot under emulat
     sleep 30
 done
 phase reboot-verify uninstall
-phase listen uninstall send relay boundary uninstall units erspan
+phase listen uninstall send relay boundary uninstall units erspan l2
 vm 'cat /root/gt/results.jsonl' > "$out/ubuntu-$v-arm64.results.jsonl" 2>/dev/null || true
 echo "log: $log"
 exit $rc

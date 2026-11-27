@@ -2593,6 +2593,110 @@ def wait_for(cond, timeout: float, step: float = 0.5) -> float | None:
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         forwarding_off()
+
+
+# ---------------------------------------------------------------- layer-2 lane (ADR 0004 module 6)
+
+MAC_A, MAC_B = "02:00:00:00:a0:01", "02:00:00:00:b0:01"
+L2_A = """schema = 1
+[relay]
+remote_interface = "wgl0"
+link_interface = "l2d0"
+link_address = "198.51.100.129/25"
+allow = [{ direction = "remote-to-link", protocol = "udp", remote = "203.0.113.2", listen_port = 7100, target = "198.51.100.130", target_port = 7100 }]
+[[relay.l2]]
+name = "lane0"
+port = "lp0"
+peer = "203.0.113.2"
+local = "203.0.113.1"
+key = 4242
+accept_layer2 = true
+ethertypes = ["0x0806", "0x0800", "0x88b5"]
+macs = ["02:00:00:00:b0:01"]
+"""
+L2_B = (L2_A.replace('"wgl0"', '"wgl1"').replace('"l2d0"', '"l2d1"').replace('remote = "203.0.113.2"', 'remote = "203.0.113.1"')
+        .replace('peer = "203.0.113.2"', 'peer = "203.0.113.9"').replace('local = "203.0.113.1"', 'local = "203.0.113.2"')
+        .replace('peer = "203.0.113.9"', 'peer = "203.0.113.1"').replace('"lp0"', '"lp1"').replace(MAC_B, MAC_A))
+CFG_B = f"{WORK}/goatrope-b.toml"
+
+
+def topo_l2() -> None:
+    """Two lane ends joined by WireGuard over an underlay veth: this machine (end A, the installed relay)
+    and namespace endB (a relay in the foreground). Each end's port leads to its own link host.
+
+      hostA [ha0 192.0.2.1] == lp0 ]-l2b-lane0-[ l2g-lane0 ~ wgl0 203.0.113.1 == underlay ==
+          == wgl1 203.0.113.2 (ns endB) ~ l2g-lane0 ]-l2b-lane0-[ lp1 == [hb0 192.0.2.2] hostB
+    """
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns del {ns}", check=False)
+    for leftover in ("wg0", "u0", "r0", "grb0", "bp0", "er0", "l2u0", "wgl0", "lp0", "l2d0", "l2g-lane0", "l2b-lane0"):
+        sh(f"ip link del {leftover}", check=False)
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns add {ns} && ip -n {ns} link set lo up")
+    for ns in ("hostA", "hostB"):  # the link hosts send no IPv6, so the counters below count only what the test sends
+        sh(f"ip netns exec {ns} sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1")
+    sh("ip link add l2u0 address 02:00:00:00:e1:01 type veth peer name l2u1 address 02:00:00:00:e1:02 && ip link set l2u1 netns endB")
+    sh("ip addr add 198.51.100.1/30 dev l2u0 && ip link set l2u0 up")
+    sh("ip -n endB addr add 198.51.100.2/30 dev l2u1 && ip -n endB link set l2u1 up")
+    keys = {}
+    for k in ("l2a", "l2b"):
+        priv = sh("wg genkey").stdout.strip()
+        keys[k] = (priv, subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True).stdout.strip())
+    sh("ip link add wgl0 type wireguard")
+    subprocess.run(["wg", "set", "wgl0", "listen-port", "51830", "private-key", "/dev/stdin", "peer", keys["l2b"][1],
+                    "endpoint", "198.51.100.2:51831", "allowed-ips", "203.0.113.2/32", "persistent-keepalive", "5"],
+                   input=keys["l2a"][0] + "\n", text=True, check=True)
+    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 up")
+    sh("ip -n endB link add wgl1 type wireguard")
+    subprocess.run(["ip", "netns", "exec", "endB", "wg", "set", "wgl1", "listen-port", "51831", "private-key", "/dev/stdin",
+                    "peer", keys["l2a"][1], "endpoint", "198.51.100.1:51830", "allowed-ips", "203.0.113.1/32",
+                    "persistent-keepalive", "5"], input=keys["l2b"][0] + "\n", text=True, check=True)
+    sh("ip -n endB addr add 203.0.113.2/24 dev wgl1 && ip -n endB link set wgl1 up")
+    for pre, port, peer, ns, mac, addr in (("", "lp0", "ha0", "hostA", MAC_A, "192.0.2.1"),
+                                           ("ip netns exec endB ", "lp1", "hb0", "hostB", MAC_B, "192.0.2.2")):
+        end = "endB" if pre else None
+        sh(f"ip link add {port} address 02:00:00:00:{'a' if port == 'lp0' else 'b'}0:fe type veth peer name {peer} address {mac}")
+        sh(f"ip link set {peer} netns {ns}")
+        if end:
+            sh(f"ip link set {port} netns {end}")
+        sh(f"ip -n {ns} addr add {addr}/24 dev {peer} && ip -n {ns} link set {peer} up")
+        sh(f"{pre}ip link set {port} up")  # IPv6 stays on for the port here: the first start must refuse
+        dummy = "l2d0" if not end else "l2d1"
+        sh(f"{pre}ip link add {dummy} type dummy && {pre}ip addr add 198.51.100.129/25 dev {dummy}")
+        sh(f"{pre}sysctl -qw net.ipv6.conf.{dummy}.disable_ipv6=1 net.ipv4.conf.all.forwarding=0 net.ipv6.conf.all.forwarding=0")
+        sh(f"{pre}ip link set {dummy} up")
+
+
+def l2_inject(ns: str, ifname: str, n: int, tag: bytes, src: str, ethertype: int = 0x88b5) -> None:
+    s = bytes.fromhex(src.replace(":", ""))
+    code = (f"import socket,time\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\ns.bind(({ifname!r},0))\n"
+            f"for i in range({n}):\n s.send(b'\\xff'*6+{s!r}+{ethertype.to_bytes(2, 'big')!r}+"
+            f"{MAGIC!r}+{tag!r}+i.to_bytes(4,'big')+b'z'*40)\n time.sleep(0.002)\n")
+    sh(f"ip netns exec {ns} python3 -c \"{code}\"")
+
+
+def l2_counter(dev: str, ns: str | None = None, drop: bool = True) -> int:
+    """Packets counted by the lane's drop (or its pass) filters on dev's ingress."""
+    pre = f"ip netns exec {ns} " if ns else ""
+    p = sh(f"{pre}tc -s -j filter show dev {dev} ingress", check=False)
+    try:
+        rows = json.loads(p.stdout or "[]")
+    except ValueError:
+        return -1
+    want = "matchall" if drop else "flower"
+    return sum(f["options"]["actions"][0]["stats"]["packets"] for f in rows if f.get("kind") == want and "options" in f)
+
+
+def l2_up(dev: str, ns: str | None = None) -> bool:
+    pre = f"ip -n {ns} " if ns else "ip "
+    p = sh(f"{pre}-j link show dev {dev}", check=False)
+    return p.returncode == 0 and "UP" in json.loads(p.stdout)[0].get("flags", [])
+
+
+def l2_wait(cond, timeout: float, step: float = 0.5) -> float | None:
+    """Seconds until cond() held, or None."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
         if cond():
             return time.monotonic() - t0
         time.sleep(step)
@@ -3136,6 +3240,185 @@ def phase_fragments() -> None:
 
 HEALTH_FILE = "/var/lib/goatrope/relay.health"
 PHASES["fragments"] = phase_fragments
+
+
+def l2_ping(src_ns: str, dst: str, n: int, size: int = 56) -> int:
+    p = sh(f"ip netns exec {src_ns} ping -n -q -M do -s {size} -c {n} -i 0.2 -W 3 {dst}", check=False)
+    for ln in p.stdout.splitlines():
+        if "received" in ln:
+            return int(ln.split(",")[1].split()[0])
+    return 0
+
+
+def phase_l2() -> None:
+    """ADR 0004 module 6: an opt-in bridge of one port to one peer, filtered by EtherType and source MAC."""
+    topo_l2()
+    write_cfg(L2_B, CFG_B)
+    # refused at validation
+    for name, text, want in (
+            ("without accept_layer2", L2_A.replace("accept_layer2 = true\n", ""), "missing required key(s) accept_layer2"),
+            ("with accept_layer2 = false", L2_A.replace("accept_layer2 = true", "accept_layer2 = false"), "accept_layer2 = true is required"),
+            ("without ethertypes", L2_A.replace('ethertypes = ["0x0806", "0x0800", "0x88b5"]\n', ""), "missing required key(s) ethertypes"),
+            ("with an empty macs list", L2_A.replace('macs = ["02:00:00:00:b0:01"]', "macs = []"), "macs must list"),
+            ("with a group source MAC", L2_A.replace('macs = ["02:00:00:00:b0:01"]', 'macs = ["01:00:5e:00:00:01"]'), "group"),
+            ("with a VLAN tag as an EtherType", L2_A.replace('"0x88b5"]', '"0x8100"]'), "VLAN tag"),
+            ("with the relay's link interface as its port", L2_A.replace('port = "lp0"', 'port = "l2d0"'), "relay's link interface")):
+        p = gr("validate", "--config", write_cfg(text))
+        result(p.returncode == 2 and want in p.stderr, f"l2: refused {name}", p.stderr.strip()[-160:])
+    p = gr("validate", "--config", write_cfg(L2_A.replace("accept_layer2 = true\n", "accept_layer2 = false\n")))
+    result("ADR 0002" in p.stderr and "ARP" in p.stderr, "l2: the refusal names the risks the lane keeps (ADR 0002)", p.stderr.strip()[-200:])
+    write_cfg(L2_A)
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "IPv6 is on for lp0" in p.stderr, "l2: relay refused: IPv6 on the lane port", p.stderr.strip()[-120:])
+    sh("sysctl -qw net.ipv6.conf.lp0.disable_ipv6=1")
+    sh("ip netns exec endB sysctl -qw net.ipv6.conf.lp1.disable_ipv6=1")
+    nf = [k for k in ("iptables", "ip6tables", "arptables") if os.path.exists(f"/proc/sys/net/bridge/bridge-nf-call-{k}")]
+    if nf and any(open(f"/proc/sys/net/bridge/bridge-nf-call-{k}").read().strip() == "1" for k in nf):
+        p = gr("relay", "--config", CFG)
+        result(p.returncode == 2 and "bridge-nf-call" in p.stderr, "l2: relay refused: bridged frames would pass through iptables",
+               p.stderr.strip()[-120:])
+    else:
+        result(None, "l2: bridge-nf-call refusal not shown", "br_netfilter is not loaded on this kernel")
+    for pre in ("", "ip netns exec endB "):
+        for k in nf:
+            sh(f"{pre}sysctl -qw net.bridge.bridge-nf-call-{k}=0", check=False)
+    result(not sh("ip link show l2b-lane0", check=False).returncode == 0, "l2: a refused start made no lane interface")
+
+    before = snapshot()
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "l2: install of a relay with a lane", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+    unit = open("/etc/systemd/system/goatrope-relay.service").read() if os.path.exists("/etc/systemd/system/goatrope-relay.service") else ""
+    result("ExecStopPost=/usr/local/sbin/goatrope l2 down" in unit, "l2: the unit closes the lane however the relay stops (ExecStopPost)")
+    b_log = open(f"{WORK}/relay-b.log", "w")
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    waited = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
+    result(waited is not None, "l2: both lane ends come up once the WireGuard peers handshake",
+           f"after {waited:.1f} s" if waited is not None else open(f"{WORK}/relay-b.log").read()[-300:])
+    check_exit(0, "l2: lane up")
+    gre = json.loads(sh("ip -d -j link show l2g-lane0").stdout)[0]
+    br = json.loads(sh("ip -d -j link show l2b-lane0").stdout)[0]
+    result(br["linkinfo"]["info_data"]["stp_state"] == 0 and not sh("ip -br addr show dev l2b-lane0").stdout.split()[2:]
+           and gre["mtu"] == 1500 and gre["linkinfo"]["info_data"]["pmtudisc"] is False,
+           "l2: bridge with STP off and no address; GRETAP MTU 1500, outer fragmentation allowed",
+           f"stp {br['linkinfo']['info_data']['stp_state']}, gretap mtu {gre['mtu']}, pmtudisc {gre['linkinfo']['info_data']['pmtudisc']}")
+
+    cap_b = Capture("hostB", "hb0", "l2-b")
+    cap_a = Capture("hostA", "ha0", "l2-a")
+    sh("ip -n hostA neigh flush dev ha0 && ip -n hostB neigh flush dev hb0", check=False)
+    n = l2_ping("hostA", "192.0.2.2", 10)
+    neigh_a = sh("ip -n hostA neigh show 192.0.2.2 dev ha0").stdout
+    neigh_b = sh("ip -n hostB neigh show 192.0.2.1 dev hb0").stdout
+    result(n == 10 and MAC_B in neigh_a and MAC_A in neigh_b,
+           "l2: ARP crosses both ways (each host resolved the other's MAC) and IPv4 crosses", f"{n} of 10 pings; {neigh_a.strip()} | {neigh_b.strip()}")
+    n = l2_ping("hostB", "192.0.2.1", 10)
+    result(n == 10, "l2: IPv4 crosses the other way", f"{n} of 10")
+    pass_a, pass_b = l2_counter("l2g-lane0", drop=False), l2_counter("l2g-lane0", "endB", drop=False)
+    l2_inject("hostA", "ha0", 50, b"E1", MAC_A)
+    l2_inject("hostB", "hb0", 50, b"E2", MAC_B)
+    time.sleep(0.5)
+    pass_a, pass_b = l2_counter("l2g-lane0", drop=False) - pass_a, l2_counter("l2g-lane0", "endB", drop=False) - pass_b
+    drops_a, drops_b = l2_counter("lp0"), l2_counter("lp1", "endB")
+    l2_inject("hostA", "ha0", 30, b"U1", MAC_A, 0x88b6)
+    l2_inject("hostB", "hb0", 30, b"U2", MAC_B, 0x88b6)
+    gdrops_a, gdrops_b = l2_counter("l2g-lane0"), l2_counter("l2g-lane0", "endB")
+    l2_inject("hostA", "ha0", 30, b"M1", "02:00:00:00:a0:66")
+    l2_inject("hostB", "hb0", 30, b"M2", "02:00:00:00:b0:66")
+    # an ARP request whose Ethernet source is declared but whose sender hardware address is not
+    spoof = bytes.fromhex("02000000a066")
+    arp = (b"\xff" * 6 + bytes.fromhex(MAC_A.replace(":", "")) + b"\x08\x06" + b"\x00\x01\x08\x00\x06\x04\x00\x01"
+           + spoof + bytes([192, 0, 2, 77]) + b"\x00" * 6 + bytes([192, 0, 2, 2]))
+    sh(f"ip netns exec hostA python3 -c \"import socket;s=socket.socket(socket.AF_PACKET,socket.SOCK_RAW);s.bind(('ha0',0));"
+       f"[s.send({arp!r}) for i in range(10)]\"")
+    time.sleep(1)
+    fb, fa = cap_b.stop(), cap_a.stop()
+    result(tagged(fb, b"E1") == set(range(50)) and tagged(fa, b"E2") == set(range(50)),
+           "l2: a declared EtherType (0x88b5) crosses both ways",
+           f"{len(tagged(fb, b'E1'))} of 50 A to B, {len(tagged(fa, b'E2'))} of 50 B to A; "
+           f"passed from the tunnel {pass_b} at B, {pass_a} at A")
+    da, db = l2_counter("lp0") - drops_a, l2_counter("lp1", "endB") - drops_b
+    result(not tagged(fb, b"U1") and not tagged(fa, b"U2") and da >= 30 and db >= 30,
+           "l2: an undeclared EtherType (0x88b6) is dropped at the port, and counted",
+           f"{len(tagged(fb, b'U1'))} of 30 and {len(tagged(fa, b'U2'))} of 30 crossed; drops counted {da} at A, {db} at B")
+    ga, gb = l2_counter("l2g-lane0") - gdrops_a, l2_counter("l2g-lane0", "endB") - gdrops_b
+    spoofed = [f for f in fb if f[12:14] == b"\x08\x06" and f[22:28] == spoof]
+    result(not tagged(fb, b"M1") and not tagged(fa, b"M2") and not spoofed and ga >= 30 and gb >= 40,
+           "l2: an undeclared source MAC (and an ARP sender address that is not the frame's source) is dropped from the tunnel, and counted",
+           f"{len(tagged(fb, b'M1'))} of 30 and {len(tagged(fa, b'M2'))} of 30 crossed, {len(spoofed)} of 10 spoofed ARP; drops counted {ga} at A, {gb} at B")
+    other = [f[:16].hex() for f in fb if not (f[6:12] == bytes.fromhex(MAC_A.replace(":", "")) and f[12:14] in (b"\x08\x06", b"\x08\x00", b"\x88\xb5"))]
+    result(not other, "l2: on link B, every frame from the lane was a declared EtherType from a declared MAC",
+           f"{len(fb)} frames, {len(other)} other: {other[:3]}")
+    wg_mtu = json.loads(sh("ip -j link show wgl0").stdout)[0]["mtu"]
+    n = l2_ping("hostA", "192.0.2.2", 10, 1472)
+    result(n == 10 and wg_mtu < 1500, "l2: a 1,472-byte ping (a 1,514-byte frame, DF set) crosses a WireGuard MTU below 1,500",
+           f"{n} of 10, WireGuard MTU {wg_mtu}")
+    fwd = {i: (open(f"/proc/sys/net/ipv4/conf/{i}/forwarding").read().strip()) for i in ("lp0", "l2b-lane0", "l2g-lane0", "wgl0")}
+    fwd["ipv6"] = open("/proc/sys/net/ipv6/conf/all/forwarding").read().strip()
+    result(set(fwd.values()) == {"0"}, "l2: IP forwarding stays off (the lane bridges, it does not route)", str(fwd))
+    p = gr("status", "--config", CFG)
+    lane = [ln.strip() for ln in p.stdout.splitlines() if "lane" in ln or "frames passed" in ln]
+    result(any("lane0 up" in ln for ln in lane) and any("dropped" in ln for ln in lane), "l2: status shows the lane and its counters",
+           " | ".join(lane)[:300])
+
+    # check 3 when part of the lane is removed; the relay stops on it, and its restart builds the lane again
+    for what, cmd, item_id in (("a filter", "tc filter del dev l2g-lane0 ingress pref 60000", "l2:lane0:filters:l2g-lane0"),
+                               ("the GRETAP interface", "ip link del l2g-lane0", "l2:lane0:gretap"),
+                               ("the bridge", "ip link del l2b-lane0", "l2:lane0:bridge")):
+        restarts = int(unit_props().get("NRestarts", "0"))
+        sh(cmd)
+        p = gr("check", "--config", CFG)
+        diffs = [ln for ln in p.stdout.splitlines() if "DIFF" in ln]
+        result(p.returncode == 3 and any(item_id in ln for ln in diffs), f"l2: {what} removed: check exits 3",
+               f"exit {p.returncode}: {'; '.join(diffs)[:200]}")
+        back = l2_wait(lambda: int(unit_props().get("NRestarts", "0")) > restarts and gr("check", "--config", CFG).returncode == 0
+                       and l2_up("l2g-lane0"), 60, 1)
+        n = l2_ping("hostA", "192.0.2.2", 5)
+        result(back is not None and n == 5, f"l2: {what} removed: the relay stops, is restarted and builds the lane again; check 0",
+               f"after {back:.0f} s, {n} of 5 pings" if back is not None else f"NRestarts {unit_props().get('NRestarts')}")
+
+    # the lane follows the tunnel: down within 180 s + one tick of the last handshake, up when it is fresh again
+    def last_hs() -> int:
+        out = sh("wg show wgl0 latest-handshakes").stdout.split()
+        return int(out[1]) if len(out) > 1 else 0
+    sh("ip -n endB link set wgl1 down")
+    t_stop, hs = time.time(), last_hs()
+    waited = l2_wait(lambda: not l2_up("l2g-lane0"), 200, 0.25)
+    t_down = time.time()
+    after_hs = t_down - hs
+    result(waited is not None and 180 <= after_hs <= 184,
+           "l2: the lane goes down within 180 s + one tick (2 s) of the peer's last handshake",
+           f"down {after_hs:.1f} s after the last handshake, {t_down - t_stop:.1f} s after the peer stopped")
+    n = l2_ping("hostA", "192.0.2.2", 3)
+    result(n == 0, "l2: nothing crosses while the lane is down", f"{n} of 3")
+    sh("ip -n endB link set wgl1 up")
+    waited = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60, 0.25)
+    n = l2_ping("hostA", "192.0.2.2", 5)
+    result(waited is not None and n == 5, "l2: the lane comes back up when the handshake is fresh again",
+           f"after {waited:.1f} s, {n} of 5 pings" if waited is not None else "still down")
+
+    relay_b.terminate()
+    try:
+        rc = relay_b.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        relay_b.kill()
+        rc = None
+    result(rc == 0 and not l2_up("l2g-lane0", "endB"), "l2: a relay stopped with SIGTERM closes its lane first", f"exit {rc}")
+    sh("systemctl stop goatrope-relay.service")
+    result(not l2_up("l2g-lane0"), "l2: a stopped relay unit leaves its lane closed")
+    p = gr("uninstall", "--purge")
+    left = diff(before, snapshot())
+    gone = [i for i in ("l2b-lane0", "l2g-lane0") if os.path.exists(f"/sys/class/net/{i}")]
+    qd = sh("tc qdisc show dev lp0").stdout
+    master = os.path.exists("/sys/class/net/lp0/master")
+    result(p.returncode == 0 and not left and not gone and "clsact" not in qd and not master,
+           "l2: uninstall --purge removes the bridge, the GRETAP interface and the filters, and leaves nothing",
+           "; ".join(left + gone)[:300] + f" qdisc: {qd.strip()[:80]}, port in a bridge: {master}")
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns del {ns}", check=False)
+    for leftover in ("l2u0", "wgl0", "lp0", "l2d0"):
+        sh(f"ip link del {leftover}", check=False)
+
+
+PHASES["l2"] = phase_l2
 
 
 if __name__ == "__main__":

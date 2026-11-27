@@ -150,6 +150,20 @@ pub fn set_up(ifname: &str) -> io::Result<()> {
     route(RouteNetlinkMessage::NewLink(m), 0).map(|_| ())
 }
 
+/// `ip link set <ifname> down`
+pub fn set_down(ifname: &str) -> io::Result<()> {
+    let mut m = LinkMessage::default();
+    m.header.index = index(ifname)?;
+    m.header.flags = LinkFlags::empty();
+    m.header.change_mask = LinkFlags::Up;
+    route(RouteNetlinkMessage::NewLink(m), 0).map(|_| ())
+}
+
+/// Whether the link is administratively up; None when there is no such link.
+pub fn is_up(ifname: &str) -> Option<bool> {
+    link(ifname).ok()?.map(|l| l.header.flags.contains(LinkFlags::Up))
+}
+
 /// `ip address add <ip/prefix> dev <ifname>`
 pub fn add_address(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<()> {
     let mut m = AddressMessage::default();

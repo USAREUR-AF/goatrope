@@ -1,0 +1,24 @@
+# goatrope declaration: a relay with a layer-2 lane (ADR 0004 §6). One dedicated port, eth2, is
+# bridged with a GRETAP interface to one mesh peer, so a machine on the far side's link and a
+# machine on this one exchange frames as on one segment, within the declared EtherTypes and source
+# MACs. The far end runs the same declaration with peer and local swapped and its own macs.
+# Addresses, MAC addresses and the key are documentation values.
+schema = 1
+
+[relay]
+remote_interface = "wt0"          # the mesh's kernel WireGuard interface
+link_interface = "eth1"           # the relay's own interface for its fixed-port rules
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000 },
+]
+
+[[relay.l2]]
+name = "lane0"                    # the lane's interfaces are l2b-lane0 (bridge) and l2g-lane0 (GRETAP)
+port = "eth2"                     # dedicated: no address, IPv6 off, in no other bridge; never a tap or relay interface
+peer = "203.0.113.21"             # the far end's mesh address
+local = "203.0.113.20"            # this end's mesh address, held by remote_interface
+key = 4242                        # GRE key, the same at both ends
+accept_layer2 = true              # required: the lane carries the far side's frames onto eth2's link (ADR 0002)
+ethertypes = ["0x0806", "0x0800"] # ARP and IPv4 only; every other EtherType is dropped and counted
+macs = ["02:00:00:00:b0:01"]      # source MACs accepted from across the tunnel; any other is dropped and counted
