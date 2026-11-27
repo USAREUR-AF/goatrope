@@ -5,8 +5,10 @@
 - relay TCP and link-initiated traffic (ADR 0004 module 2): `protocol = "tcp"` rules (accepted only
   from the rule's remote, a connection opened from the link address, copied both ways with
   half-close, `max_connections`, default 64); `direction = "link-to-remote"` for UDP and TCP, with a
-  required `sources` list and `remote_port`; `both` refused for TCP. relay.health counts
-  connections, bytes each way and denials per rule. Namespace phase `relay-tcp`.
+  required `sources` list and `remote_port`; `both` refused for TCP. A dead peer frees its slot
+  within 2 minutes (keepalive 60 s idle, 6 probes 10 s apart, and `TCP_USER_TIMEOUT` 120 s);
+  `TCP_NODELAY` on both sockets. relay.health counts connections, bytes each way, denials and
+  broken connections per rule. Namespace phase `relay-tcp`.
 - relay service (ADR 0004 module 1): `goatrope install` writes and starts `goatrope-relay.service`
   for a declaration with `[relay]`, which may now be the only role; a refusal is not restarted.
   `check` reads the unit and the age of `relay.health` (stale after 10 s); `status` shows the rules

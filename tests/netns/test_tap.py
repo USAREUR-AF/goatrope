@@ -1560,9 +1560,33 @@ def phase_relay_tcp() -> None:
                "relay tcp: relay.health counts connections, bytes each way and denials per rule",
                f"7100 {t}; 8000 {lu}; 8001 {lt}")
         p = gr("status", "--config", CFG)
-        result("over the limit" in p.stdout and "link-to-remote" not in p.stdout and "connections from 192.0.2.2" in p.stdout,
+        result("over the limit" in p.stdout and "broken" in p.stdout and "link-to-remote" not in p.stdout and "connections from 192.0.2.2" in p.stdout,
                "relay tcp: status shows the TCP and link-initiated rules in words",
                " | ".join(ln.strip() for ln in p.stdout.splitlines() if "rule" in ln)[:400])
+
+        # A remote that vanishes without a FIN (its WireGuard interface taken down): keepalive and the
+        # user timeout free the slot within 120 s (60 s idle, then 6 probes 10 s apart).
+        held = subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, "-c",
+                                 "import socket,time\nc=socket.socket();c.setsockopt(socket.SOL_SOCKET,25,b'wga')\n"
+                                 "c.bind(('10.99.0.2',0));c.connect(('10.99.0.1',7100));time.sleep(600)\n"])
+        end = time.monotonic() + 20
+        while time.monotonic() < end and {(x["protocol"], x["listen_port"]): x for x in relay_rows()}.get(("tcp", 7100), {}).get("connections") != 1:
+            time.sleep(0.5)
+        t0 = time.monotonic()
+        sh("ip -n remote link set wga down")
+        row, freed = {}, None
+        while time.monotonic() < t0 + 200:
+            row = {(x["protocol"], x["listen_port"]): x for x in relay_rows()}.get(("tcp", 7100), {})
+            if row.get("connections") == 0:
+                freed = time.monotonic() - t0
+                break
+            time.sleep(1)
+        held.kill()
+        sh("ip -n remote link set wga up")
+        sh("ip -n remote route replace 10.99.0.1/32 dev wga metric 1")
+        result(freed is not None and freed <= 135 and row.get("broken") == 1,
+               "relay tcp: a remote that vanishes without a FIN frees its slot at the 120 s bound (relay.health is rewritten every 2 s)",
+               f"freed after {freed if freed is None else round(freed)} s; connections {row.get('connections')}, broken {row.get('broken')}")
         result(relay.poll() is None, "relay tcp: the relay kept running", f"exit {relay.poll()}")
     finally:
         relay.terminate()

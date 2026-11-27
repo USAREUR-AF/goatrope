@@ -12,6 +12,13 @@
 //!
 //! Every other connection is closed at once and counted as denied. At most `max_connections`
 //! are open on a rule at once; one more is closed and counted as over the limit.
+//!
+//! A peer that vanishes without closing (the normal case when a WireGuard path dies) is found
+//! within DEAD_PEER_S: both sockets of a connection send keepalive probes after 60 s idle, every
+//! 10 s, and give up after 6 unanswered (TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT), and data
+//! not acknowledged within the same 120 s fails the connection (TCP_USER_TIMEOUT). The
+//! connection is then closed both ways and counted as broken. TCP_NODELAY is set on both
+//! sockets: tactical feeds are small messages, and Nagle's algorithm would hold them back.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -24,6 +31,11 @@ use crate::config::{Relay, RelayRule};
 use crate::relay::{any_of, bound_fd};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEPIDLE_S: libc::c_int = 60;
+const KEEPINTVL_S: libc::c_int = 10;
+const KEEPCNT: libc::c_int = 6;
+/// The longest a dead peer holds a connection slot: KEEPIDLE_S + KEEPINTVL_S * KEEPCNT.
+pub const DEAD_PEER_S: libc::c_int = KEEPIDLE_S + KEEPINTVL_S * KEEPCNT;
 
 /// A rule's counters, written to relay.health by the relay's main loop.
 #[derive(Default)]
@@ -37,6 +49,8 @@ pub struct Counters {
     pub over_limit: AtomicU64,
     /// connections to the far side that failed
     pub send_errors: AtomicU64,
+    /// connections ended by an error: a reset, or a peer that stopped answering (keepalive, user timeout)
+    pub broken: AtomicU64,
 }
 
 impl Counters {
@@ -44,14 +58,15 @@ impl Counters {
     pub fn json(&self) -> String {
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "\"connections\": {}, \"accepted\": {}, \"bytes_to_link\": {}, \"bytes_to_remote\": {}, \"denied\": {}, \"over_limit\": {}, \"send_errors\": {}",
+            "\"connections\": {}, \"accepted\": {}, \"bytes_to_link\": {}, \"bytes_to_remote\": {}, \"denied\": {}, \"over_limit\": {}, \"send_errors\": {}, \"broken\": {}",
             n(&self.open),
             n(&self.accepted),
             n(&self.bytes_to_link),
             n(&self.bytes_to_remote),
             n(&self.denied),
             n(&self.over_limit),
-            n(&self.send_errors)
+            n(&self.send_errors),
+            n(&self.broken)
         )
     }
 }
@@ -80,6 +95,34 @@ fn connect(dev: &str, from: IpAddr, to: SocketAddr) -> io::Result<TcpStream> {
     Ok(TcpStream::from(fd))
 }
 
+fn opt(fd: libc::c_int, level: libc::c_int, name: libc::c_int, v: libc::c_int) -> io::Result<()> {
+    // SAFETY: v is a c_int of the size given.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Keepalive, the user timeout and no Nagle delay, on one connection's socket.
+fn tune(s: &TcpStream) -> io::Result<()> {
+    let fd = s.as_raw_fd();
+    opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPIDLE_S)?;
+    opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, KEEPINTVL_S)?;
+    opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPCNT)?;
+    opt(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, DEAD_PEER_S * 1000)?;
+    opt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1)
+}
+
 fn set_timeval(fd: libc::c_int, tv: libc::timeval) -> io::Result<()> {
     // SAFETY: tv is a timeval of the size given.
     let rc = unsafe {
@@ -98,14 +141,14 @@ fn set_timeval(fd: libc::c_int, tv: libc::timeval) -> io::Result<()> {
 }
 
 /// Copy from one stream to the other until the sender closes, then close the sending half of
-/// the other (a half-close). An error closes both streams both ways.
-fn pump(mut from: TcpStream, mut to: TcpStream, bytes: &AtomicU64) {
+/// the other (a half-close). An error closes both streams both ways; it returns false then.
+fn pump(mut from: TcpStream, mut to: TcpStream, bytes: &AtomicU64) -> bool {
     let mut buf = vec![0u8; 16384];
     loop {
         match from.read(&mut buf) {
             Ok(0) => {
                 let _ = to.shutdown(Shutdown::Write);
-                return;
+                return true;
             }
             Ok(k) => {
                 if to.write_all(&buf[..k]).is_err() {
@@ -119,6 +162,7 @@ fn pump(mut from: TcpStream, mut to: TcpStream, bytes: &AtomicU64) {
     }
     let _ = from.shutdown(Shutdown::Both);
     let _ = to.shutdown(Shutdown::Both);
+    false
 }
 
 /// Bind the rule's listening socket (an error is returned at once), then accept on a thread of its own.
@@ -174,6 +218,10 @@ pub fn start(r: &Relay, rule: &RelayRule, link_addr: IpAddr, clients: Vec<IpAddr
 }
 
 fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l2r: bool, c: &Arc<Counters>) {
+    if tune(&conn).is_err() {
+        c.send_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let out = match connect(out_dev, out_addr, dest) {
         Ok(s) => s,
         Err(_) => {
@@ -181,6 +229,10 @@ fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l
             return; // conn is dropped: the client sees the connection closed
         }
     };
+    if tune(&out).is_err() {
+        c.send_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let (Ok(conn2), Ok(out2)) = (conn.try_clone(), out.try_clone()) else {
         c.send_errors.fetch_add(1, Ordering::Relaxed);
         return;
@@ -191,6 +243,9 @@ fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l
         let bytes = if l2r { &c2.bytes_to_remote } else { &c2.bytes_to_link };
         pump(conn2, out2, bytes)
     });
-    pump(out, conn, if l2r { &c.bytes_to_link } else { &c.bytes_to_remote });
-    let _ = forward.join();
+    let back = pump(out, conn, if l2r { &c.bytes_to_link } else { &c.bytes_to_remote });
+    let fwd = forward.join().unwrap_or(false);
+    if !(back && fwd) {
+        c.broken.fetch_add(1, Ordering::Relaxed);
+    }
 }

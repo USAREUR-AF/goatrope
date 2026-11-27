@@ -161,8 +161,14 @@ each side has closed; a side that closes only its sending half is passed on as a
 A connection it does not accept is closed at once and counted as denied. `max_connections`
 (default 64) bounds the connections open on a rule at once; one more is closed and counted.
 `direction = "both"` is refused for TCP, because a connection always carries both directions.
+A peer that vanishes without closing (the normal case when a WireGuard path dies) frees its slot
+within a fixed 2 minutes: both sockets of a connection send keepalive probes after 60 s idle,
+every 10 s, and give up after 6 unanswered, and data not acknowledged within 120 s fails the
+connection (`TCP_USER_TIMEOUT`); it is then closed both ways and counted as broken. Both sockets
+have `TCP_NODELAY`, so small messages are not held back.
 `relay.health` counts, per rule, the datagrams each way (UDP) or the connections open and
-accepted and the bytes each way (TCP), and what was denied, over the limit or could not be sent.
+accepted and the bytes each way (TCP), and what was denied, over the limit, could not be sent or
+broken.
 Examples: `examples/relay-over-mesh.toml`, `examples/relay-boundary.toml`,
 `examples/relay-link-initiated.toml`.
 
@@ -225,7 +231,8 @@ the host's kernel. No hardware is involved. They cover:
   leaves only the declaration and `--purge` leaves nothing; a declaration with a tap and a relay
   installs, checks and removes both;
 - `relay-tcp` (ADR 0004 module 2): TCP both ways through a rule with a half-close; a connection
-  from another peer denied; `max_connections` enforced; link-initiated UDP and TCP flows reach the
+  from another peer denied; `max_connections` enforced; a remote that vanishes without a FIN
+  freed at the 120 s bound; link-initiated UDP and TCP flows reach the
   remote and are answered; a link address not in `sources` denied; refusals of TCP `both` and of a
   missing or off-link `sources`;
 - the relay's boundary transport: its own interface with one peer, drift and refusals;

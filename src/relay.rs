@@ -634,14 +634,15 @@ pub fn status(cfg: &Config) {
             let n = |k: &str| x[k].as_u64().unwrap_or(0);
             if rule.protocol == "tcp" {
                 println!(
-                    "         {} open now, {} accepted, {} bytes to the link, {} bytes to the remote, {} denied, {} over the limit, {} could not connect",
+                    "         {} open now, {} accepted, {} bytes to the link, {} bytes to the remote, {} denied, {} over the limit, {} could not connect, {} broken",
                     n("connections"),
                     n("accepted"),
                     n("bytes_to_link"),
                     n("bytes_to_remote"),
                     n("denied"),
                     n("over_limit"),
-                    n("send_errors")
+                    n("send_errors"),
+                    n("broken")
                 );
             } else {
                 println!(
