@@ -37,7 +37,7 @@ The relay's parts, and the data paths under them, each with its status on `main`
 | The relay as a service | `[relay]`; `goatrope install` writes `goatrope-relay.service` | built ([ADR 0004](docs/adr/0004-relay-1-0.md) §1) |
 | UDP rules, remote to link, with replies | `[relay].allow`, `protocol = "udp"`, `direction = "remote-to-link"` or `"both"` | built ([ADR 0002](docs/adr/0002-relay.md)) |
 | TCP rules, and traffic that machines on the link start | `protocol = "tcp"`; `direction = "link-to-remote"` with `sources` | built (ADR 0004 §2) |
-| Multicast groups on the link | | designed (ADR 0004 §3), not built |
+| Multicast groups on the link | a rule's multicast `target` (remote to link, `ttl`); `group` on a `link-to-remote` rule, sent to every listed `remote` | built (ADR 0004 §3): a group from the link reached two remotes, 50 of 50 at each; a remote's datagrams reached the link as the group, 30 of 30; the link interface joined the declared group only |
 | A remote machine under a local address of its own | `[[relay.proxy]]` and a rule's `link_address` | built (ADR 0004 §4) |
 | Frames from a tap port sent to a remote collector as ERSPAN | `[[tap.mirror]]` | designed (ADR 0004 §5), not built; the kernel path it uses is measured in [performance.md](docs/performance.md) |
 | One port bridged to one peer, filtered by EtherType and source MAC | `[[relay.l2]]` with `accept_layer2 = true` | built (ADR 0004 §6); also run in the emulated arm64 VM |
@@ -192,6 +192,13 @@ interface and address. Everything else is dropped and counted. The rules and the
 | `remote-to-link` | `udp` or `tcp` | the remote interface, `listen_port` | the rule's `remote` only | `target`:`target_port` on the link, from its link address | `remote`, `listen_port`, `target`, `target_port` |
 | `both` | `udp` | as above | as above; and replies from the target only | as above, and the target's replies back to the remote | as above |
 | `link-to-remote` | `udp` or `tcp` | its link address, `listen_port` | the `sources` listed (the link is not authenticated, so the list is the control) | `remote`:`remote_port` through the remote interface; UDP replies go back to the sender | `remote`, `listen_port`, `remote_port`, `sources` |
+| `remote-to-link`, multicast `target` | `udp` | the remote interface, `listen_port` | the rule's `remote` only | the group `target`:`target_port` on the link interface only, with `ttl` (default 1), not looped back | as `remote-to-link`; optional `ttl` |
+| `link-to-remote` with `group` | `udp` | the `group` at `listen_port`, joined on the link interface only | the `sources` listed | one unicast copy of each datagram to every `remote` listed (`remote` may be a list) at `remote_port`; no replies | as `link-to-remote`, plus `group` |
+
+Multicast: a group is IPv4 and outside 224.0.0.0/24 (the local network control block); IPv6
+multicast is not built. Joining sends IGMP membership reports on the link; these are the only
+frames multicast adds. The tunnel carries no multicast, so a group crosses as unicast copies; a
+second relay at the far end can send the stream onto its own link as a group again.
 
 TCP: the relay accepts a connection, opens one to the other side, and copies both ways until
 each side has closed; a side that closes only its sending half is passed on as a half-close.
@@ -207,7 +214,7 @@ have `TCP_NODELAY`, so small messages are not held back.
 accepted and the bytes each way (TCP), and what was denied, over the limit, could not be sent or
 broken.
 Examples: `examples/relay-over-mesh.toml`, `examples/relay-boundary.toml`,
-`examples/relay-link-initiated.toml`.
+`examples/relay-link-initiated.toml`, `examples/relay-multicast.toml`.
 
 A declaration may hold only `[relay]`. `goatrope install` then installs the software, the
 declaration and `goatrope-relay.service`, and touches no tap port, network file, sysctl or
@@ -396,6 +403,11 @@ the host's kernel. No hardware is involved. They cover:
   freed at the 120 s bound; link-initiated UDP and TCP flows reach the
   remote and are answered; a link address not in `sources` denied; refusals of TCP `both` and of a
   missing or off-link `sources`;
+- `relay-multicast` (ADR 0004 module 3): a group stream from the link reaches two remotes; an
+  unlisted source and a group not named are not forwarded; a remote's datagrams arrive on the
+  link as the group with TTL 1; `/proc/net/igmp` lists the declared group on the link interface
+  only, and it is left when the relay stops; on the link the relay sends only ARP, IGMP reports
+  and the group datagrams;
 - the relay's boundary transport: its own interface with one peer, drift and refusals;
 - `proxy` (ADR 0004 module 4): an address another machine on the link holds is not taken (probes
   sent, no announcement, datagrams for its rule counted as send errors); once free it is probed,

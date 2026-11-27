@@ -1,0 +1,17 @@
+# goatrope declaration: A relay that carries a multicast stream both ways (ADR 0004 §3). A sensor
+# sends its track stream to a group on its own network; the relay joins that group on its link
+# interface only and sends each datagram, as unicast through the WireGuard mesh, to two
+# controllers. A controller's commands arrive on the link as a group of their own.
+# Addresses and ports are documentation values.
+schema = 1
+
+[relay]
+remote_interface = "wt0"          # the mesh's kernel WireGuard interface
+link_interface = "eth1"           # the sensor's network, an interface of its own
+link_address = "192.0.2.50/24"    # the relay's address on that network
+allow = [
+  # the sensor's group stream, from the sensor only, to both controllers
+  { direction = "link-to-remote", protocol = "udp", group = "239.1.2.3", remote = ["203.0.113.20", "203.0.113.21"], listen_port = 40400, remote_port = 40400, sources = ["192.0.2.10"] },
+  # the first controller's datagrams, sent onto the link to the group 239.1.2.5, one hop
+  { direction = "remote-to-link", protocol = "udp", remote = "203.0.113.20", listen_port = 40500, target = "239.1.2.5", target_port = 40500, ttl = 1 },
+]

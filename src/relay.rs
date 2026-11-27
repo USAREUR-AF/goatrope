@@ -12,7 +12,9 @@
 //! accepted, and the remote's port. Everything else is dropped and counted.
 //!
 //! The relay TRANSMITS on the link, from its own interface and address. It never
-//! uses a tap port, never bridges and forwards no broadcast or multicast.
+//! uses a tap port, never bridges and forwards no broadcast. Multicast (docs/adr/0004 §3)
+//! only as a rule names it: a remote's datagrams sent to one group on the link, or one
+//! group joined on the link interface and sent, as unicast, to each listed remote.
 //! An interface that is not there (a mesh client not started yet, or restarting) is waited for,
 //! at start and after a restart, and is never a refusal: relay.health and `check` say what the
 //! relay is waiting for. The relay stops (exit 1) when IP forwarding is turned on, or when one of
@@ -247,8 +249,8 @@ struct RuleState<'a> {
     rule: &'a RelayRule,
     /// the senders `listen` accepts
     clients: Vec<IpAddr>,
-    /// where their datagrams go
-    dest: Option<SocketAddr>,
+    /// where their datagrams go: one machine, the group on the link, or (a group rule) every remote
+    dests: Vec<SocketAddr>,
     listen: UdpSocket,
     /// one per client
     outs: Vec<UdpSocket>,
@@ -257,6 +259,8 @@ struct RuleState<'a> {
     replies: bool,
     /// the rule's proxy address is held (None: the rule sends from the relay's own address)
     held: Option<Hold>,
+    /// a group rule: the relay's own link address, whose datagrams to the group are never sent back
+    own: Option<IpAddr>,
     to_link: u64,
     to_remote: u64,
     denied: u64,
@@ -276,11 +280,11 @@ fn json_float(f: f64) -> String {
 
 /// Where a rule sends: the target on the link, or (link-to-remote) the remote.
 fn dest_of(rule: &RelayRule) -> String {
-    let (a, p) = if rule.link_initiated() { (&rule.remote, rule.remote_port) } else { (&rule.target, rule.target_port) };
-    if a.contains(':') {
-        format!("[{a}]:{p}")
+    let at = |a: &String, p: u16| if a.contains(':') { format!("[{a}]:{p}") } else { format!("{a}:{p}") };
+    if rule.link_initiated() {
+        rule.remotes.iter().map(|a| at(a, rule.remote_port)).collect::<Vec<_>>().join(", ")
     } else {
-        format!("{a}:{p}")
+        at(&rule.target, rule.target_port)
     }
 }
 
@@ -314,6 +318,50 @@ pub fn reassembly() -> (u64, u64) {
         }
     }
     (fails, timeouts)
+}
+
+/// The interface's index, or an error naming it.
+fn index_of(dev: &str) -> io::Result<u32> {
+    ifindex(dev).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no interface {dev}")))
+}
+
+fn mreqn(group: std::net::Ipv4Addr, local: std::net::Ipv4Addr, ifindex: u32) -> libc::ip_mreqn {
+    libc::ip_mreqn {
+        imr_multiaddr: libc::in_addr { s_addr: u32::from_ne_bytes(group.octets()) },
+        imr_address: libc::in_addr { s_addr: u32::from_ne_bytes(local.octets()) },
+        imr_ifindex: ifindex as libc::c_int,
+    }
+}
+
+fn v4(a: IpAddr) -> io::Result<std::net::Ipv4Addr> {
+    match a {
+        IpAddr::V4(x) => Ok(x),
+        IpAddr::V6(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "IPv6 multicast is not built")),
+    }
+}
+
+/// The socket a remote-to-link rule sends to a group with: from the link address, out of the link
+/// interface only, with the declared TTL, and never looped back to this machine.
+fn group_sender(dev: &str, local: IpAddr, ttl: u8, freebind: bool) -> io::Result<UdpSocket> {
+    let sock = bound_free(dev, local, 0, freebind)?;
+    let fd = sock.as_raw_fd();
+    setopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_IF, &mreqn(std::net::Ipv4Addr::UNSPECIFIED, v4(local)?, index_of(dev)?))?;
+    setopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_TTL, &(ttl as libc::c_int))?;
+    setopt(fd, libc::IPPROTO_IP, libc::IP_MULTICAST_LOOP, &(0 as libc::c_int))?;
+    Ok(sock)
+}
+
+/// The socket a link-to-remote rule receives a group with: bound to group:port on the link
+/// interface, a member of that group on the link interface only, and of no other group.
+fn group_receiver(dev: &str, local: IpAddr, group: IpAddr, port: u16) -> io::Result<UdpSocket> {
+    let fd = bound_fd_free(dev, group, port, libc::SOCK_DGRAM, false)?;
+    let raw = fd.as_raw_fd();
+    // only the groups this socket joined, not every group any socket on the machine joined
+    setopt(raw, libc::IPPROTO_IP, libc::IP_MULTICAST_ALL, &(0 as libc::c_int))?;
+    setopt(raw, libc::IPPROTO_IP, libc::IP_ADD_MEMBERSHIP, &mreqn(v4(group)?, v4(local)?, index_of(dev)?))?;
+    let sock = UdpSocket::from(fd);
+    sock.set_nonblocking(true)?;
+    Ok(sock)
 }
 
 /// Each interface the relay's sockets are bound to, and its index then.
@@ -472,14 +520,16 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         let link_ip = link_addr.to_string();
         let l2r = rule.link_initiated();
         let remote = ip(&rule.remote)?;
-        let (clients, dest) = if l2r {
-            (rule.sources.iter().map(|s| ip(s)).collect::<Result<Vec<_>, _>>()?, SocketAddr::new(remote, rule.remote_port))
+        let (clients, dests) = if l2r {
+            let dests = rule.remotes.iter().map(|a| Ok(SocketAddr::new(ip(a)?, rule.remote_port))).collect::<Result<Vec<_>, String>>()?;
+            (rule.sources.iter().map(|s| ip(s)).collect::<Result<Vec<_>, _>>()?, dests)
         } else {
-            (vec![remote], SocketAddr::new(ip(&rule.target)?, rule.target_port))
+            (vec![remote], vec![SocketAddr::new(ip(&rule.target)?, rule.target_port)])
         };
+        let on = if rule.group.is_empty() { link_ip.to_string() } else { format!("group {}", rule.group) };
         let shown = if l2r {
             format!(
-                "{} -> {link_ip}:{} on {} => {} -> {} on {} ({} {})",
+                "{} -> {on}:{} on {} => {} -> {} on {} ({} {})",
                 rule.sources.join(","),
                 rule.listen_port,
                 r.link_interface,
@@ -502,29 +552,41 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             )
         };
         if rule.protocol == "tcp" {
-            let c = relay_tcp::start(r, rule, link_addr, held, clients, dest)?;
+            let c = relay_tcp::start(r, rule, link_addr, held, clients, dests[0])?;
             tcp.push((rule, c));
             println!("goatrope relay: {shown}");
             continue;
         }
         let (listen, outs) = if l2r {
-            let listen = sized(bound_free(&r.link_interface, link_addr, rule.listen_port, free), rule).map_err(|e| sys::strerror(&e))?;
+            let listen = if rule.group.is_empty() {
+                bound_free(&r.link_interface, link_addr, rule.listen_port, free)
+            } else {
+                group_receiver(&r.link_interface, link_addr, ip(&rule.group)?, rule.listen_port)
+            };
+            let listen = sized(listen, rule).map_err(|e| sys::strerror(&e))?;
             let outs = clients.iter().map(|_| sized(bound(&r.remote_interface, any_of(remote), 0), rule)).collect::<io::Result<Vec<_>>>();
             (listen, outs.map_err(|e| sys::strerror(&e))?)
         } else {
             let listen = sized(bound(&r.remote_interface, any_of(remote), rule.listen_port), rule).map_err(|e| sys::strerror(&e))?;
-            (listen, vec![sized(bound_free(&r.link_interface, link_addr, 0, free), rule).map_err(|e| sys::strerror(&e))?])
+            let out = if rule.multicast() {
+                group_sender(&r.link_interface, link_addr, rule.ttl, free)
+            } else {
+                bound_free(&r.link_interface, link_addr, 0, free)
+            };
+            (listen, vec![sized(out, rule).map_err(|e| sys::strerror(&e))?])
         };
         let n = clients.len();
         state.push(RuleState {
             rule,
             clients,
-            dest: Some(dest),
+            dests,
             listen,
             outs,
             peers: vec![None; n],
-            replies: l2r || rule.direction == "both",
+            // replies go back to one sender; a group rule has none
+            replies: (l2r && rule.group.is_empty()) || rule.direction == "both",
             held,
+            own: if rule.group.is_empty() { None } else { Some(link_addr) },
             to_link: 0,
             to_remote: 0,
             denied: 0,
@@ -795,6 +857,9 @@ impl Datapath for Batched {
                 };
                 match out {
                     None => {
+                        if Some(src.ip()) == st.own {
+                            continue; // this machine's own datagram to the group: never sent back where it came from
+                        }
                         let Some(c) = st.clients.iter().position(|a| *a == src.ip()) else {
                             st.denied += 1;
                             if log.0.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
@@ -805,13 +870,14 @@ impl Datapath for Batched {
                             continue;
                         };
                         st.peers[c] = Some(src);
-                        match st.dest {
-                            Some(_) if !l2r && link_blocked => st.send_errors += 1,
-                            Some(to) => via.push((i, Some(c), to)),
-                            None => st.send_errors += 1,
+                        if !l2r && link_blocked {
+                            st.send_errors += 1;
+                        } else {
+                            // one copy per destination: one machine, the group, or (a group rule) every remote
+                            via.extend(st.dests.iter().map(|&to| (i, Some(c), to)));
                         }
                     }
-                    Some(k) => match st.peers[k].filter(|_| st.replies && Some(src) == st.dest) {
+                    Some(k) => match st.peers[k].filter(|_| st.replies && st.dests.contains(&src)) {
                         Some(_) if l2r && link_blocked => st.send_errors += 1,
                         Some(peer) => via.push((i, None, peer)),
                         None => st.denied += 1,
@@ -823,24 +889,28 @@ impl Datapath for Batched {
             socks.sort();
             socks.dedup();
             for sk in socks {
-                self.keep.clear();
-                for &(i, _, to) in via.iter().filter(|v| v.1 == sk) {
-                    let j = self.keep.len();
-                    to_sockaddr(to, &mut self.to[j]);
-                    self.keep.push(i);
+                let mine: Vec<(usize, SocketAddr)> = via.iter().filter(|v| v.1 == sk).map(|v| (v.0, v.2)).collect();
+                // at most BATCH per sendmmsg: a group rule sends each datagram to several remotes
+                for chunk in mine.chunks(BATCH) {
+                    self.keep.clear();
+                    for &(i, to) in chunk {
+                        let j = self.keep.len();
+                        to_sockaddr(to, &mut self.to[j]);
+                        self.keep.push(i);
+                    }
+                    let (sent, failed) = self.send(match sk {
+                        Some(c) => &st.outs[c],
+                        None => &st.listen,
+                    });
+                    // from the listening socket toward the rule's destination; back toward the sender for replies
+                    let toward_link = if sk.is_some() { !l2r } else { l2r };
+                    if toward_link {
+                        st.to_link += sent;
+                    } else {
+                        st.to_remote += sent;
+                    }
+                    st.send_errors += failed;
                 }
-                let (sent, failed) = self.send(match sk {
-                    Some(c) => &st.outs[c],
-                    None => &st.listen,
-                });
-                // from the listening socket toward the rule's destination; back toward the sender for replies
-                let toward_link = if sk.is_some() { !l2r } else { l2r };
-                if toward_link {
-                    st.to_link += sent;
-                } else {
-                    st.to_remote += sent;
-                }
-                st.send_errors += failed;
             }
             if n < BATCH {
                 return;
@@ -1039,6 +1109,22 @@ pub fn status(cfg: &Config) {
                 rule.sources.join(", "),
                 dest_of(rule),
                 rule.max_connections
+            ),
+            (true, _) if !rule.group.is_empty() => format!(
+                "udp group {} port {} on {}: datagrams from {} go to {} (each one to every remote)",
+                rule.group,
+                rule.listen_port,
+                r.link_interface,
+                rule.sources.join(", "),
+                dest_of(rule)
+            ),
+            (false, _) if rule.multicast() => format!(
+                "udp port {}: from {} to the group {} on {} (ttl {})",
+                rule.listen_port,
+                rule.remote,
+                dest_of(rule),
+                r.link_interface,
+                rule.ttl
             ),
             (true, _) => format!(
                 "udp port {} on {}: datagrams from {} go to {}, and its replies back",

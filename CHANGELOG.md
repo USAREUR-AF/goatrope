@@ -53,6 +53,11 @@
   announces it, holds it while the remote's WireGuard peer has a handshake younger than 180 s, and
   removes it when the handshake is stale, another machine claims it, or the relay stops. `check`,
   `status` and `relay.health` report it. Namespace phase `proxy`.
+- relay multicast (ADR 0004 module 3): a remote-to-link rule may send to a group on the link
+  (`IP_MULTICAST_IF` on the link interface, `ttl` default 1, loop off); a link-to-remote rule
+  with `group` joins it on the link interface only and sends each datagram from a listed source,
+  as unicast, to every listed `remote`. Groups in 224.0.0.0/24 and IPv6 groups are refused.
+  Namespace phase `relay-multicast`.
 - relay TCP and link-initiated traffic (ADR 0004 module 2): `protocol = "tcp"` rules (accepted only
   from the rule's remote, a connection opened from the link address, copied both ways with
   half-close, `max_connections`, default 64); `direction = "link-to-remote"` for UDP and TCP, with a
