@@ -3589,6 +3589,23 @@ def phase_mirror() -> None:
     p = gr("status", "--config", CFG)
     line = next((ln for ln in p.stdout.splitlines() if "mirror goatrope-m7" in ln), "")
     result("session 7" in line and "203.0.113.2" in line and "wg0" in line, "mirror: status lists the mirror", line.strip())
+    # The listen egress drop stands beside the mirror: one clsact, the drop at its own pref, and it
+    # still drops what this machine tries to send on the port.
+    def drops() -> int:
+        m = __import__("re").search(r"dropped (\d+)", sh("tc -s filter show dev tp0 egress pref 1").stdout)
+        return int(m.group(1)) if m else -1
+    qd = [ln for ln in sh("tc qdisc show dev tp0").stdout.splitlines() if "clsact" in ln]
+    egress, ingress = sh("tc filter show dev tp0 egress").stdout, sh("tc filter show dev tp0 ingress").stdout
+    d0 = drops()
+    tx = ("import socket\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\ns.bind(('tp0',0))\n"
+          "n=0\nfor i in range(20):\n try:\n  s.send(b'\\xff'*6+b'\\x02'*6+b'\\x88\\xb5'+b'mirror-tx'*8)\n"
+          " except OSError: n+=1\nprint(n)\n")  # a dropped send returns ENOBUFS to the sender
+    refused = sh(f"python3 -c \"{tx}\"", check=False).stdout.strip()
+    d1 = drops()
+    result(len(qd) == 1 and "pref 1 matchall" in egress and "gact action drop" in egress and "pref 1007" in ingress
+           and "mirred" in ingress and "pref 1007" not in egress and d1 - d0 >= 20,
+           "mirror: the listen egress drop stays (one clsact, drop at pref 1, mirror at ingress pref 1007) and drops what is sent",
+           f"{len(qd)} clsact; egress drop counted {d1 - d0} of 20 frames sent on tp0; {refused} sends refused with an error")
     frags = frag_creates()
     inject_udp("feed", "f0", MIRROR_SENT["SM"], b"SM", 5000, 80, False)
     inject_udp("feed", "f0", MIRROR_SENT["BG"], b"BG", 5001, 1514, True)  # a 1,500-byte packet, DF set
