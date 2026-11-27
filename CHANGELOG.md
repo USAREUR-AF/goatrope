@@ -6,12 +6,12 @@
   (64, 512 and 1,400-byte payloads, loss under 0.1 %, added latency), of the remote mirror
   (frames with none lost at the collector) and of decode-and-send with a converter run once per
   message. Measurements only; run.sh runs it in its own container.
-- relay address proxy (ADR 0004 module 4): `[[relay.proxy]]` gives a remote machine an IPv4
-  address of its own on the link, and a rule's `link_address` (any protocol or direction) uses it
-  there. The relay adds it as a /32 (`noprefixroute`) only after an RFC 5227 ARP probe finds no other holder, announces it,
-  holds it while the remote's WireGuard peer has a handshake younger than 180 s, and removes it
-  when the handshake is stale, another machine claims it, or the relay stops. `check`, `status`
-  and `relay.health` report it. Namespace phase `proxy`.
+- relay address proxy (ADR 0004 module 4): `[[relay.proxy]]` gives a remote machine an IPv4 address
+  of its own on the link, and a rule's `link_address` (any protocol or direction) uses it there. The
+  relay adds it as a /32 (`noprefixroute`) only after an RFC 5227 ARP probe finds no other holder,
+  announces it, holds it while the remote's WireGuard peer has a handshake younger than 180 s, and
+  removes it when the handshake is stale, another machine claims it, or the relay stops. `check`,
+  `status` and `relay.health` report it. Namespace phase `proxy`.
 - relay TCP and link-initiated traffic (ADR 0004 module 2): `protocol = "tcp"` rules (accepted only
   from the rule's remote, a connection opened from the link address, copied both ways with
   half-close, `max_connections`, default 64); `direction = "link-to-remote"` for UDP and TCP, with a
