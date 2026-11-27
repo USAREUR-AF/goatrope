@@ -57,6 +57,15 @@
   `check` reads the unit and the age of `relay.health` (stale after 10 s); `status` shows the rules
   and counters; `uninstall` removes the unit, `relay.health` and a boundary interface. `wip` is no
   longer required (`wip = true` is accepted and does nothing). Namespace phase `relay-service`.
+- remote mirror (ADR 0004 module 5): `[[tap.mirror]]` sends whole frames from tap ports, through
+  tc `mirred` and an optional BPF filter, to a collector as ERSPAN type II over the mesh; outer
+  packets may be fragmented, so 1,500-byte frames cross a 1,280-byte mesh MTU. Phase `mirror`
+  (two containers over WireGuard), on 24.04 and 26.04: 160 of 160 mirrored frames arrived, 50 of
+  50 at 1,514 bytes; 0 of 40 filtered or unmirrored frames; 0 frames on the tapped link.
+- listen source `erspan`: the interface no longer checks the receive sequence, so a sender that
+  restarts is recorded (before: every frame dropped until its count passed the old one); its MTU
+  is fixed at 9,000, so over an underlay below 1,280 (a mesh) it keeps IPv6 settings that are
+  turned off and checked.
 - ADR 0004 (Accepted): the relay reaches 1.0 in six modules: a service, TCP and link-initiated
   traffic, multicast, an address proxy, a remote mirror over ERSPAN, and an opt-in layer-2 lane.
 

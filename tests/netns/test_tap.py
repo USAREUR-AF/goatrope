@@ -2122,6 +2122,11 @@ print(json.dumps(sorted(got)))
     mirror_udp("span200", 20, b"NO", 9300)
     got = json.loads(rx.communicate(timeout=660)[0] or "[]")
     result(got == list(range(50)), "erspan: [[send]] got every datagram of the declared session", f"{len(got)} of 50")
+    # The switch restarts its session: its sequence numbers start at 0 again.
+    sh("ip -n sw link del span100")
+    sh("ip -n sw link add span100 type erspan seq key 100 local 203.0.113.1 remote 203.0.113.10 erspan_ver 1 erspan 7")
+    sh("ip -n sw link set span100 up")
+    mirror_udp("span100", 20, b"RS", 9300)
     time.sleep(3)  # stopping a recorder loses what tcpdump has not yet written (hardware.md, known limits)
     flush_recorders(["grspan0"])
     frames = ring_frames("grspan0")
@@ -2129,6 +2134,8 @@ print(json.dumps(sorted(got)))
     result(tagged(frames, b"OK") == set(range(50)), "erspan: every mirrored frame of session 100 recorded, decapsulated",
            f"{len(tagged(frames, b'OK'))} of 50 ({len(frames)} frames in the ring)")
     result(not tagged(frames, b"NO"), "erspan: no frame of another session recorded", f"{len(tagged(frames, b'NO'))} of 20")
+    result(tagged(frames, b"RS") == set(range(20)), "erspan: every frame recorded after the sender restarted its session",
+           f"{len(tagged(frames, b'RS'))} of 20; sequence flags {' '.join(w for w in sh('ip -d link show grspan0').stdout.split() if w in ('iseq', 'oseq'))}")
     back = [f for f in up.stop() if len(f) > 23 and f[12:14] == b"\x08\x00" and f[23] == 47]
     result(not back, "erspan: nothing sent back toward the switch in GRE", f"{len(back)} GRE frames")
     sh("ip link del grspan0")
@@ -3443,12 +3450,238 @@ def phase_l2() -> None:
 PHASES["l2"] = phase_l2
 
 
+# ---------------------------------------------------------------- remote mirror (ADR 0004 module 5)
+# Two containers joined by WireGuard over their Docker network: this one is the tap machine and
+# sends the mirror; the other (run.sh starts it) is a goatrope listen tap with source = "erspan"
+# whose underlay is its WireGuard interface. run.sh writes each one's peer (key, address) to PEER.
+
+PEER = f"{WORK}/peer"
+WG_MTU = 1280  # a mesh MTU below 1,500, as NetBird's
+MIRROR_SESSION = 7
+
+COLLECTOR = f"""schema = 1
+[tap]
+mode = "listen"
+source = "erspan"
+ports = ["grspan0"]
+management = "eth0"
+[tap.erspan]
+underlay = "wg0"
+local = "203.0.113.2"
+remote = "203.0.113.1"
+session_id = {MIRROR_SESSION}
+version = 1
+[tap.record]
+ports = ["grspan0"]
+filter = ""
+file_mb = 5
+files = 4
+"""
+
+MIRROR_TABLE = f"""
+[[tap.mirror]]
+ports = ["tp0"]
+underlay = "wg0"
+local = "203.0.113.1"
+remote = "203.0.113.2"
+session_id = {MIRROR_SESSION}
+filter = "not udp port 9999"
+"""
+
+# What the tap machine sends, and so what the collector must (or must not) receive.
+MIRROR_SENT = {"SM": 50, "BG": 50, "IA": 30, "IB": 30}      # mirrored: every one arrives
+MIRROR_HELD = {"FX": 20, "T1": 20}                            # filtered, or on a port not mirrored
+
+
+def wg_key() -> str:
+    priv = sh("wg genkey").stdout.strip()
+    fd = os.open(f"{WORK}/wg.key", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, priv.encode() + b"\n")
+    os.close(fd)
+    return subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True).stdout.strip()
+
+
+def wg_up(mine: str, theirs: str) -> None:
+    key, endpoint = open(PEER).read().split()
+    sh("ip link del wg0", check=False)
+    sh("ip link add wg0 type wireguard")
+    sh(f"cat {WORK}/wg.key | wg set wg0 listen-port 51820 private-key /dev/stdin "
+       f"peer {key} endpoint {endpoint}:51820 allowed-ips {theirs}/32 persistent-keepalive 5")
+    sh(f"ip addr add {mine}/24 dev wg0 && ip link set wg0 mtu {WG_MTU} up")
+
+
+def inject_udp(ns: str, ifname: str, n: int, tag: bytes, dport: int, size: int, df: bool) -> None:
+    """Ethernet frames of size bytes (14 + an IPv4 packet) carrying UDP to dport, sent from ns."""
+    code = ("import socket,struct\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\n"
+            f"s.bind(({ifname!r},0))\n"
+            "def ck(h):\n s=sum(struct.unpack('!10H',h));s=(s>>16)+(s&0xffff);return (~(s+(s>>16)))&0xffff\n"
+            f"for i in range({n}):\n"
+            f" pl={MAGIC!r}+{tag!r}+i.to_bytes(4,'big')\n"
+            f" pl+=b'm'*({size}-14-20-8-len(pl))\n"
+            f" u=struct.pack('!HHHH',40000,{dport},8+len(pl),0)+pl\n"
+            f" h=struct.pack('!BBHHHBBH4s4s',0x45,0,20+len(u),i,{0x4000 if df else 0},64,17,0,bytes([192,0,2,10]),bytes([192,0,2,20]))\n"
+            " h=h[:10]+struct.pack('!H',ck(h))+h[12:]\n"
+            " s.send(b'\\x02\\x00\\x00\\x00\\x00\\x20'+b'\\x02\\x00\\x00\\x00\\x00\\x10'+b'\\x08\\x00'+h+u)\n")
+    sh(f"ip netns exec {ns} python3 -c \"{code}\"")
+
+
+def tc_filters(port: str) -> str:
+    return "".join(sh(f"tc filter show dev {port} {hook}", check=False).stdout for hook in ("ingress", "egress"))
+
+
+def frag_creates() -> int:
+    rows = [ln.split() for ln in open("/proc/net/snmp") if ln.startswith("Ip:")]
+    return int(rows[1][rows[0].index("FragCreates")])
+
+
+def phase_mirror_collector() -> None:
+    """The collector: a goatrope listen tap, source = "erspan", whose underlay is WireGuard."""
+    wg_up("203.0.113.2", "203.0.113.1")
+    write_cfg(COLLECTOR)
+    stand_in_watchdog()
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "mirror collector: install (listen, source erspan, underlay WireGuard wg0)",
+           f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
+    check_exit(0, "mirror collector after install")
+    wait_packet_sockets("grspan0", 1)
+
+
+def phase_mirror() -> None:
+    """The tap machine: [[tap.mirror]] on a listen tap, then on an inline tap."""
+    wg_up("203.0.113.1", "203.0.113.2")
+    ping = sh("ping -c 3 -W 2 203.0.113.2", check=False)
+    result(ping.returncode == 0, "mirror: the collector answers over WireGuard", f"wg0 mtu {WG_MTU}")
+    topo_listen()
+    stand_in_watchdog()
+    listen = LISTEN + MIRROR_TABLE
+    # Refusals: the declaration, then install on the machine, which must change nothing.
+    for bad, want, name in (
+        (listen.replace('underlay = "wg0"', 'underlay = "tp1"'), "is a tap interface", "an underlay that is a tap port"),
+        (listen.replace('ports = ["tp0"]\nunderlay', 'ports = ["tp9"]\nunderlay'), "is not one of [tap].ports", "a port that is not a tap port"),
+        (listen.replace("session_id = 7", "session_id = 1024"), "from 0 to 1023", "a session ID over 1023"),
+        (listen.replace('underlay = "wg0"\n', ''), "missing required key(s) underlay", "no underlay (there is no default)"),
+        (listen + MIRROR_TABLE.replace('remote = "203.0.113.2"', 'remote = "203.0.113.3"'), "same session_id", "two mirrors with one session ID"),
+        (INLINE + MIRROR_TABLE.replace('["tp0"]', '["tp0", "tp1"]'), "exactly 1", "two ports of an inline tap (one bridge port sees both directions)"),
+    ):
+        p = gr("validate", "--config", write_cfg(bad))
+        result(p.returncode == 2 and want in p.stderr, f"mirror: refused: {name}", p.stderr.strip()[-160:])
+    before = snapshot()
+    filters_before = tc_filters("tp0")
+    for bad, want, name in (
+        (listen.replace('underlay = "wg0"', 'underlay = "wg9"'), "underlay wg9 does not exist", "the underlay does not exist"),
+        (listen.replace('local = "203.0.113.1"', 'local = "203.0.113.9"'), "does not hold 203.0.113.9", "the underlay does not hold local"),
+        (listen.replace('remote = "203.0.113.2"', 'remote = "192.0.2.99"'), "not the underlay wg0", "the route to the collector is not by the underlay"),
+        (listen.replace('filter = "not udp port 9999"', 'filter = "udp port nine"'), "cannot compile the filter", "a filter tcpdump cannot compile"),
+    ):
+        p = gr("install", "--config", write_cfg(bad))
+        d = diff(before, snapshot())
+        result(p.returncode == 2 and want in p.stderr and not d and not os.path.exists("/sys/class/net/goatrope-m7"),
+               f"mirror: install refused, changing nothing: {name}", (p.stderr.strip()[-140:] + " " + "; ".join(d))[:300])
+
+    write_cfg(listen)
+    c0, c1 = Capture("feed", "f0", "mirror-f0"), Capture("feed", "f1", "mirror-f1")
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "mirror: install (listen tap, mirror of tp0)", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
+    link = " ".join(sh("ip -d link show goatrope-m7", check=False).stdout.split())
+    result("erspan" in link and "nopmtudisc" in link and "okey 0.0.0.7" in link and "erspan_ver 1" in link,
+           "mirror: an ERSPAN type II interface, key 7, outer fragmentation allowed", link[:220])
+    check_exit(0, "mirror after install")
+    p = gr("status", "--config", CFG)
+    line = next((ln for ln in p.stdout.splitlines() if "mirror goatrope-m7" in ln), "")
+    result("session 7" in line and "203.0.113.2" in line and "wg0" in line, "mirror: status lists the mirror", line.strip())
+    frags = frag_creates()
+    inject_udp("feed", "f0", MIRROR_SENT["SM"], b"SM", 5000, 80, False)
+    inject_udp("feed", "f0", MIRROR_SENT["BG"], b"BG", 5001, 1514, True)  # a 1,500-byte packet, DF set
+    inject_udp("feed", "f0", MIRROR_HELD["FX"], b"FX", 9999, 80, False)    # the filter excludes it
+    inject_udp("feed", "f1", MIRROR_HELD["T1"], b"T1", 5000, 80, False)    # tp1 is not mirrored
+    time.sleep(2)
+    frags = frag_creates() - frags
+    sent = int(open("/sys/class/net/goatrope-m7/statistics/tx_packets").read())
+    result(sent == MIRROR_SENT["SM"] + MIRROR_SENT["BG"], "mirror: the interface sent exactly the copies the filter passes",
+           f"{sent} packets sent, {MIRROR_SENT['SM'] + MIRROR_SENT['BG']} expected; {frags} IPv4 fragments made for wg0 (mtu {WG_MTU})")
+    result(frags >= MIRROR_SENT["BG"], "mirror: 1,500-byte frames were sent fragmented, not dropped or truncated",
+           f"{frags} fragments for {MIRROR_SENT['BG']} full-size frames")
+    sh("systemctl restart goatrope-ports.service"); ports_settled()
+    f0, f1 = c0.stop(), c1.stop()
+    result(not f0 and not f1, "mirror: no frame sent on the tapped link (install, mirror, restart of goatrope-ports)",
+           f"{len(f0)} + {len(f1)} frames reached the feed side")
+    sh("tc filter del dev tp0 ingress pref 1007")
+    check_exit(3, "mirror: the tc filter removed")
+    sh("systemctl restart goatrope-ports.service"); ports_settled()
+    check_exit(0, "mirror: after goatrope-ports restores the filter")
+    sh("ip link del goatrope-m7")
+    check_exit(3, "mirror: the interface removed")
+    gr("install", "--config", CFG)
+    check_exit(0, "mirror: install again restores it")
+    p = gr("uninstall", "--purge")
+    d = diff(before, snapshot())
+    result(p.returncode == 0 and not d and tc_filters("tp0") == filters_before and not os.path.exists("/sys/class/net/goatrope-m7"),
+           "mirror: uninstall removes the interface and the filters and restores the ports",
+           ("; ".join(d) + f" filters now {tc_filters('tp0')!r}")[:400])
+
+    # Inline: one bridge port mirrors both directions of the link.
+    topo_inline()
+    for ns, peer in (("a", "a0"), ("b", "b0")):
+        sh(f"ip netns exec {ns} sysctl -qw net.ipv6.conf.{peer}.disable_ipv6=1")  # the hosts send only what the test sends
+    sh("tc qdisc add dev tp1 clsact && tc filter add dev tp1 ingress pref 9 matchall action pass")  # the operator's own
+    before = snapshot()
+    filters_before = tc_filters("tp0") + tc_filters("tp1")
+    write_cfg(INLINE + MIRROR_TABLE.replace('filter = "not udp port 9999"\n', ""))
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "mirror: install (inline tap, mirror of tp0, every frame)", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+    check_exit(0, "mirror inline after install")
+    cb, ca = Capture("b", "b0", "mirror-b0"), Capture("a", "a0", "mirror-a0")
+    raw_inject("a", "a0", MIRROR_SENT["IA"], b"IA")
+    raw_inject("b", "b0", MIRROR_SENT["IB"], b"IB")
+    fb, fa = cb.stop(), ca.stop()
+    result(tagged(fb, b"IA") == set(range(MIRROR_SENT["IA"])) and len(fb) == MIRROR_SENT["IA"]
+           and tagged(fa, b"IB") == set(range(MIRROR_SENT["IB"])) and len(fa) == MIRROR_SENT["IB"],
+           "mirror inline: the link carries both directions, and nothing else",
+           f"b0 got {len(fb)} frames ({len(tagged(fb, b'IA'))} of {MIRROR_SENT['IA']} from a); a0 got {len(fa)} ({len(tagged(fa, b'IB'))} of {MIRROR_SENT['IB']} from b)")
+    p = gr("uninstall", "--purge")
+    d = diff(before, snapshot())
+    after = tc_filters("tp0") + tc_filters("tp1")
+    result(p.returncode == 0 and not d and after == filters_before,
+           "mirror inline: uninstall restores the ports and keeps the operator's own tc filter", ("; ".join(d) + f" {after!r}")[:400])
+
+
+def phase_mirror_arrived() -> None:
+    """Back on the collector: what reached it over WireGuard, counted from its recording."""
+    time.sleep(3)  # stopping a recorder loses what tcpdump has not yet written
+    flush_recorders(["grspan0"])
+    frames = ring_frames("grspan0")
+    for tag, n in MIRROR_SENT.items():
+        got = tagged(frames, tag.encode())
+        later = " (sent after the mirror interface was made again)" if tag in ("IA", "IB") else ""
+        result(got == set(range(n)), f"mirror collector: every mirrored frame arrived ({tag}){later}", f"{len(got)} of {n}")
+    big = [f for f in frames if MAGIC + b"BG" in f]
+    result(len(big) == MIRROR_SENT["BG"] and all(len(f) == 1514 for f in big),
+           "mirror collector: 1,500-byte frames arrived whole across a WireGuard MTU of 1,280",
+           f"{len(big)} frames, lengths {sorted(set(len(f) for f in big))}")
+    for tag, n in MIRROR_HELD.items():
+        got = tagged(frames, tag.encode())
+        result(not got, f"mirror collector: frames that are not mirrored did not arrive ({tag})", f"{len(got)} of {n}")
+    other = [f for f in frames if MAGIC not in f]
+    result(not other, "mirror collector: only the mirrored frames arrived (the mirror interface sends nothing of its own)",
+           f"{len(other)} other frames: {[f[12:14].hex() for f in other[:5]]}")
+    p = gr("uninstall", "--purge")
+    result(p.returncode == 0, "mirror collector: uninstall", p.stdout.strip()[-200:])
+
+
+PHASES["mirror-collector"] = phase_mirror_collector
+PHASES["mirror"] = phase_mirror
+PHASES["mirror-arrived"] = phase_mirror_arrived
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:
         if name == "topo-inline":
             topo_inline()
             continue
+        if name == "wg-key":  # run.sh reads the public key for the other container's peer
+            print(wg_key())
+            sys.exit(0)
         print(f"# phase {name}", flush=True)
         try:
             PHASES[name]()

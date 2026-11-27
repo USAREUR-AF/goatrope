@@ -119,6 +119,25 @@ for v in "${versions[@]}"; do
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 
+    # The remote mirror: a second container is the collector, reached over WireGuard on the Docker network.
+    k="$c-coll"
+    start "$c" "$v"
+    start "$k" "$v"
+    peer() { # the container's WireGuard public key and its Docker address, for the other one
+        echo "$(docker exec "$1" python3 -I /src/tests/netns/test_tap.py wg-key) $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1")"
+    }
+    pc=$(peer "$c")
+    pk=$(peer "$k")
+    docker exec "$c" sh -c "echo '$pk' > /root/gt/peer"
+    docker exec "$k" sh -c "echo '$pc' > /root/gt/peer"
+    phase "$k" "$log" mirror-collector
+    phase "$c" "$log" mirror
+    phase "$k" "$log" mirror-arrived
+    for x in "$c" "$k"; do
+        docker exec "$x" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
+        docker rm -f "$x" >/dev/null
+    done
+
     # NetworkManager installed and managing the wired ports, as on a desktop image.
     start "$c" "$v-nm"
     phase "$c" "$log" networkmanager

@@ -54,6 +54,23 @@ pub struct Tap {
     pub speed_mbps: Option<i64>,
     pub record: Record,
     pub erspan: Option<Erspan>,
+    /// `[[tap.mirror]]`: frames from tap ports sent to a remote collector as ERSPAN (ADR 0004 §5)
+    pub mirrors: Vec<Mirror>,
+}
+
+/// A remote mirror: frames received on `ports` go, through tc mirred, to an ERSPAN type II
+/// interface goatrope makes, keyed by `session_id`, from `local` on `underlay` to `remote`.
+#[derive(Debug, Clone)]
+pub struct Mirror {
+    pub ports: Vec<String>,
+    /// the interface the ERSPAN packets leave by (the mesh interface); never a tap port
+    pub underlay: String,
+    pub local: String,
+    /// the collector's address
+    pub remote: String,
+    pub session_id: i64,
+    /// a tcpdump filter; empty: every frame
+    pub filter: String,
 }
 
 /// An ERSPAN mirror: the switch sends copies in GRE to `local`; goatrope's `erspan` interface
@@ -513,7 +530,12 @@ fn as_table<'a>(v: &'a Value, where_: &str) -> R<&'a Table> {
 fn tap(v: &Value) -> R<Tap> {
     let w = "[tap]";
     let t = as_table(v, w)?;
-    keys(t, w, &["mode", "ports", "management", "source", "speed_mbps", "record", "erspan"], &["mode", "ports", "management", "record"])?;
+    keys(
+        t,
+        w,
+        &["mode", "ports", "management", "source", "speed_mbps", "record", "erspan", "mirror"],
+        &["mode", "ports", "management", "record"],
+    )?;
     let mode = match &t["mode"] {
         Value::String(s) if s == "inline" || s == "listen" => s.clone(),
         other => return err(format!("{w}.mode must be \"inline\" or \"listen\", not {}", pyrepr(other))),
@@ -590,6 +612,17 @@ fn tap(v: &Value) -> R<Tap> {
             RESERVED_DIRS.join(", ")
         ));
     }
+    let mirrors = match t.get("mirror") {
+        None => vec![],
+        Some(Value::Array(a)) => a.iter().enumerate().map(|(i, m)| mirror_table(m, i, &mode, &ports)).collect::<R<Vec<_>>>()?,
+        Some(m) => vec![mirror_table(m, 0, &mode, &ports)?],
+    };
+    let mut ids: Vec<i64> = mirrors.iter().map(|m| m.session_id).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.len() != mirrors.len() {
+        return err(format!("{w}: two [[tap.mirror]] tables use the same session_id; a collector tells sessions apart by it"));
+    }
     Ok(Tap {
         mode,
         ports,
@@ -604,7 +637,41 @@ fn tap(v: &Value) -> R<Tap> {
             directory: directory.unwrap(),
         },
         erspan,
+        mirrors,
     })
+}
+
+fn mirror_table(v: &Value, i: usize, mode: &str, tap_ports: &[String]) -> R<Mirror> {
+    let w = format!("[[tap.mirror]] {}", i + 1);
+    let t = as_table(v, &w)?;
+    keys(
+        t,
+        &w,
+        &["ports", "underlay", "local", "remote", "session_id", "filter"],
+        &["ports", "underlay", "local", "remote", "session_id"],
+    )?;
+    // as [tap.record]: an inline bridge port sees both directions, so one is the whole link
+    let ports = port_list(&t["ports"], &format!("{w}.ports"), 1, if mode == "inline" { 1 } else { 2 })?;
+    for p in &ports {
+        if !tap_ports.contains(p) {
+            return err(format!("{w}.ports: {p} is not one of [tap].ports"));
+        }
+    }
+    let underlay = ifname(&t["underlay"], &format!("{w}.underlay"))?;
+    if tap_ports.contains(&underlay) || underlay == "goatrope0" {
+        return err(format!("{w}.underlay ({underlay}) is a tap interface; the mirror leaves by another interface, never the tapped link"));
+    }
+    let local = addr(&t["local"], &format!("{w}.local"))?;
+    let remote = addr(&t["remote"], &format!("{w}.remote"))?;
+    if local.contains(':') || remote.contains(':') {
+        return err(format!("{w}: ERSPAN over IPv6 is not built; local and remote are IPv4 addresses"));
+    }
+    if local == remote {
+        return err(format!("{w}: local and remote must differ"));
+    }
+    let session_id = int(t, "session_id", &w, 0, 1023)?;
+    let filter = if t.contains_key("filter") { string(t, "filter", &w)? } else { String::new() };
+    Ok(Mirror { ports, underlay, local, remote, session_id, filter })
 }
 
 fn erspan_table(v: &Value, port: &str) -> R<Erspan> {
@@ -1592,6 +1659,18 @@ CONVERT
         assert!(e(&twice).contains("declared twice"));
         let extra = proxy("192.0.2.60", "198.51.100.5", "192.0.2.60") + "mac = \"02:00:00:00:00:01\"\n";
         assert!(e(&extra).contains("unknown key"));
+    }
+
+    #[test]
+    fn mirrors() {
+        let m = "\n[[tap.mirror]]\nports = [\"tp0\"]\nunderlay = \"wt0\"\nlocal = \"198.51.100.1\"\nremote = \"198.51.100.2\"\nsession_id = 7\n";
+        let t = parse(&(INLINE.to_string() + m), "x.toml").unwrap().tap.unwrap();
+        assert_eq!((t.mirrors.len(), t.mirrors[0].session_id, t.mirrors[0].filter.as_str()), (1, 7, ""));
+        assert!(e(&(INLINE.to_string() + &m.replace("[\"tp0\"]", "[\"tp0\", \"tp1\"]"))).contains("exactly 1"));
+        assert!(e(&(INLINE.to_string() + &m.replace("wt0", "tp1"))).contains("is a tap interface"));
+        assert!(e(&(INLINE.to_string() + &m.replace("session_id = 7\n", ""))).contains("missing required key(s) session_id"));
+        assert!(e(&(INLINE.to_string() + m + &m.replace("198.51.100.2", "198.51.100.3"))).contains("same session_id"));
+        assert!(e(&(INLINE.to_string() + &m.replace("198.51.100.2", "2001:db8::2"))).contains("IPv6 is not built"));
     }
 
     #[test]

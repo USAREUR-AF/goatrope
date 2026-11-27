@@ -1,0 +1,24 @@
+# goatrope declaration: an inline tap that also sends its link, whole, to a remote collector
+# as ERSPAN over the mesh. The collector can be a goatrope listen tap with source = "erspan"
+# (examples/listen-erspan.toml) whose underlay is its own mesh interface.
+# Every value is a placeholder; replace each one.
+schema = 1
+
+[tap]
+mode = "inline"
+ports = ["enxPORTA", "enxPORTB"]
+management = "eth0"
+
+[tap.record]
+ports = ["enxPORTA"]
+filter = ""
+file_mb = 50
+files = 40
+
+[[tap.mirror]]
+ports = ["enxPORTA"]               # one bridge port: both directions of the link
+underlay = "wt0"                   # the mesh interface; never a tap port
+local = "192.0.2.10"               # an address the underlay holds
+remote = "198.51.100.20"           # the collector's address on the mesh
+session_id = 7                     # the collector's session_id (0 to 1023)
+filter = "udp"                     # optional: a BPF filter; "" or absent for every frame

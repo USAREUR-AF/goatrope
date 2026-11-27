@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{self, pystr, Config, Tap};
 use crate::link::SYS_NET;
+use crate::mirror;
 use crate::send;
 use crate::sysutil as su;
 
@@ -148,6 +149,9 @@ ConfigureWithoutCarrier=yes
 
 /// The decapsulating interface, made by systemd-networkd at every boot, as it makes the bridge.
 /// Independent: it is bound to no underlay's .network file, which belongs to the system, not goatrope.
+/// A fixed MTU: the kernel otherwise sizes it from the underlay, and below 1,280 (a mesh) it keeps no
+/// IPv6 settings, so IPv6 could not be turned off and checked. The kernel needs a sequence flag on an
+/// erspan interface; networkd sets both, and goatrope-ports clears the receive check (erspan_seq).
 fn erspan_netdev(port: &str, e: &config::Erspan) -> String {
     let index = if e.version == 1 { "ERSPANIndex=1\n" } else { "" };
     format!(
@@ -155,6 +159,7 @@ fn erspan_netdev(port: &str, e: &config::Erspan) -> String {
 [NetDev]
 Name={port}
 Kind=erspan
+MTUBytes={}
 
 [Tunnel]
 Local={}
@@ -168,6 +173,7 @@ ERSPANVersion={}
         e.gre_key,
         e.remote,
         e.local,
+        mirror::MTU,
         e.local,
         e.remote,
         e.gre_key,
@@ -175,11 +181,23 @@ ERSPANVersion={}
     )
 }
 
+/// The GRE sequence flags of an erspan interface, as `ip -d link` shows them.
+fn erspan_seq(port: &str) -> String {
+    let d = su::run(&["ip", "-d", "link", "show", "dev", port]).stdout;
+    let f: Vec<&str> = d.split_whitespace().filter(|w| *w == "iseq" || *w == "oseq").collect();
+    if f.is_empty() {
+        "none".into()
+    } else {
+        f.join(" ")
+    }
+}
+
 fn tap_names(tap: &Tap) -> Vec<String> {
     let mut names = tap.ports.clone();
     if tap.mode == "inline" {
         names.push(BRIDGE.into());
     }
+    names.extend(mirror::devs(tap));
     names
 }
 
@@ -201,7 +219,7 @@ fn sysctl_file(cfg: &Config) -> String {
 fn ports_unit() -> String {
     format!(
         "{}[Unit]
-Description=goatrope: prepare the tap ports (IPv6, offloads, EEE, speed; listen: egress drop, then link up)
+Description=goatrope: prepare the tap ports (IPv6, offloads, EEE, speed; listen: egress drop, then link up; mirror filters)
 After=systemd-networkd.service
 Wants=systemd-networkd.service
 
@@ -303,6 +321,7 @@ pub fn render(cfg: &Config, nm_present: bool) -> BTreeMap<String, String> {
     if let Some(e) = &tap.erspan {
         files.insert(format!("{NET}/03-goatrope-{}.netdev", tap.ports[0]), erspan_netdev(&tap.ports[0], e));
     }
+    files.extend(mirror::render(tap, &header(&decl())));
     files.insert(SYSCTL.into(), sysctl_file(cfg));
     files.insert(format!("{UNITS}/goatrope-ports.service"), ports_unit());
     files.insert(format!("{UNITS}/goatrope-record@.service"), record_unit(cfg));
@@ -500,7 +519,7 @@ pub fn preflight(cfg: &Config) -> R<()> {
             }
         }
     }
-    Ok(())
+    mirror::preflight(tap).map_err(Refusal)
 }
 
 // ---------------------------------------------------------------- port preparation (boot and install)
@@ -526,6 +545,11 @@ pub fn apply_ports(cfg: &Config, wait: f64) -> Vec<String> {
             continue;
         }
         su::write(&format!("/proc/sys/net/ipv6/conf/{p}/disable_ipv6"), "1");
+        if tap.erspan.is_some() && erspan_seq(p).contains("iseq") {
+            // with the receive check, every frame from a sender that restarted (its sequence starts at
+            // 0 again) is dropped as out of order, until its count passes the old one
+            su::run(&["ip", "link", "set", p, "type", "erspan", "noiseq"]);
+        }
         for (short, _) in su::OFFLOADS {
             su::run(&["ethtool", "-K", p, short, "off"]);
         }
@@ -559,6 +583,7 @@ pub fn apply_ports(cfg: &Config, wait: f64) -> Vec<String> {
         let mask = format!("{LLDP_MASK:#x}");
         su::run(&["ip", "link", "set", BRIDGE, "type", "bridge", "forward_delay", "0", "group_fwd_mask", &mask, "mcast_snooping", "0"]);
     }
+    problems.extend(mirror::apply(tap, wait_for));
     problems
 }
 
@@ -817,6 +842,8 @@ pub fn install(cfg: &Config) -> R<()> {
             state["ports"][p] = snapshot_port(p);
         }
     }
+    let dropped_mirrors = state["mirrors"].clone(); // undone below, once their files are gone
+    state["mirrors"] = mirror::state(tap);
     state["version"] = json!(crate::version());
     if let Some(tap) = tap_cfg {
         state["mode"] = json!(tap.mode);
@@ -870,6 +897,7 @@ pub fn install(cfg: &Config) -> R<()> {
     for f in &stale {
         remove(f);
     }
+    mirror::undo(&dropped_mirrors, &state["mirrors"]);
     for (path, content) in &files {
         su::write_file(path, content, *modes.get(path).unwrap_or(&0o644)).map_err(io)?;
     }
@@ -971,6 +999,7 @@ pub fn uninstall(purge: bool) -> R<()> {
     if su::exists(BRIDGE) {
         su::run(&["ip", "link", "del", BRIDGE]);
     }
+    mirror::undo(&state["mirrors"], &Value::Null);
     // links goatrope made (the erspan interface): networkd does not remove a netdev whose file is gone
     if let Some(made) = state["created_links"].as_array() {
         for l in made.iter().filter_map(|v| v.as_str()) {
@@ -1313,6 +1342,8 @@ fn check_tap(cfg: &Config, tap: &Tap) -> Vec<Item> {
             "an erspan interface",
             k.unwrap_or_else(|| "absent".into()),
         );
+        let seq = erspan_seq(p);
+        item(&mut items, format!("erspan-sequence:{p}"), Some(seq == "oseq"), "oseq (a sender that restarts is accepted)", seq);
         let held = su::addresses(&e.underlay).iter().any(|a| a.split('/').next() == Some(e.local.as_str()));
         item(
             &mut items,
@@ -1322,6 +1353,7 @@ fn check_tap(cfg: &Config, tap: &Tap) -> Vec<Item> {
             if held { format!("holds {}", e.local) } else { format!("does not hold {}", e.local) },
         );
     }
+    mirror::check(tap, &mut items);
     if su::nm_active() {
         let st = su::nm_states();
         for p in &tap.ports {
@@ -1571,6 +1603,7 @@ fn status_tap(tap: &Tap) {
             e.underlay
         );
     }
+    mirror::status(tap);
     if tap.mode == "inline" {
         if su::exists(BRIDGE) {
             let mut members: Vec<String> = fs::read_dir(format!("{SYS_NET}/{BRIDGE}/brif"))

@@ -13,7 +13,7 @@ WireGuard. The copy can come from any of these:
 |---|---|---|
 | a **prebuilt tap device** in the cable: a passive copper tap, or a powered tap device that keeps the link closed when its power fails | `mode = "listen"`, `source = "copper-tap"` or `"bypass-relay"` | built; tested in network namespaces; no device measured with goatrope |
 | a switch **mirror port**: SPAN on the same switch, or RSPAN delivered to a port of another | `mode = "listen"`, `source = "mirror-port"` | built; tested in network namespaces |
-| **ERSPAN**: a mirror sent over IP, in GRE, to an address on the goatrope machine | `mode = "listen"`, `source = "erspan"` and a `[tap.erspan]` table | built; tested in network namespaces with a mirroring namespace |
+| **ERSPAN**: a mirror sent over IP, in GRE, to an address on the goatrope machine | `mode = "listen"`, `source = "erspan"` and a `[tap.erspan]` table | built; tested in network namespaces with a mirroring namespace, and as the collector of a goatrope remote mirror over WireGuard |
 | goatrope's **own inline tap**: a small computer with two Ethernet ports, such as a Raspberry Pi, bridging the link | `mode = "inline"` | built; tested in network namespaces |
 
 When the system that sends the data seems locked down, [three-ways.md](docs/three-ways.md)
@@ -99,23 +99,33 @@ ports = ["enxPORTA"]               # inline: one bridge port (it sees both direc
 filter = ""                        # a BPF filter, or "" for every frame
 file_mb = 50
 files = 40
+
+# optional, any number: a remote mirror (below)
+[[tap.mirror]]
+ports = ["enxPORTA"]               # as [tap.record]: inline, one bridge port; listen, one or two
+underlay = "wt0"                   # the interface the mirror leaves by (the mesh); never a tap port
+local = "192.0.2.10"               # an address the underlay holds
+remote = "198.51.100.20"           # the collector
+session_id = 7                     # 0 to 1023, one per mirror
+filter = ""                        # optional: a BPF filter; "" or absent for every frame
 ```
 
 `examples/` holds an inline tap (`inline.toml`), a listen tap behind a passive copper tap
 (`listen-copper-tap.toml`), an ERSPAN listen tap (`listen-erspan.toml`), decode-and-send
 (`send.toml`), and relays: over the mesh (`relay-over-mesh.toml`), to a boundary point
 (`relay-boundary.toml`), started from the link (`relay-link-initiated.toml`), with an address
-proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`).
+proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`), and an inline tap with a
+remote mirror (`inline-mirror.toml`).
 
 ## Commands
 
 | Command | Does |
 |---|---|
-| `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, carries a VLAN or other device, holds an address, carries the default route, the operator's session or any established connection (link-local ones included), when the rings (one per recorded port) and file destinations do not fit on disk, or when the state file of an earlier install is unreadable |
+| `goatrope install` | applies the declaration. Refuses, changing nothing, when the OS is not Ubuntu 24.04 or 26.04, a port is missing, wireless, in another bridge, carries a VLAN or other device, holds an address, carries the default route, the operator's session or any established connection (link-local ones included), when the rings (one per recorded port) and file destinations do not fit on disk, or when the state file of an earlier install is unreadable. For a `[[tap.mirror]]`: when the underlay is missing or does not hold `local`, the route to `remote` does not leave by the underlay, or tcpdump cannot compile the filter |
 | `goatrope deploy [--dry-run]` | `install`, only when the machine does not already have this software and declaration and match it. With `--dry-run`, makes every refusal and changes nothing. [docs/deploy.md](docs/deploy.md): the Ansible play that runs it from a verified release file |
-| `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each recorder and its ring, each send and decoder, the relay's rules and counters, and the check result |
+| `goatrope status` | the mode in plain words, each port's carrier and speed, the bridge, each mirror and the packets it has sent, each recorder and its ring, each send and decoder, the relay's rules and counters, and the check result |
 | `goatrope check [--json]` | compares the machine with the declaration. Exit **0** matches, **3** differs, anything else is an error (2: invalid or unreadable declaration) |
-| `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, `relay.health` and the relay's boundary interface, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
+| `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, `relay.health` and the relay's boundary interface, deletes the bridge and each mirror's interface and tc filters (the operator's own tc filters stay), and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
 | `goatrope validate` | checks the declaration alone |
 | `goatrope relay` | runs the relay in the foreground (`install` runs it as `goatrope-relay.service`) |
 | `goatrope packs-digest PACKS FROM TO` | prints the `version` and `packs_sha256` a `convert` with the linked engine declares for those packs |
@@ -326,6 +336,32 @@ Each end needs a WireGuard peer that handshakes: when neither end sends a persis
 other traffic to the peer renews it. The relay prints a warning at start when this end's peer
 has none.
 
+## Remote mirror
+
+Status: built; tested in network namespaces on Ubuntu 24.04 and 26.04, between two
+machines joined by WireGuard ([ADR 0004](docs/adr/0004-relay-1-0.md) module 5).
+
+A `[[tap.mirror]]` sends whole frames from tap ports to a remote collector, as ERSPAN
+type II over the mesh. install makes one `erspan` interface per mirror,
+`goatrope-m<session_id>`, keyed by the session, from `local` to `remote`, and on each
+mirrored port a tc filter (`bpf` with the compiled filter, or `matchall`) whose action is
+`mirred egress mirror` to that interface. On an inline tap the one port is mirrored at
+ingress and egress, so both directions of the link are sent, as its recording holds
+both. A listen port is mirrored at ingress; its egress drop stays.
+
+- The outer packets may be fragmented (`nopmtudisc`, `ignore-df`), and the interface's
+  MTU is 9,000, so a 1,500-byte frame crosses a mesh whose MTU is 1,280 whole. A frame
+  longer than 9,014 bytes is truncated by the kernel.
+- Nothing is sent onto the tapped link: the packets leave by the underlay, and install
+  refuses a route to the collector by any other interface. The interface has no address
+  and IPv6 off before it goes up, so it sends only the copies.
+- `check` reports the interface (kind, session, addresses, fragmentation, MTU, up, IPv6
+  off), the underlay address, the route to the collector, and each tc filter; exit 3 when
+  one is missing or differs. goatrope-ports puts back a removed filter at boot or restart.
+- A goatrope listen tap with `source = "erspan"` is a collector, its underlay the mesh
+  interface; so is any ERSPAN receiver. The collector accepts a sender that restarted
+  (its interface keeps `oseq` and drops the receive sequence check).
+
 ## Tests
 
 `tests/netns/run.sh` runs the tests in a privileged container with systemd as PID 1,
@@ -400,7 +436,12 @@ the host's kernel. No hardware is involved. They cover:
   `current` and the ledger as they were; install, a second run that changes nothing, repair,
   a changed declaration, a newer release, rollback, and inline with no ping lost on a re-run;
 - `units`: a full disk, HTTP redirects, the reassembly bound, default routes in other
-  tables, the state backup, and the operator's own tc filters kept.
+  tables, the state backup, and the operator's own tc filters kept;
+- `mirror`, in two containers joined by WireGuard (MTU 1,280): a listen tap and an inline
+  tap mirror to a goatrope ERSPAN collector. Every mirrored frame arrives, 1,500-byte
+  frames whole; filtered frames and frames on a port not mirrored do not; nothing reaches
+  the tapped link; check 0, and 3 with the filter or the interface removed; refusals change
+  nothing; uninstall restores the ports and keeps the operator's own tc filter.
 
 `tests/arm64/run.sh 24.04|26.04` runs the same phases, except `components`,
 `networkmanager` and `deploy`, in an emulated arm64 Ubuntu VM
@@ -428,7 +469,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `mirror.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |
