@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 | Field | Value |
 |---|---|
-| Status | Proposed; the smallest case is built as WIP |
+| Status | Proposed; amended by [ADR 0004](0004-relay-1-0.md), which takes the relay to 1.0 |
 | Date | 2026-11-24 |
 | Deciders | operator |
 | Related | [ADR 0001](0001-goatrope-is-its-own-repository.md) |
@@ -167,7 +167,7 @@ proxy, layer-2 tunnel or second tunnel is needed for a protocol of this kind.
 
 `goatrope relay --config <file>` runs the fixed-port forwarder for UDP in the
 foreground. `goatrope install` installs no relay unit, so a relay runs only while
-someone runs it. Code: [`goatrope/relay.py`](../../goatrope/relay.py).
+someone runs it. Code: [`src/relay.rs`](../../src/relay.rs).
 
 Tested in network namespaces on Ubuntu 24.04 and 26.04 (`tests/netns`, phase
 `relay`), with real WireGuard interfaces between a "remote" namespace and the relay
