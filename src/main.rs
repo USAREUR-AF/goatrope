@@ -9,6 +9,7 @@ mod config;
 mod link;
 mod nl;
 mod relay;
+mod relay_tcp;
 mod send;
 mod sys;
 mod sysutil;

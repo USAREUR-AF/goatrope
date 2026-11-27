@@ -145,10 +145,26 @@ runs, and `check` reports it.
 
 ## Relay
 
-A `[relay]` forwards the UDP datagrams its `allow` rules name between a remote machine,
-authenticated by WireGuard, and one machine on the link, from the relay's own interface
-and address. Everything else is dropped and counted. The rules and the refusals are in
-[ADR 0002](docs/adr/0002-relay.md).
+A `[relay]` forwards the UDP datagrams and TCP connections its `allow` rules name between a
+remote machine, authenticated by WireGuard, and machines on the link, from the relay's own
+interface and address. Everything else is dropped and counted. The rules and the refusals are in
+[ADR 0002](docs/adr/0002-relay.md) and [ADR 0004](docs/adr/0004-relay-1-0.md).
+
+| `direction` | `protocol` | The relay listens on | It accepts | It sends to | Required keys |
+|---|---|---|---|---|---|
+| `remote-to-link` | `udp` or `tcp` | the remote interface, `listen_port` | the rule's `remote` only | `target`:`target_port` on the link, from its link address | `remote`, `listen_port`, `target`, `target_port` |
+| `both` | `udp` | as above | as above; and replies from the target only | as above, and the target's replies back to the remote | as above |
+| `link-to-remote` | `udp` or `tcp` | its link address, `listen_port` | the `sources` listed (the link is not authenticated, so the list is the control) | `remote`:`remote_port` through the remote interface; UDP replies go back to the sender | `remote`, `listen_port`, `remote_port`, `sources` |
+
+TCP: the relay accepts a connection, opens one to the other side, and copies both ways until
+each side has closed; a side that closes only its sending half is passed on as a half-close.
+A connection it does not accept is closed at once and counted as denied. `max_connections`
+(default 64) bounds the connections open on a rule at once; one more is closed and counted.
+`direction = "both"` is refused for TCP, because a connection always carries both directions.
+`relay.health` counts, per rule, the datagrams each way (UDP) or the connections open and
+accepted and the bytes each way (TCP), and what was denied, over the limit or could not be sent.
+Examples: `examples/relay-over-mesh.toml`, `examples/relay-boundary.toml`,
+`examples/relay-link-initiated.toml`.
 
 A declaration may hold only `[relay]`. `goatrope install` then installs the software, the
 declaration and `goatrope-relay.service`, and touches no tap port, network file, sysctl or
@@ -208,6 +224,10 @@ the host's kernel. No hardware is involved. They cover:
   hung (relay.health older than 10 s); a failure is restarted and a refusal is not; uninstall
   leaves only the declaration and `--purge` leaves nothing; a declaration with a tap and a relay
   installs, checks and removes both;
+- `relay-tcp` (ADR 0004 module 2): TCP both ways through a rule with a half-close; a connection
+  from another peer denied; `max_connections` enforced; link-initiated UDP and TCP flows reach the
+  remote and are answered; a link address not in `sources` denied; refusals of TCP `both` and of a
+  missing or off-link `sources`;
 - the relay's boundary transport: its own interface with one peer, drift and refusals;
 - `deploy`, in an image with Ansible: the play from a release file. Refusals leave the machine,
   `current` and the ledger as they were; install, a second run that changes nothing, repair,
