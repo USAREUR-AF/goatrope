@@ -843,7 +843,7 @@ pub fn install(cfg: &Config) -> R<()> {
         }
     }
     let dropped_mirrors = state["mirrors"].clone(); // undone below, once their files are gone
-    state["mirrors"] = mirror::state(tap);
+    state["mirrors"] = tap_cfg.map(mirror::state).unwrap_or_else(|| json!([]));
     state["version"] = json!(crate::version());
     if let Some(tap) = tap_cfg {
         state["mode"] = json!(tap.mode);
