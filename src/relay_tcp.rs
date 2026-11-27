@@ -28,7 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{Relay, RelayRule};
-use crate::relay::{any_of, bound_fd};
+use crate::proxy::Hold;
+use crate::relay::{any_of, bound_fd_free};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPIDLE_S: libc::c_int = 60;
@@ -71,8 +72,8 @@ impl Counters {
     }
 }
 
-fn listener(dev: &str, addr: IpAddr, port: u16) -> io::Result<TcpListener> {
-    let fd = bound_fd(dev, addr, port, libc::SOCK_STREAM)?;
+fn listener(dev: &str, addr: IpAddr, port: u16, freebind: bool) -> io::Result<TcpListener> {
+    let fd = bound_fd_free(dev, addr, port, libc::SOCK_STREAM, freebind)?;
     // SAFETY: fd is a bound stream socket.
     if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
         return Err(io::Error::last_os_error());
@@ -82,7 +83,7 @@ fn listener(dev: &str, addr: IpAddr, port: u16) -> io::Result<TcpListener> {
 
 /// A connection to `to` from a socket bound to `dev` and `from`, given up after CONNECT_TIMEOUT.
 fn connect(dev: &str, from: IpAddr, to: SocketAddr) -> io::Result<TcpStream> {
-    let fd = bound_fd(dev, from, 0, libc::SOCK_STREAM)?;
+    let fd = bound_fd_free(dev, from, 0, libc::SOCK_STREAM, false)?;
     let tv = |d: Duration| libc::timeval { tv_sec: d.as_secs() as libc::time_t, tv_usec: 0 };
     // a blocking connect gives up after the send timeout
     set_timeval(fd.as_raw_fd(), tv(CONNECT_TIMEOUT))?;
@@ -166,11 +167,23 @@ fn pump(mut from: TcpStream, mut to: TcpStream, bytes: &AtomicU64) -> bool {
 }
 
 /// Bind the rule's listening socket (an error is returned at once), then accept on a thread of its own.
-pub fn start(r: &Relay, rule: &RelayRule, link_addr: IpAddr, clients: Vec<IpAddr>, dest: SocketAddr) -> Result<Arc<Counters>, String> {
+///
+/// `held`: the rule uses a proxy address (ADR 0004 §4). The link-side listener is then bound with
+/// IP_FREEBIND, a connection toward the link is not made while the address is not held (a send
+/// error), and each connection's link-side stream is registered, so the relay closes it before
+/// it gives the address up.
+pub fn start(
+    r: &Relay,
+    rule: &RelayRule,
+    link_addr: IpAddr,
+    held: Option<Hold>,
+    clients: Vec<IpAddr>,
+    dest: SocketAddr,
+) -> Result<Arc<Counters>, String> {
     let l2r = rule.link_initiated();
     let (listen_dev, listen_addr) = if l2r { (&r.link_interface, link_addr) } else { (&r.remote_interface, any_of(clients[0])) };
     let (out_dev, out_addr) = if l2r { (r.remote_interface.clone(), any_of(dest.ip())) } else { (r.link_interface.clone(), link_addr) };
-    let l = listener(listen_dev, listen_addr, rule.listen_port).map_err(|e| crate::sys::strerror(&e))?;
+    let l = listener(listen_dev, listen_addr, rule.listen_port, l2r && held.is_some()).map_err(|e| crate::sys::strerror(&e))?;
     let c = Arc::new(Counters::default());
     let counters = c.clone();
     let max = rule.max_connections as u64;
@@ -208,8 +221,9 @@ pub fn start(r: &Relay, rule: &RelayRule, link_addr: IpAddr, clients: Vec<IpAddr
             c.accepted.fetch_add(1, Ordering::Relaxed);
             let c = c.clone();
             let out_dev = out_dev.clone();
+            let held = held.clone();
             std::thread::spawn(move || {
-                session(conn, &out_dev, out_addr, dest, l2r, &c);
+                session(conn, &out_dev, out_addr, dest, l2r, &c, held);
                 c.open.fetch_sub(1, Ordering::Relaxed);
             });
         }
@@ -217,7 +231,12 @@ pub fn start(r: &Relay, rule: &RelayRule, link_addr: IpAddr, clients: Vec<IpAddr
     Ok(counters)
 }
 
-fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l2r: bool, c: &Arc<Counters>) {
+fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l2r: bool, c: &Arc<Counters>, held: Option<Hold>) {
+    // remote-to-link connects from the proxy address: not while the relay does not hold it
+    if !l2r && held.as_ref().is_some_and(|h| !h.held()) {
+        c.send_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     if tune(&conn).is_err() {
         c.send_errors.fetch_add(1, Ordering::Relaxed);
         return;
@@ -237,6 +256,17 @@ fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l
         c.send_errors.fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // the link-side stream, so the relay can close it before it gives the proxy address up
+    let reg = match &held {
+        Some(h) => match h.register(if l2r { &conn } else { &out }) {
+            Some(id) => Some((h, id)),
+            None => {
+                c.send_errors.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        },
+        None => None,
+    };
     let c2 = c.clone();
     // forward: what the side that connected sends; back: what the far side answers
     let forward = std::thread::spawn(move || {
@@ -245,6 +275,9 @@ fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l
     });
     let back = pump(out, conn, if l2r { &c.bytes_to_link } else { &c.bytes_to_remote });
     let fwd = forward.join().unwrap_or(false);
+    if let Some((h, id)) = reg {
+        h.unregister(id);
+    }
     if !(back && fwd) {
         c.broken.fetch_add(1, Ordering::Relaxed);
     }

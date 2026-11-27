@@ -13,7 +13,7 @@ use netlink_packet_core::{
 };
 use netlink_packet_generic::ctrl::{nlas::GenlCtrlAttrs, GenlCtrl, GenlCtrlCmd};
 use netlink_packet_generic::GenlMessage;
-use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressMessage};
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_packet_wireguard::{
@@ -161,6 +161,68 @@ pub fn add_address(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<()> {
     route(RouteNetlinkMessage::NewAddress(m), NLM_F_CREATE | NLM_F_EXCL).map(|_| ())
 }
 
+/// One IPv4 or IPv6 address of an interface, with the kernel's IFA_FLAGS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Addr {
+    pub ip: IpAddr,
+    pub prefix: u8,
+    pub noprefixroute: bool,
+}
+
+/// Every address of the interface (or of every interface, when ifname is None) as Addr.
+pub fn address_list(ifname: Option<&str>) -> io::Result<Vec<(u32, Addr)>> {
+    let want = match ifname {
+        Some(i) => Some(index(i)?),
+        None => None,
+    };
+    let all = route(RouteNetlinkMessage::GetAddress(AddressMessage::default()), NLM_F_DUMP)?;
+    Ok(all
+        .into_iter()
+        .filter_map(|r| match r {
+            RouteNetlinkMessage::NewAddress(a) if want.is_none_or(|w| w == a.header.index) => Some(a),
+            _ => None,
+        })
+        .filter_map(|a| {
+            let mut local = None;
+            let mut addr = None;
+            let mut flags = AddressFlags::empty();
+            for x in &a.attributes {
+                match x {
+                    AddressAttribute::Local(ip) => local = Some(*ip),
+                    AddressAttribute::Address(ip) => addr = Some(*ip),
+                    AddressAttribute::Flags(f) => flags = *f,
+                    _ => {}
+                }
+            }
+            let ip = local.or(addr)?;
+            Some((a.header.index, Addr { ip, prefix: a.header.prefix_len, noprefixroute: flags.contains(AddressFlags::Noprefixroute) }))
+        })
+        .collect())
+}
+
+fn address_msg(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<AddressMessage> {
+    let mut m = AddressMessage::default();
+    m.header.index = index(ifname)?;
+    m.header.prefix_len = prefix;
+    m.header.family = if ip.is_ipv4() { AddressFamily::Inet } else { AddressFamily::Inet6 };
+    m.attributes.push(AddressAttribute::Local(ip));
+    m.attributes.push(AddressAttribute::Address(ip));
+    Ok(m)
+}
+
+/// `ip address add <ip/prefix> dev <ifname> noprefixroute`: the address, and no route for its prefix.
+pub fn add_address_noprefixroute(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<()> {
+    let mut m = address_msg(ifname, ip, prefix)?;
+    m.attributes.push(AddressAttribute::Flags(AddressFlags::Noprefixroute));
+    route(RouteNetlinkMessage::NewAddress(m), NLM_F_CREATE | NLM_F_EXCL).map(|_| ())
+}
+
+/// `ip address del <ip/prefix> dev <ifname>`
+pub fn del_address(ifname: &str, ip: IpAddr, prefix: u8) -> io::Result<()> {
+    let m = address_msg(ifname, ip, prefix)?;
+    route(RouteNetlinkMessage::DelAddress(m), 0).map(|_| ())
+}
+
 // ---------------------------------------------------------------- WireGuard (generic netlink)
 
 fn wireguard_family() -> io::Result<u16> {
@@ -194,6 +256,8 @@ pub struct WgPeer {
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<(IpAddr, u8)>,
     pub keepalive: u16,
+    /// the latest handshake as seconds since the epoch (wall clock, as the kernel keeps it); 0: none yet
+    pub last_handshake: i64,
 }
 
 /// A WireGuard device as `wg show <if> dump` describes it. The private key is not kept.
@@ -213,6 +277,7 @@ fn peer_from(attrs: &[WireguardPeerAttribute]) -> WgPeer {
             WireguardPeerAttribute::PresharedKey(k) if k.iter().any(|b| *b != 0) => p.preshared_key = Some(*k),
             WireguardPeerAttribute::Endpoint(e) => p.endpoint = Some(*e),
             WireguardPeerAttribute::PersistentKeepalive(k) => p.keepalive = *k,
+            WireguardPeerAttribute::LastHandshake(t) => p.last_handshake = t.seconds,
             WireguardPeerAttribute::AllowedIps(ips) => {
                 for ip in ips {
                     let addr = ip.0.iter().find_map(|x| match x {
@@ -252,6 +317,7 @@ pub fn wg_get(ifname: &str) -> io::Result<WgDevice> {
                         match d.peers.last_mut() {
                             Some(last) if last.public_key == np.public_key => {
                                 last.allowed_ips.extend(np.allowed_ips);
+                                last.last_handshake = last.last_handshake.max(np.last_handshake);
                             }
                             _ => d.peers.push(np),
                         }

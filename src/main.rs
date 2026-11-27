@@ -8,6 +8,7 @@ mod boundary;
 mod config;
 mod link;
 mod nl;
+mod proxy;
 mod relay;
 mod relay_tcp;
 mod send;

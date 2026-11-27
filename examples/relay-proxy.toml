@@ -1,0 +1,19 @@
+# goatrope declaration: A relay whose remote machine appears on the sensor's network under an
+# address of its own (ADR 0004 §4). The sensor sends to and receives from 192.0.2.60, as if the
+# controller were on its network; the relay holds that address only while the controller's
+# WireGuard peer has a handshake younger than 180 s, and only after an ARP probe finds no other
+# machine using it. Addresses and ports are documentation values.
+schema = 1
+
+[relay]
+remote_interface = "wt0"          # the mesh's kernel WireGuard interface
+link_interface = "eth1"           # the sensor's network, an interface of its own
+link_address = "192.0.2.50/24"    # the relay's own address on that network
+allow = [
+  # the controller's mesh address; on the sensor's network its datagrams come from 192.0.2.60
+  { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000, link_address = "192.0.2.60" },
+]
+
+[[relay.proxy]]
+address = "192.0.2.60"            # a free address on the sensor's network; never the relay's own
+remote = "203.0.113.20"           # the remote machine it stands for: a rule's remote

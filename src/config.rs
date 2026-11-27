@@ -170,6 +170,16 @@ pub struct RelayRule {
     pub sources: Vec<String>,
     /// tcp: connections open at once on this rule
     pub max_connections: usize,
+    /// a [[relay.proxy]] address the rule's link-side sockets bind to, instead of the relay's own (ADR 0004 §4)
+    pub link_address: Option<String>,
+}
+
+/// A local address on the link that stands for one remote machine (ADR 0004 §4).
+#[derive(Debug, Clone)]
+pub struct Proxy {
+    /// IPv4, without a prefix; added as a /32 while the remote's tunnel is up
+    pub address: String,
+    pub remote: String,
 }
 
 impl RelayRule {
@@ -203,6 +213,7 @@ pub struct Relay {
     /// "mesh": an existing WireGuard interface; "boundary": goatrope's own, one peer
     pub transport: String,
     pub boundary: Option<Boundary>,
+    pub proxies: Vec<Proxy>,
 }
 
 #[derive(Debug, Clone)]
@@ -945,7 +956,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     keys(
         r,
         w,
-        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow"],
+        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow", "proxy"],
         &["remote_interface", "link_interface", "link_address", "allow"],
     )?;
     let transport = match r.get("transport") {
@@ -1024,6 +1035,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         let mut req = vec!["direction", "protocol", "remote", "listen_port"];
         req.extend(if l2r { ["remote_port", "sources"] } else { ["target", "target_port"] });
         let mut allowed = req.clone();
+        allowed.push("link_address");
         if protocol == "tcp" {
             allowed.push("max_connections");
         }
@@ -1078,6 +1090,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             remote_port,
             sources,
             max_connections,
+            link_address: a.get("link_address").map(|v| addr(v, &format!("{aw}.link_address"))).transpose()?,
         });
     }
     let mut seen = BTreeSet::new();
@@ -1098,7 +1111,82 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             }
         }
     }
-    Ok(Relay { remote_interface: remote_if, link_interface: link_if, link_address: link.to_string(), rules, transport, boundary: bnd })
+    let proxies = proxies(r, &link, &rules)?;
+    Ok(Relay {
+        remote_interface: remote_if,
+        link_interface: link_if,
+        link_address: link.to_string(),
+        rules,
+        transport,
+        boundary: bnd,
+        proxies,
+    })
+}
+
+/// `[[relay.proxy]]`: each address is IPv4, one machine's place on the link, used by a rule, and
+/// stands for a remote that rule names (ADR 0004 §4).
+fn proxies(r: &Table, link: &Iface, rules: &[RelayRule]) -> R<Vec<Proxy>> {
+    let list = match r.get("proxy") {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(a)) => a,
+        Some(_) => return err("[[relay.proxy]] must be an array of tables, each with address and remote"),
+    };
+    let mut out: Vec<Proxy> = Vec::new();
+    for (j, p) in list.iter().enumerate() {
+        let pw = format!("[[relay.proxy]][{j}]");
+        let p = as_table(p, &pw)?;
+        keys(p, &pw, &["address", "remote"], &["address", "remote"])?;
+        let address = addr(&p["address"], &format!("{pw}.address"))?;
+        let ip = parse_ip(&address).unwrap();
+        if ip.is_ipv6() {
+            return err(format!(
+                "{pw}.address {address}: a proxy address is IPv4; IPv6 would need neighbor discovery, which the relay does not do"
+            ));
+        }
+        if !link.contains(ip) {
+            return err(format!("{pw}.address {address} is not on the link ({})", link.network()));
+        }
+        if ip == link.ip
+            || (link.num_addresses() > 2 && (ip == link.network_address() || ip == link.broadcast_address()))
+            || ip.is_multicast()
+        {
+            return err(format!("{pw}.address {address} is the relay's own, the network, a broadcast or a multicast address"));
+        }
+        if let Some(rule) = rules.iter().find(|rule| rule.target == address || rule.sources.contains(&address)) {
+            return err(format!(
+                "{pw}.address {address} is a machine on the link in the rule on listen_port {} (its target or a source); a proxy address stands for a remote machine",
+                rule.listen_port
+            ));
+        }
+        if out.iter().any(|o| o.address == address) {
+            return err(format!("{pw}.address {address} is declared twice"));
+        }
+        let remote = addr(&p["remote"], &format!("{pw}.remote"))?;
+        if !rules.iter().any(|rule| rule.remote == remote) {
+            return err(format!("{pw}.remote {remote} is the remote of no rule"));
+        }
+        out.push(Proxy { address, remote });
+    }
+    for rule in rules {
+        let Some(la) = &rule.link_address else { continue };
+        let aw = format!("[relay].allow listen_port {}", rule.listen_port);
+        match out.iter().find(|p| &p.address == la) {
+            None => return err(format!("{aw}: link_address {la} is not a [[relay.proxy]] address")),
+            Some(p) if p.remote != rule.remote => {
+                return err(format!(
+                    "{aw}: link_address {la} stands for {}, not for this rule's remote {}; machines on the link would see one machine's traffic under another's address",
+                    p.remote, rule.remote
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    for p in &out {
+        if !rules.iter().any(|rule| rule.link_address.as_deref() == Some(&p.address)) {
+            return err(format!("[[relay.proxy]] {}: no rule uses it (link_address); held alone it would only answer ARP", p.address));
+        }
+    }
+    Ok(out)
 }
 
 pub fn parse(text: &str, path: &str) -> R<Config> {
@@ -1213,6 +1301,33 @@ allow = [{ direction = "both", protocol = "udp", remote = "198.51.100.5", listen
         assert!(e(&l2r.replace("[\"192.0.2.2\"]", "[]")).contains("sources must list"));
         assert!(e(&l2r.replace("[\"192.0.2.2\"]", "[\"192.0.2.50\"]")).contains("the relay's own"));
         assert!(e(&l2r.replace("remote_port = 9000", "remote_port = 9000, target = \"192.0.2.2\"")).contains("unknown key"));
+    }
+
+    #[test]
+    fn relay_proxy() {
+        let proxy = |addr: &str, remote: &str, la: &str| {
+            RELAY.replace("target_port = 7000 }", &format!("target_port = 7000, link_address = \"{la}\" }}"))
+                + &format!("[[relay.proxy]]\naddress = \"{addr}\"\nremote = \"{remote}\"\n")
+        };
+        let c = parse(&proxy("192.0.2.60", "198.51.100.5", "192.0.2.60"), "x.toml").unwrap();
+        let r = c.relay.unwrap();
+        assert_eq!(r.proxies[0].address, "192.0.2.60");
+        assert_eq!(r.rules[0].link_address.as_deref(), Some("192.0.2.60"));
+        assert!(parse(RELAY, "x.toml").unwrap().relay.unwrap().proxies.is_empty());
+        assert!(e(&proxy("2001:db8::60", "198.51.100.5", "2001:db8::60")).contains("a proxy address is IPv4"));
+        assert!(e(&proxy("203.0.113.60", "198.51.100.5", "203.0.113.60")).contains("is not on the link"));
+        assert!(e(&proxy("192.0.2.50", "198.51.100.5", "192.0.2.50")).contains("the relay's own"));
+        assert!(e(&proxy("192.0.2.255", "198.51.100.5", "192.0.2.255")).contains("broadcast"));
+        assert!(e(&proxy("192.0.2.2", "198.51.100.5", "192.0.2.2")).contains("is a machine on the link"));
+        assert!(e(&proxy("192.0.2.60", "198.51.100.9", "192.0.2.60")).contains("is the remote of no rule"));
+        assert!(e(&proxy("192.0.2.60", "198.51.100.5", "192.0.2.61")).contains("is not a [[relay.proxy]] address"));
+        let unused = RELAY.to_string() + "[[relay.proxy]]\naddress = \"192.0.2.60\"\nremote = \"198.51.100.5\"\n";
+        assert!(e(&unused).contains("no rule uses it"));
+        let twice =
+            proxy("192.0.2.60", "198.51.100.5", "192.0.2.60") + "[[relay.proxy]]\naddress = \"192.0.2.60\"\nremote = \"198.51.100.5\"\n";
+        assert!(e(&twice).contains("declared twice"));
+        let extra = proxy("192.0.2.60", "198.51.100.5", "192.0.2.60") + "mac = \"02:00:00:00:00:01\"\n";
+        assert!(e(&extra).contains("unknown key"));
     }
 
     #[test]

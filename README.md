@@ -27,7 +27,7 @@ On the machine that receives the copy, goatrope runs in up to three declared rol
 |---|---|---|
 | **tap** | records the link: **listen** (a tap device or mirror port hands the machine a copy) or **inline** (the machine bridges the link) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
 | **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
-| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
+| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service; an address proxy for a remote machine); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
 
 It runs with no goat component installed. Why it is a repository of its own, and
 what it leaves to other repositories: [ADR 0001](docs/adr/0001-goatrope-is-its-own-repository.md).
@@ -192,6 +192,44 @@ an interface) and `CAP_NET_ADMIN` (the boundary interface) only, on a read-only 
 Installing a declaration with no `[tap]` over an installed tap is refused: run `goatrope
 uninstall` first, so the tap ports are restored.
 
+### Address proxy
+
+A `[[relay.proxy]]` gives a remote machine an address of its own on the link
+([ADR 0004](docs/adr/0004-relay-1-0.md) §4, [example](examples/relay-proxy.toml)). A rule
+whose `link_address` names it sends to its target from that address, so machines on the link
+see the remote there, and their replies to it go back to the remote.
+
+| Key | Value |
+|---|---|
+| `address` | an IPv4 address on the link's network: not the relay's own, the network, a broadcast, multicast or a rule's target. IPv6 is refused |
+| `remote` | the remote machine it stands for; a rule must name it as its `remote` |
+| a rule's `link_address` | a proxy address whose `remote` is the rule's own; every proxy address must be used by a rule |
+
+| What the relay does | When |
+|---|---|
+| sends three ARP probes from 0.0.0.0 (RFC 5227), then waits 2 s | the remote's tunnel is up: the WireGuard peer whose allowed IPs hold the remote has a handshake younger than 180 s |
+| adds the address to `link_interface` as a /32 with `noprefixroute`, then sends two announcements | no machine answered for it or probed for it |
+| does not take it, logs and counts a conflict, and probes again 10 s later | another machine answered for it or probed for it |
+| removes it, logs and counts it | the handshake is 180 s old or older (checked every 2 s), another machine claims it, or the relay stops (SIGTERM, `systemctl stop`, any exit) |
+| removes it at start, then probes before taking it again | an earlier run that was killed left it on `link_interface` |
+
+A rule's sockets on the address are bound with `IP_FREEBIND`, so they exist while the address
+is absent: the kernel delivers to them only while it is on `link_interface`. While the address
+is not held, a datagram for the link counts as `send_errors`, a TCP connection toward the link
+is not made (also `send_errors`), and an open TCP connection on it is closed. Every rule shape
+can use it: on a `link-to-remote` rule, machines on the link send to `<address>:<listen_port>`. IP forwarding stays off
+and no route names the remote, so the kernel does not route to it; only the rules' sockets on
+the address forward anything. The relay refuses to start when the link interface does not use
+ARP, or when the address is already configured on this machine by someone else. With a proxy
+declared, the unit also allows `AF_PACKET` sockets, for the probes.
+
+| Property | What `check` reads |
+|---|---|
+| each proxy address is on `link_interface` exactly when the relay says it holds it | `relay-proxy-<address>`: held (with the handshake age) or not held, and why |
+
+`relay.health` carries, per proxy address: `held`, `why`, `handshake_age`, `probes`,
+`conflicts`, `added` and `removed`. `status` prints them.
+
 ## Tests
 
 `tests/netns/run.sh` runs the tests in a privileged container with systemd as PID 1,
@@ -236,6 +274,15 @@ the host's kernel. No hardware is involved. They cover:
   remote and are answered; a link address not in `sources` denied; refusals of TCP `both` and of a
   missing or off-link `sources`;
 - the relay's boundary transport: its own interface with one peer, drift and refusals;
+- `proxy` (ADR 0004 module 4): an address another machine on the link holds is not taken (probes
+  sent, no announcement, datagrams for its rule counted as send errors); once free it is probed,
+  taken as a /32 with `noprefixroute` and announced twice, and answers ARP from the link; the
+  remote's datagrams and TCP connections reach the link from it, and link machines' datagrams and
+  TCP connections to it reach the remote; the kernel does
+  not route to the remote; the address is removed within 180 s (+ one 2 s tick) of the peer's
+  latest handshake once the peer stops, and taken back after a new probe when it returns; a
+  killed relay's address is removed at the next start; SIGTERM and `systemctl stop` remove it;
+  `check` and `status` report it; IP forwarding stays off throughout;
 - `deploy`, in an image with Ansible: the play from a release file. Refusals leave the machine,
   `current` and the ledger as they were; install, a second run that changes nothing, repair,
   a changed declaration, a newer release, rollback, and inline with no ping lost on a re-run;
@@ -267,7 +314,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `relay.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `relay.rs`, `proxy.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |
