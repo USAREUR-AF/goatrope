@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- tests: `tests/netns/run.sh` and `tests/arm64/run.sh` name their images by a hash of the
+  Dockerfile (`goatrope-netns-<hash>`, `goatrope-qemu-arm64-<hash>`), so runs from trees whose
+  Dockerfiles differ no longer overwrite each other's image on a shared host.
 - namespace phase `bench` and docs/performance.md: the sustained rate of relay UDP over WireGuard
   (64, 512 and 1,400-byte payloads, loss under 0.1 %, added latency), of the remote mirror
   (frames with none lost at the collector) and of decode-and-send with a converter run once per

@@ -43,11 +43,15 @@ wait_systemd() {
     return 1
 }
 
+# The image name carries a hash of the Dockerfile, so runs from trees whose Dockerfiles differ
+# never overwrite each other's image on a shared host; runs from the same Dockerfile share it.
+image="goatrope-netns-$(sha256sum "$here/Dockerfile" | cut -c1-12)"
+
 start() { # container, image tag
     local c=$1 v=$2
     docker rm -f "$c" >/dev/null 2>&1 || true
     docker run -d --name "$c" --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-        --tmpfs /run --tmpfs /run/lock "goatrope-netns:$v" >/dev/null
+        --tmpfs /run --tmpfs /run/lock "$image:$v" >/dev/null
     wait_systemd "$c"
     docker exec "$c" mkdir -p /src
     tar -C "$repo" --exclude=.git --exclude=test-results --exclude=__pycache__ --exclude=./target -cf - . | docker exec -i "$c" tar -C /src --no-same-owner -xf -
@@ -68,9 +72,9 @@ for v in "${versions[@]}"; do
     log="$out/ubuntu-$v.log"
     : > "$log"
     echo "### Ubuntu $v  (host kernel $(uname -r), $(uname -m))" | tee -a "$log"
-    docker build -q --build-arg "UBUNTU=$v" -t "goatrope-netns:$v" "$here" >/dev/null
-    docker build -q --build-arg "UBUNTU=$v" --build-arg NM=1 -t "goatrope-netns:$v-nm" "$here" >/dev/null
-    docker build -q --build-arg "UBUNTU=$v" --build-arg ANSIBLE=1 -t "goatrope-netns:$v-ansible" "$here" >/dev/null
+    docker build -q --build-arg "UBUNTU=$v" -t "$image:$v" "$here" >/dev/null
+    docker build -q --build-arg "UBUNTU=$v" --build-arg NM=1 -t "$image:$v-nm" "$here" >/dev/null
+    docker build -q --build-arg "UBUNTU=$v" --build-arg ANSIBLE=1 -t "$image:$v-ansible" "$here" >/dev/null
     c="${GOATROPE_TEST_CONTAINER:-goatrope-netns}-$v"   # another name lets two runs share a host
 
     start "$c" "$v"
