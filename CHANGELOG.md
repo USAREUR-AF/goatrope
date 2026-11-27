@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- ADR 0004 (Accepted): the relay reaches 1.0 in six modules: a service, TCP and link-initiated
+  traffic, multicast, an address proxy, a remote mirror over ERSPAN, and an opt-in layer-2 lane.
+
 ## 0.2.0 (2026-11-25)
 
 - listen source `erspan`: goatrope makes an `erspan` interface for one declared mirror session
