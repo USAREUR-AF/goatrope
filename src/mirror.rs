@@ -23,7 +23,7 @@ pub const PREF_BASE: i64 = 1000;
 pub const MTU: u32 = 9000;
 
 pub fn dev(m: &Mirror) -> String {
-    format!("goatrope-m{}", m.session_id)
+    format!("goatrope-m{}", m.gre_key)
 }
 
 pub fn devs(tap: &Tap) -> Vec<String> {
@@ -31,7 +31,7 @@ pub fn devs(tap: &Tap) -> Vec<String> {
 }
 
 fn pref(m: &Mirror) -> String {
-    (PREF_BASE + m.session_id).to_string()
+    (PREF_BASE + m.gre_key).to_string()
 }
 
 /// The tc hooks a mirror uses on its port. An inline bridge port: ingress (frames from its own
@@ -72,10 +72,10 @@ Independent=yes
 ",
                 m.ports.join(", "),
                 m.remote,
-                m.session_id,
+                m.gre_key,
                 m.local,
                 m.remote,
-                m.session_id
+                m.gre_key
             ),
         ));
         out.push((
@@ -124,10 +124,10 @@ pub fn preflight(tap: &Tap) -> Result<(), String> {
     for m in &tap.mirrors {
         let d = dev(m);
         if tap.ports.contains(&d) {
-            return Err(format!("{d} is a tap port; goatrope makes an interface of that name for mirror session {}", m.session_id));
+            return Err(format!("{d} is a tap port; goatrope makes an interface of that name for mirror session {}", m.gre_key));
         }
         if su::exists(&d) && su::kind(&d).as_deref() != Some("erspan") {
-            return Err(format!("{d} exists and is not an erspan interface; goatrope makes it for mirror session {}", m.session_id));
+            return Err(format!("{d} exists and is not an erspan interface; goatrope makes it for mirror session {}", m.gre_key));
         }
         if !su::exists(&m.underlay) {
             return Err(format!("the mirror underlay {} does not exist (see: ip -br link)", m.underlay));
@@ -215,7 +215,7 @@ pub fn apply(tap: &Tap, wait_for: impl Fn(&str, f64) -> bool) -> Vec<String> {
                 let args = tc_filter_args(m, p, hook, &bc);
                 let r = su::run(&args.iter().map(String::as_str).collect::<Vec<_>>());
                 if r.code != 0 {
-                    problems.push(format!("{p}: the mirror filter for session {} could not be added: {}", m.session_id, r.stderr.trim()));
+                    problems.push(format!("{p}: the mirror filter for session {} could not be added: {}", m.gre_key, r.stderr.trim()));
                 }
             }
         }
@@ -283,7 +283,7 @@ fn describe(l: &Value) -> String {
 }
 
 fn want_link(m: &Mirror) -> String {
-    format!("erspan session {} from {} to {}, nopmtudisc, ignore-df, type II, mtu {MTU}", m.session_id, m.local, m.remote)
+    format!("erspan session {} from {} to {}, nopmtudisc, ignore-df, type II, mtu {MTU}", m.gre_key, m.local, m.remote)
 }
 
 pub fn check(tap: &Tap, items: &mut Vec<Item>) {
@@ -358,7 +358,7 @@ pub fn status(tap: &Tap) {
         let filter = if m.filter.is_empty() { "(every frame)".to_string() } else { m.filter.clone() };
         println!(
             "  mirror {d:<14} session {} {} -> {} on {}, filter {}, sent {sent}",
-            m.session_id,
+            m.gre_key,
             m.ports.join(","),
             m.remote,
             m.underlay,

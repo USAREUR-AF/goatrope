@@ -68,7 +68,8 @@ pub struct Mirror {
     pub local: String,
     /// the collector's address
     pub remote: String,
-    pub session_id: i64,
+    /// the GRE key: the declared session_id
+    pub gre_key: i64,
     /// a tcpdump filter; empty: every frame
     pub filter: String,
 }
@@ -617,7 +618,7 @@ fn tap(v: &Value) -> R<Tap> {
         Some(Value::Array(a)) => a.iter().enumerate().map(|(i, m)| mirror_table(m, i, &mode, &ports)).collect::<R<Vec<_>>>()?,
         Some(m) => vec![mirror_table(m, 0, &mode, &ports)?],
     };
-    let mut ids: Vec<i64> = mirrors.iter().map(|m| m.session_id).collect();
+    let mut ids: Vec<i64> = mirrors.iter().map(|m| m.gre_key).collect();
     ids.sort();
     ids.dedup();
     if ids.len() != mirrors.len() {
@@ -669,9 +670,9 @@ fn mirror_table(v: &Value, i: usize, mode: &str, tap_ports: &[String]) -> R<Mirr
     if local == remote {
         return err(format!("{w}: local and remote must differ"));
     }
-    let session_id = int(t, "session_id", &w, 0, 1023)?;
+    let gre_key = int(t, "session_id", &w, 0, 1023)?;
     let filter = if t.contains_key("filter") { string(t, "filter", &w)? } else { String::new() };
-    Ok(Mirror { ports, underlay, local, remote, session_id, filter })
+    Ok(Mirror { ports, underlay, local, remote, gre_key, filter })
 }
 
 fn erspan_table(v: &Value, port: &str) -> R<Erspan> {
@@ -1665,7 +1666,7 @@ CONVERT
     fn mirrors() {
         let m = "\n[[tap.mirror]]\nports = [\"tp0\"]\nunderlay = \"wt0\"\nlocal = \"198.51.100.1\"\nremote = \"198.51.100.2\"\nsession_id = 7\n";
         let t = parse(&(INLINE.to_string() + m), "x.toml").unwrap().tap.unwrap();
-        assert_eq!((t.mirrors.len(), t.mirrors[0].session_id, t.mirrors[0].filter.as_str()), (1, 7, ""));
+        assert_eq!((t.mirrors.len(), t.mirrors[0].gre_key, t.mirrors[0].filter.as_str()), (1, 7, ""));
         assert!(e(&(INLINE.to_string() + &m.replace("[\"tp0\"]", "[\"tp0\", \"tp1\"]"))).contains("exactly 1"));
         assert!(e(&(INLINE.to_string() + &m.replace("wt0", "tp1"))).contains("is a tap interface"));
         assert!(e(&(INLINE.to_string() + &m.replace("session_id = 7\n", ""))).contains("missing required key(s) session_id"));
