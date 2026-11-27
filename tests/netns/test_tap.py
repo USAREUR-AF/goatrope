@@ -766,13 +766,7 @@ def phase_listen() -> None:
 
 
 def phase_send() -> None:
-    """Decode-and-send on the listen tap: UDP and file destinations, a pinned converter stand-in."""
-    os.makedirs("/opt/gt-test", exist_ok=True)
-    xf = "/opt/gt-test/fake-goat-xf"  # not under /root: the send unit runs with ProtectHome
-    with open(xf, "w") as f:
-        f.write("#!/bin/sh\n# stand-in for goat-xf convert: upper-cases the hex it reads\ntr a-f A-F\n")
-    os.chmod(xf, 0o755)
-    pin = hashlib.sha256(open(xf, "rb").read()).hexdigest()
+    """Decode-and-send on the listen tap: UDP, TCP, HTTP and file destinations (conversion: phase linked-engine)."""
     cfg = LISTEN + f"""
 [[send]]
 name = "plain"
@@ -782,10 +776,9 @@ to = ["udp://127.0.0.1:9101", {{ url = "file:///var/lib/goatrope/send/plain.json
       {{ url = "tcp://127.0.0.1:9102", framing = "len32be" }}, "http://127.0.0.1:9103/in"]
 
 [[send]]
-name = "converted"
+name = "wider"
 port = "tp0"
 match = {{ protocol = "udp", dst_port = 5000 }}
-convert = {{ component = "goat-transformers", binary = "{xf}", version = "stand-in", sha256 = "{pin}", from = "a", to = "b", packs = "/opt/gt-test" }}
 to = ["udp://127.0.0.1:9104"]
 
 [[send]]
@@ -860,9 +853,9 @@ import os; os._exit(0)
     result(got["http"] == 101, "send: HTTP destination got the same 101", f"{got['http']}")
     lines = open("/var/lib/goatrope/send/plain.jsonl").read().splitlines()
     result(len(lines) == 101, "send: file destination holds 101 JSON lines", f"{len(lines)}")
-    result(got["conv"] == 151, "send: the converted feed (wider match) got 151 converted messages", f"{got['conv']}")
+    result(got["conv"] == 151, "send: a second feed with a wider match got 151 messages", f"{got['conv']}")
     sample = bytes.fromhex(got["sample_conv"][0]).decode() if got["sample_conv"] else ""
-    result(sample == b"SEND\x00\x00\x00\x00".hex().upper(), "send: the converter's output is what was sent", sample)
+    result(sample == "SEND\x00\x00\x00\x00", "send: a feed sends the datagram's payload as it was", repr(sample))
     time.sleep(2)
     b = "/var/lib/goatrope/send/bounded.jsonl"
     sizes = [os.path.getsize(f) if os.path.exists(f) else -1 for f in (b, b + ".1")]
@@ -872,10 +865,7 @@ import os; os._exit(0)
            f"sizes {sizes}, {n} of 600 lines")
     mode = oct(os.stat("/var/lib/goatrope/send/plain.jsonl").st_mode & 0o777)
     result(mode == "0o640", "send: file destinations are not world-readable", mode)
-    check_exit(0, "send: check after install (pins and heartbeats)")
-    with open(xf, "a") as f:
-        f.write("# changed\n")
-    check_exit(3, "send: converter binary no longer matches its pin")
+    check_exit(0, "send: check after install (heartbeats)")
 
 
 PHASES = {"refusals": phase_refusals, "inline": phase_inline, "reboot-verify": phase_reboot_verify,
@@ -1606,12 +1596,12 @@ NTP = ("240206e90000060000000a80c0000201ed135500c0000000ed13554040000000ed135540
 
 
 def phase_components() -> None:
-    """The real goat-transformers goat-xf in a [[send]] and the real first-bite mind in a [[decode]]."""
-    if not os.path.exists(f"{COMPONENTS}/goat-xf"):
-        result(None, "components: not run (no real binaries given; set GOATROPE_TEST_COMPONENTS)")
+    """The linked goat-transformers engine with the given packs in a [[send]], and the real first-bite mind in a [[decode]]."""
+    if not os.path.exists(f"{COMPONENTS}/mind") or not os.path.exists(f"{COMPONENTS}/packs/remote-id/pack.def"):
+        result(None, "components: not run (no real mind and packs given; set GOATROPE_TEST_COMPONENTS)")
         return
-    xf, mind = f"{COMPONENTS}/goat-xf", f"{COMPONENTS}/mind"
-    pin = {b: hashlib.sha256(open(b, "rb").read()).hexdigest() for b in (xf, mind)}
+    mind = f"{COMPONENTS}/mind"
+    pin = {mind: hashlib.sha256(open(mind, "rb").read()).hexdigest()}
     ver = {b: sh(f"{b} --version", check=False).stdout.strip() or "unknown" for b in (mind,)}
     with open(f"{COMPONENTS}/publishers.yml", "w") as f:
         f.write("publishers:\n  - name: records\n    publisher_type: PUB\n    address: \"tcp://127.0.0.1:47123\"\n"
@@ -1621,12 +1611,13 @@ def phase_components() -> None:
                 "    zmq_url: 127.0.0.1\n    zmq_port: 47123\n    local_logfile: records.jsonl\n"
                 "    topics: [\"*\"]\n")
     sh(f"chmod -R go+rX {COMPONENTS}")
+    engine_version, packs_sha = packs_digest(f"{COMPONENTS}/packs")
     write_cfg(LISTEN + f"""
 [[send]]
 name = "remote-id"
 port = "tp0"
 match = {{ protocol = "udp", dst_port = 5000 }}
-convert = {{ component = "goat-transformers", binary = "{xf}", version = "main", sha256 = "{pin[xf]}", from = "remote-id", to = "cot-xml", packs = "{COMPONENTS}/packs" }}
+convert = {{ component = "goat-transformers", version = "{engine_version}", from = "remote-id", to = "cot-xml", packs = "{COMPONENTS}/packs", packs_sha256 = "{packs_sha}" }}
 to = ["udp://127.0.0.1:9105"]
 
 [[decode]]
@@ -1652,7 +1643,7 @@ print(json.dumps(got))
 """], stdout=subprocess.PIPE, text=True)
     c0 = Capture("feed", "f0", "components-f0")
     p = gr("install", "--config", CFG)
-    result(p.returncode == 0, "components: install with the real goat-xf and mind",
+    result(p.returncode == 0, "components: install with the linked engine and the real mind",
            f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-400:]}")
     for _ in range(30):
         if sh("systemctl is-active goatrope-decode@ntp.service", check=False).stdout.strip() == "active" and \
@@ -1672,7 +1663,7 @@ print(json.dumps(got))
     sh(f"ip netns exec feed python3 -c \"{code}\"")
     got = json.loads(rx.communicate(timeout=60)[0])
     result(len(got) == 10 and all(g.startswith("<event") for g in got),
-           "components: goat-xf converted 10 of 10 Remote ID messages to Cursor-on-Target XML and they were sent",
+           "components: the linked engine converted 10 of 10 Remote ID messages to Cursor-on-Target XML and they were sent",
            f"{len(got)} of 10; {got[0][:90] if got else ''}")
     time.sleep(5)
     recs = []
@@ -2289,6 +2280,7 @@ def bench_relay_udp() -> None:
                "wireguard_alone_rate": base["rate"], "wireguard_alone_generator_bound": base["generator_bound"],
                "latency_relay": [lat_r["p50_us"], lat_r["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
                "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
+    bench_relay_tc(trial_path)
     relay.terminate()
     relay.wait(timeout=10)
 
@@ -2346,33 +2338,21 @@ def converted_rate(r: dict) -> float:
     return (r["received"] - 1) / r["span_s"] if r["received"] > 1 and r["span_s"] > 0 else 0.0
 
 
-def bench_send_convert() -> None:
-    """[[send]] with a converter on a listen tap: frames into the tap port, converted messages counted at UDP."""
-    real = os.path.exists(f"{COMPONENTS}/goat-xf")
-    if real:
-        xf, frm, to, packs, which = f"{COMPONENTS}/goat-xf", "remote-id", "cot-xml", f"{COMPONENTS}/packs", "the real goat-xf"
-        sh(f"chmod -R go+rX {COMPONENTS}")
-    else:
-        os.makedirs("/opt/gt-test", exist_ok=True)
-        xf = "/opt/gt-test/fake-goat-xf"
-        with open(xf, "w") as f:
-            f.write("#!/bin/sh\n# stand-in for goat-xf convert: upper-cases the hex it reads\ntr a-f A-F\n")
-        os.chmod(xf, 0o755)
-        frm, to, packs, which = "a", "b", "/opt/gt-test", "the stand-in (a shell script running tr)"
-    pin = hashlib.sha256(open(xf, "rb").read()).hexdigest()
+def bench_converter(label: str, option: str, conv: str, which: str) -> None:
+    """One [[send]] with this convert line on a listen tap: frames into the tap port, converted messages counted at UDP."""
     topo_listen()
     write_cfg(LISTEN + f"""
 [[send]]
 name = "bench"
 port = "tp0"
 match = {{ protocol = "udp", dst_port = 5000 }}
-convert = {{ component = "goat-transformers", binary = "{xf}", version = "bench", sha256 = "{pin}", from = "{frm}", to = "{to}", packs = "{packs}" }}
+{conv}
 to = ["udp://127.0.0.1:9201"]
 """)
     stand_in_watchdog()
     p = gr("install", "--config", CFG)
     if p.returncode != 0:
-        bench("decode-and-send: not measured", f"install exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}", {})
+        bench(f"decode-and-send, {label}: not measured", f"install exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}", {})
         return
     for _ in range(30):
         if sh("systemctl is-active goatrope-send@bench.service", check=False).stdout.strip() == "active":
@@ -2390,19 +2370,43 @@ to = ["udp://127.0.0.1:9201"]
         return s | {"received": r["received"], "span_s": r["span_s"]}
 
     over = trial(0)
-    conv = converted_rate(over)
-    check = trial(conv * 0.9) if conv >= 5 else None
+    conv_rate = converted_rate(over)
+    try:
+        hb = json.load(open("/var/lib/goatrope/send/bench.health"))
+    except (OSError, ValueError):
+        hb = {}
+    cv, ld = hb.get("convert", {}), hb.get("load", {})
+    check = trial(conv_rate * 0.9) if conv_rate >= 5 else None
     gr("uninstall", "--config", CFG)
     at90 = (f"at 90 % of that rate, {fmt(check['received'])} of {fmt(check['sent'])} arrived" if check
             else "too slow for a second trial at 90 %")
-    bench(f"decode-and-send, the converter run once per message: {conv:,.1f} messages/s converted and sent",
+    bench(f"decode-and-send, {label}: {conv_rate:,.1f} messages/s converted and sent",
           f"converter: {which}; {fmt(over['offered_per_s'])}/s offered for {D:g} s, {fmt(over['received'])} converted "
           f"in {over['span_s']:g} s; {at90}; {host_line()}",
-          {"path": "send-convert", "option": "exec-per-message", "converter": "goat-xf" if real else "stand-in",
-           "rate": round(conv, 2), "unpaced": over, "at_90_percent": check, "trial_seconds": D})
+          {"path": "send-convert", "option": option, "converter": which, "rate": round(conv_rate, 2), "unpaced": over,
+           "at_90_percent": check, "trial_seconds": D})
+    if cv:
+        bench(f"decode-and-send, {label}: one conversion p50 {cv.get('p50_us')} us, p99 {cv.get('p99_us')} us, max {cv.get('max_us')} us",
+              f"{fmt(cv.get('count', 0))} conversions in the last trial, timed in the send process (p50, p99 over the last 16,384); "
+              f"packs loaded once at start: {ld.get('files')} files in {ld.get('seconds')} s, resident {ld.get('rss_kib')} KiB, "
+              f"peak {ld.get('peak_rss_kib')} KiB; {host_line()}",
+              {"path": "send-convert-latency", "option": option, "convert": cv, "load": ld})
+
+
+def bench_send_convert() -> None:
+    """The converter: the engine linked into goatrope; goat-xf-pipe beside it when GOATROPE_TEST_COMPONENTS gives it."""
+    epacks = engine_packs()
+    if epacks:
+        sh(f"chmod -R go+rX {os.path.dirname(epacks)}")
+        version, digest = packs_digest(epacks)
+        bench_converter("the engine linked into goatrope", "linked",
+                        f'convert = {{ component = "goat-transformers", version = "{version}", from = "remote-id", to = "cot-xml", '
+                        f'packs = "{epacks}", packs_sha256 = "{digest}" }}', f"goat-transformers {version}, linked, packs {epacks}")
+    else:
+        bench("decode-and-send, the engine linked into goatrope: not measured", "no packs (see engine_packs)", {})
     pipe = f"{COMPONENTS}/goat-xf-pipe"
-    if real and os.path.exists(pipe):
-        bench_pipe(pipe, packs, D)
+    if epacks and os.path.exists(pipe):
+        bench_pipe(pipe, epacks, max(BENCH_SECONDS * 4, 10.0))
 
 
 def bench_pipe(pipe: str, packs: str, D: float) -> None:
@@ -2911,6 +2915,227 @@ def phase_proxy() -> None:
 
 
 PHASES["proxy"] = phase_proxy
+
+TC_OBJ = os.path.join(SRC, "tests", "netns", "build", "relay_tc.o")  # run.sh compiles relay_tc.c when clang is there
+
+
+def bench_relay_tc(trial_path) -> None:
+    """The prototype of ADR 0006: the same rule (port 7002) rewritten and redirected by a tc program on wg0."""
+    if not os.path.exists(TC_OBJ):
+        bench("relay UDP in a tc program: not measured", "no clang on the machine that ran run.sh, so relay_tc.o was not built", {})
+        return
+    ifindex = int(open("/sys/class/net/r0/ifindex").read())
+    obj = open(TC_OBJ, "rb").read()
+    placeholder = (0x7E1F1D00).to_bytes(4, "little")
+    if obj.count(placeholder) != 1:
+        bench("relay UDP in a tc program: not measured", "relay_tc.o does not hold the interface placeholder once", {})
+        return
+    path = f"{WORK}/relay_tc.o"
+    with open(path, "wb") as f:
+        f.write(obj.replace(placeholder, ifindex.to_bytes(4, "little")))
+    sh("tc qdisc add dev wg0 clsact")
+    p = sh(f"tc filter add dev wg0 ingress pref 1 bpf direct-action obj {path} sec tc", check=False)
+    if p.returncode != 0:
+        bench("relay UDP in a tc program: not measured", f"tc refused the program: {(p.stdout + p.stderr).strip()[-300:]}", {})
+        sh("tc qdisc del dev wg0 clsact", check=False)
+        return
+    D = BENCH_SECONDS
+    for size in (64, 512):
+        c = ceiling(trial_path("relay", size), 0.001)
+        lat_b = trial_path("wireguard", size)(10000)
+        lat_t = trial_path("relay", size)(10000)
+        add50 = round(lat_t["p50_us"] - lat_b["p50_us"], 1) if lat_t["p50_us"] is not None and lat_b["p50_us"] is not None else None
+        add99 = round(lat_t["p99_us"] - lat_b["p99_us"], 1) if lat_t["p99_us"] is not None and lat_b["p99_us"] is not None else None
+        un = c["unpaced"]
+        bench(f"relay UDP {size}-byte payload in a tc program (prototype): {fmt(c['rate'])} datagrams/s with loss under 0.1 %",
+              f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'] / max(un['seconds'], 1e-9))} delivered/s; "
+              f"latency at 10,000/s: p50 {lat_t['p50_us']} us p99 {lat_t['p99_us']} us, WireGuard alone p50 {lat_b['p50_us']} us "
+              f"p99 {lat_b['p99_us']} us, added p50 {add50} us p99 {add99} us; {c['trials']} trials of {D:g} s; {host_line()}",
+              {"path": "relay-udp-tc", "size": size, "rate": c["rate"], "loss": c["loss"], "unpaced": un,
+               "latency": [lat_t["p50_us"], lat_t["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
+               "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
+    sh("tc qdisc del dev wg0 clsact", check=False)
+
+
+# ---------------------------------------------------------------- the linked engine (docs/adr/0006-data-path.md)
+
+ENGINE_PACKS = "/opt/gt-engine/packs"  # run.sh copies the pinned goat-transformers commit's packs and model here
+
+
+def engine_packs() -> str | None:
+    for p in (f"{COMPONENTS}/packs", ENGINE_PACKS):
+        if os.path.exists(f"{p}/remote-id/pack.def") and os.path.exists(f"{p}/cot-xml/pack.def"):
+            return p
+    return None
+
+
+def packs_digest(packs: str) -> tuple[str, str]:
+    p = gr("packs-digest", packs, "remote-id", "cot-xml")
+    vals = dict(ln.split(" = ", 1) for ln in p.stdout.splitlines() if " = " in ln)
+    return vals["version"].strip('"'), vals["packs_sha256"].strip('"')
+
+
+def phase_linked_engine() -> None:
+    """A [[send]] converted by the engine linked into goatrope: packs pinned by digest, loaded once."""
+    packs = engine_packs()
+    if not packs:
+        result(None, "linked-engine: not run (no packs: run.sh copies them from the pinned goat-transformers checkout)")
+        return
+    sh(f"chmod -R go+rX {os.path.dirname(packs)}")
+    version, digest = packs_digest(packs)
+    conv = (f'convert = {{ component = "goat-transformers", version = "{version}", from = "remote-id", to = "cot-xml", '
+            f'packs = "{packs}", packs_sha256 = "{digest}" }}')
+    topo_listen()
+    cfg = LISTEN + f"""
+[[send]]
+name = "linked"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5000 }}
+{conv}
+to = ["udp://127.0.0.1:9220"]
+"""
+    write_cfg(cfg.replace(f'version = "{version}"', 'version = "0.0.1"'))
+    p = gr("validate", "--config", CFG)
+    result(p.returncode == 2 and "linked into this goatrope" in p.stderr, "linked-engine: a version other than the linked engine's is refused",
+           p.stderr.strip()[-160:])
+    write_cfg(cfg.replace(f'packs_sha256 = "{digest}"', f'binary = "/usr/local/bin/goat-xf", sha256 = "{digest}"'))
+    p = gr("validate", "--config", CFG)
+    result(p.returncode == 2 and "not a goat-xf binary" in p.stderr, "linked-engine: a convert naming a goat-xf binary is refused",
+           p.stderr.strip()[-200:])
+    write_cfg(cfg)
+    stand_in_watchdog()
+    rx = subprocess.Popen([sys.executable, "-c", """
+import socket, json
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 9220)); s.settimeout(20)
+got = []
+try:
+    while len(got) < 50: got.append(s.recv(65535).decode(errors="replace"))
+except socket.timeout: pass
+print(json.dumps(got))
+"""], stdout=subprocess.PIPE, text=True)
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "linked-engine: install with a linked-engine convert", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
+    for _ in range(30):
+        if "loaded" in sh("journalctl -u goatrope-send@linked.service --no-pager", check=False).stdout:
+            break
+        time.sleep(0.5)
+    started = sh("journalctl -u goatrope-send@linked.service --no-pager", check=False).stdout
+    line = next((ln for ln in started.splitlines() if "loaded" in ln), "")
+    result("loaded" in line, "linked-engine: the send process loaded the packs once at start", line.split(": ", 1)[-1][-160:])
+    gen("feed", "raw-send", "f0", 0, 200, 0.25, 1, 5000, REMOTE_ID)
+    got = json.loads(rx.communicate(timeout=60)[0])
+    result(len(got) == 50 and all(g.startswith("<event") for g in got),
+           "linked-engine: 50 of 50 Remote ID messages converted to Cursor-on-Target XML and sent", f"{len(got)} of 50; {got[0][:80] if got else ''}")
+    # one conversion's time, apart from throughput: 10,000 messages at 2,000 a second, timed by the send process
+    gen("feed", "raw-send", "f0", 0, 2000, 5, 2, 5000, REMOTE_ID)
+    time.sleep(5)
+    hb = json.load(open("/var/lib/goatrope/send/linked.health"))
+    cv, ld = hb.get("convert", {}), hb.get("load", {})
+    detail = (f"{cv.get('count')} conversions; p50 {cv.get('p50_us')} us, p99 {cv.get('p99_us')} us, max {cv.get('max_us')} us "
+              f"(p50 and p99 over the last 16,384)")
+    if os.uname().machine == "x86_64":
+        result(cv.get("count", 0) >= 10050 and cv.get("p99_us", 1e9) <= 1000,
+               "linked-engine: a Remote ID to Cursor-on-Target conversion takes 1 ms or less at p99, over 10,000 messages", detail)
+    else:
+        result(None, "linked-engine: conversion time, over 10,000 messages (the 1 ms assertion is made on amd64)", detail)
+    result(None, "linked-engine: the one-time load of the named packs at start",
+           f"{ld.get('files')} files in {ld.get('seconds')} s; resident {ld.get('rss_kib')} KiB after it, peak {ld.get('peak_rss_kib')} KiB")
+    check_exit(0, "linked-engine: check after install (packs digest, heartbeat)")
+    pack = f"{packs}/cot-xml/pack.def"
+    orig = open(pack, "rb").read()
+    with open(pack, "ab") as f:
+        f.write(b"\n# changed\n")
+    check_exit(3, "linked-engine: a pack that no longer matches packs_sha256")
+    sh("systemctl restart goatrope-send@linked.service", check=False)
+    time.sleep(3)
+    jl = sh("journalctl -u goatrope-send@linked.service --no-pager -n 5", check=False).stdout
+    result("not the declared packs_sha256" in jl, "linked-engine: a changed pack is refused at start", jl.strip().splitlines()[-1][-160:] if jl.strip() else "")
+    with open(pack, "wb") as f:
+        f.write(orig)
+    gr("uninstall", "--config", CFG)
+
+
+PHASES["linked-engine"] = phase_linked_engine
+
+
+# ---------------------------------------------------------------- fragments (docs/adr/0006-data-path.md)
+
+def phase_fragments() -> None:
+    """A datagram larger than the tunnel MTU crosses it as fragments. An overload of them fills reassembly memory and
+    loses fragmented traffic until it times out (ipfrag_time); unfragmented traffic keeps flowing, and the relay
+    reports the failures in relay.health. The same for the remote mirror's full-size frames."""
+    for dev in ("r0", "u0", "wg0", "tp0", "tp1", "grbm1"):
+        sh(f"ip link del {dev}", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 net.ipv6.conf.all.forwarding=0")
+    frag_time = int(open("/proc/sys/net/ipv4/ipfrag_time").read())
+    write_cfg(RELAY)
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    time.sleep(2)
+
+    def through(size: int, n: int, rate: float) -> int:
+        run = next_run()
+        sink = SinkArgs("linkhost", "192.0.2.2", 7002, n / rate, run, 1, n / rate + 5)
+        gen("remote", "udp-send", "10.99.0.2", "10.99.0.1", 7002, size, rate, n / rate, run, "wga")
+        return sink.result()["received"]
+
+    ok1400 = through(1400, 100, 200)
+    result(ok1400 == 100, "fragments: a 1,400-byte datagram (two fragments in the 1,420-byte tunnel) is relayed", f"{ok1400} of 100")
+    over = gen("remote", "udp-send", "10.99.0.2", "10.99.0.1", 7002, 1400, 0, 2, next_run(), "wga")
+    time.sleep(1)  # the tunnel's queues drain; reassembly memory stays full for ipfrag_time
+    small = through(64, 200, 1000)
+    stalled = through(1400, 100, 200)
+    result(small == 200, "fragments: right after an overload of fragmented datagrams, unfragmented ones are all relayed",
+           f"{small} of 200; overload {fmt(over['sent'])} datagrams in 2 s")
+    result(None, "fragments: fragmented datagrams sent right after the overload (reassembly memory full)", f"{stalled} of 100 relayed")
+    time.sleep(frag_time + 3)
+    health = json.load(open(HEALTH_FILE))
+    ra = health.get("reassembly", {})
+    result(ra.get("failed", 0) + ra.get("timed_out", 0) > 0, "fragments: relay.health counts the reassembly failures since the relay started",
+           json.dumps(ra))
+    after = through(1400, 100, 200)
+    result(after == 100, f"fragments: {frag_time + 3} s later (ipfrag_time {frag_time} s), fragmented datagrams are relayed again", f"{after} of 100")
+    relay.terminate()
+    relay.wait(timeout=10)
+
+    # the remote mirror, built as ADR 0004 module 5 builds it, over the same tunnel
+    topo_listen()
+    sh("ip link add grbm1 mtu 9000 type erspan seq key 1 local 10.99.0.1 remote 10.99.0.2 erspan_ver 1 erspan 1 nopmtudisc ignore-df")
+    sh("sysctl -qw net.ipv6.conf.grbm1.disable_ipv6=1 && ip link set grbm1 arp off && ip link set grbm1 up")
+    sh("ip -n remote link del grbc1", check=False)
+    sh("ip -n remote link add grbc1 mtu 9000 type erspan seq key 1 local 10.99.0.2 remote 10.99.0.1 erspan_ver 1 erspan 1")
+    sh("ip netns exec remote sysctl -qw net.ipv6.conf.grbc1.disable_ipv6=1")
+    sh("ip -n remote link set grbc1 arp off && ip -n remote link set grbc1 up")
+    sh("ip link set tp0 up && sysctl -qw net.ipv6.conf.tp0.disable_ipv6=1")
+    sh("tc qdisc add dev tp0 clsact")
+    sh("tc filter add dev tp0 ingress pref 1001 handle 1 matchall action mirred egress mirror dev grbm1")
+
+    def mirrored(size: int, n: int, rate: float) -> int:
+        before = int(sh("ip netns exec remote cat /sys/class/net/grbc1/statistics/rx_packets").stdout)
+        gen("feed", "raw-send", "f0", size, rate, n / rate, next_run(), 5000)
+        time.sleep(1)
+        return int(sh("ip netns exec remote cat /sys/class/net/grbc1/statistics/rx_packets").stdout) - before
+
+    full = mirrored(1514, 100, 200)
+    result(full == 100, "fragments: a 1,514-byte frame is mirrored whole (the outer packet in two fragments)", f"{full} of 100")
+    gen("feed", "raw-send", "f0", 1514, 0, 2, next_run(), 5000)
+    time.sleep(1)  # the tunnel's queues drain; reassembly memory stays full for ipfrag_time
+    small = mirrored(64, 200, 1000)
+    stalled = mirrored(1514, 100, 200)
+    result(small == 200, "fragments: right after an overload of full-size frames, small frames are all mirrored", f"{small} of 200")
+    result(None, "fragments: full-size frames mirrored right after the overload (the collector's reassembly memory full)",
+           f"{stalled} of 100 arrived")
+    rft = int(sh("ip netns exec remote cat /proc/sys/net/ipv4/ipfrag_time").stdout)
+    time.sleep(rft + 3)
+    again = mirrored(1514, 100, 200)
+    result(again == 100, f"fragments: {rft + 3} s later, full-size frames are mirrored again", f"{again} of 100")
+    sh("tc qdisc del dev tp0 clsact", check=False)
+    sh("ip link del grbm1", check=False)
+
+
+HEALTH_FILE = "/var/lib/goatrope/relay.health"
+PHASES["fragments"] = phase_fragments
 
 
 if __name__ == "__main__":

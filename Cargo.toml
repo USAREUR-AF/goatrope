@@ -23,6 +23,9 @@ netlink-packet-generic = "=0.5.0"
 netlink-packet-wireguard = "=0.5.1"
 x25519-dalek = { version = "=2.0.1", default-features = false }
 getrandom = "=0.3.4"
+# The converter of decode-and-send, linked (docs/adr/0006-data-path.md): standard library only, no
+# dependencies of its own. The commit is the pin; src/engine.rs names it and a test holds it to Cargo.lock.
+goat-transformers = { git = "https://github.com/USAREUR-AF/goat-transformers", rev = "37d243021cb404f1f090d36d64d9bb567f60b126" }
 
 [profile.release]
 opt-level = 3

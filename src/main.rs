@@ -6,6 +6,7 @@
 
 mod boundary;
 mod config;
+mod engine;
 mod link;
 mod nl;
 mod proxy;
@@ -41,6 +42,7 @@ goatrope command line.
                                                the relay's boundary interface (transport = \"boundary\"):
                                                make the private key, print what the boundary point needs,
                                                bring the interface up, check it (0 matches, 3 differs), remove it
+  goatrope packs-digest PACKS FROM TO          the packs_sha256 of a conversion for the linked engine, and its version
 
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 ";
@@ -400,6 +402,24 @@ fn boundary(cfg: &config::Config, action: &str) -> i32 {
     EXIT_OK
 }
 
+/// `goatrope packs-digest PACKS FROM TO`: what a linked-engine `convert` declares.
+fn packs_digest(rest: &[String]) -> i32 {
+    let [packs, from, to] = rest else {
+        return usage_error("packs-digest PACKS FROM TO");
+    };
+    let c = config::Convert { sha256: String::new(), from_format: from.clone(), to_format: to.clone(), packs: packs.clone() };
+    match engine::digest(&c) {
+        Ok(d) => {
+            println!("version = \"{}\"\npacks_sha256 = \"{d}\"\n# {}", engine::VERSION, engine::describe());
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("goatrope: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
@@ -417,6 +437,7 @@ fn main() {
         ) => run(v, &args[1..]),
         Some("relay") => relay_cmd(&args[1..]),
         Some("boundary") => boundary_cmd(&args[1..]),
+        Some("packs-digest") => packs_digest(&args[1..]),
         Some(other) => usage_error(&format!("argument cmd: invalid choice: '{other}'")),
     };
     std::process::exit(code);

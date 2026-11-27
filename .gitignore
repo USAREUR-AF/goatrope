@@ -5,3 +5,4 @@ dist/
 /target/
 /bin/x86_64/
 /bin/aarch64/
+tests/netns/build/

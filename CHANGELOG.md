@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- ADR 0006 (Proposed): the data path of each role. Relay UDP is batched in user space
+  (`recvmmsg`/`sendmmsg`, 64 datagrams a call, no busy polling) behind one internal interface,
+  with a per-rule `receive_buffer_kb` (default 8,192); a tc program for relay UDP is measured as
+  a prototype (`tests/netns/relay_tc.c`) and designed, not built. Datagrams above the tunnel MTU
+  are relayed as fragments; `relay.health` counts this machine's reassembly failures.
+  Namespace phase `fragments`.
+- decode-and-send converts only with the goat-transformers engine linked into goatrope (0.8.0,
+  commit `37d2430`): packs loaded once and pinned by `packs_sha256`; `goatrope packs-digest`
+  prints it. A `convert` naming a goat-xf `binary` is refused. One conversion takes 1 ms or less
+  (p99 115 µs over 10,000 messages on amd64, asserted by namespace phase `linked-engine`); the
+  send heartbeat and `status` report each conversion's count, p50, p99 and maximum, and the
+  pack load's time and memory. Fixes #29.
 - tests: `tests/netns/run.sh` and `tests/arm64/run.sh` name their images by a hash of the
   Dockerfile (`goatrope-netns-<hash>`, `goatrope-qemu-arm64-<hash>`), so runs from trees whose
   Dockerfiles differ no longer overwrite each other's image on a shared host.

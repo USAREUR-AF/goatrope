@@ -40,13 +40,59 @@ runs of the same path differ: by a factor of ten for goat-xf-pipe (load 23 on th
 | goat-xf run once per message, as goatrope does now (the real goat-xf, goat-transformers `37d2430`, with every model module) | 0.5 | 0.4 |
 | goat-xf-pipe, one long-lived process, outside goatrope, loss under 0.1 % | 32,395 | 2,849 |
 
+### After ADR 0006
+
+The same bench on `feat/data-path`, run twice on each version: the relay batched with each
+rule's receive buffer at its default, 8 MiB; the tc prototype; and the engine linked into
+goatrope, the only converter. In the second run the functional suite ran beside the bench
+(load average 25 to 40); in the first, 14 to 35.
+
+| Path | Run 1, 24.04 / 26.04 | Run 2, 24.04 / 26.04 | Before (24.04 / 26.04) |
+|---|---|---|---|
+| Relay UDP 64 B, datagrams/s, loss under 0.1 % | 135,612 / 157,750 | 97,260 / 111,552 | 21,509 / 54,388 |
+| Relay UDP 512 B | 90,224 / 169,228 | 99,537 / 102,024 | 44,931 / 53,756 |
+| Relay UDP 1,400 B (two fragments in the tunnel) | 69,202 / 129,292 | 66,502 / 36,265 | 31,807 / 6,007 |
+| Relay UDP 64 B in a tc program (prototype, not built) | 214,501 / 297,510 | 193,668 / 173,274 | |
+| Relay UDP 512 B in a tc program (prototype, not built) | 345,632 / 336,930 | 165,173 / 218,871 | |
+| WireGuard alone, 64 B | 323,619 / 344,808 | 285,482 / 137,851 | 283,022 / 364,853 |
+| WireGuard alone, 512 B | 321,755 / 343,431 | 257,005 / 295,927 | 262,743 / 329,822 |
+| WireGuard alone, 1,400 B | 138,335 / 151,392 | 60,387 / 91,677 | 60,870 / 116,969 |
+| Remote mirror 64 B, frames/s, none lost (unchanged path) | 230,694 (the generator's limit) / 204,061 | 209,296 / 216,173 (the generator's limit) | 238,555 / 211,540 |
+| Remote mirror 1,514 B | 160,072 (the generator's limit) / 135,098 | 106,770 / 101,377 | 169,706 / 85,397 |
+| Decode-and-send, engine linked into goatrope, messages/s, offered more than it takes | 52,666 / 45,090 | 22,768 / 22,581 | 0.5 / 0.4 (goat-xf once per message) |
+| the same, at 90 % of that rate: share that arrived | 55 % / 93 % | 99.1 % / 99.1 % | |
+| One conversion, p50 / p99 / max (run 2, timed in the send process) | | 28.6 µs / 51.0 µs / 30.4 ms and 28.1 µs / 51.1 µs / 70.4 ms | about 2 s each |
+| Pack load at start: time, resident memory after, peak (run 2) | | 0.093 s, 3,400 KiB, 7,392 KiB and 0.101 s, 3,296 KiB, 7,288 KiB | 1.85 s per message (goatrope#29) |
+
+An earlier run with the buffer fixed at 8 MiB gave 142,394 / 143,690 (64 B), 120,862 /
+122,937 (512 B) and 106,942 / 70,993 (1,400 B) for the relay, 251,847 / 229,515 and
+288,993 / 201,699 for the tc prototype, and 50,126 / 37,500 for the linked engine. Batching
+with the default 208 KiB buffer (24.04 only) gave 59,890, 27,709 and 35,720.
+
+The phase `linked-engine` times 10,000 conversions at 2,000 a second on amd64 and asserts p99
+≤ 1 ms: over three runs p50 51 to 54 µs, p99 110 to 115 µs, max 433 µs to 16.3 ms, and the
+pack load 0.11 to 0.40 s. Under overload in the bench, the maximum is the
+send process waiting for a processor on the loaded host: the time is wall-clock around the
+call.
+
+Latency at 10,000 datagrams a second (run 1), relay path p50 / p99 against WireGuard alone:
+24.04 64 B 157 µs / 2.5 ms against 151 µs / 2.9 ms; 512 B 163 µs / 2.9 ms against 153 µs /
+3.0 ms; 1,400 B 511 µs / 21 ms against 428 µs / 3.6 ms; 26.04 64 B 320 µs / 3.0 ms against
+198 µs / 2.8 ms; 512 B 195 µs / 2.7 ms against 147 µs / 2.7 ms.
+
 ## What the numbers say
 
-- **Relay UDP.** The relay forwards 20,000 to 54,000 datagrams a second without loss, and
-  60,000 to 94,000 a second when offered more, while WireGuard alone carries 260,000 to
-  360,000 small datagrams a second on the same path. The relay's socket is where the loss
-  happens (the drops are counted in `RcvbufErrors`): one system call per datagram received
-  and one per datagram sent, in one thread.
+- **Relay UDP, before.** The relay forwarded 20,000 to 54,000 datagrams a second without
+  loss, and 60,000 to 94,000 a second when offered more, while WireGuard alone carries
+  260,000 to 360,000 small datagrams a second on the same path. The relay's socket is where
+  the loss happens (the drops are counted in `RcvbufErrors`): one system call per datagram
+  received and one per datagram sent, in one thread, and a 208 KiB receive buffer that a
+  burst overflows while the thread is not running.
+- **Relay UDP, after.** Batched system calls and an 8 MiB receive buffer: 90,000 to 170,000
+  small datagrams a second without loss; WireGuard alone carries 2.0 to 3.6 times as much in
+  seven of eight rows. The tc prototype carries 165,000 to 346,000. The 1,400-byte rows vary most between runs (in one
+  26.04 run the WireGuard-alone ceiling, 27,533, was below the relay's), because a trial that
+  overloads the fragment path spoils reassembly for the trials near it.
 - **Fragments.** A 1,400-byte payload does not fit the 1,420-byte WireGuard MTU, so each
   datagram crosses the tunnel as two fragments. Under overload, fragments of half-dropped
   datagrams fill the kernel's reassembly memory and almost nothing is reassembled (944 a
@@ -57,7 +103,9 @@ runs of the same path differ: by a factor of ten for goat-xf-pipe (load 23 on th
   six runs it kept up with everything the generator sent.
 - **Decode-and-send.** Running goat-xf once per message costs about 2 s each, because each run
   reads every model module (69 MB). One long-lived process converts 2,800 to 32,000 messages a
-  second.
+  second. The engine linked into goatrope loads the three model modules the two packs use, in
+  about 0.1 s and 3.3 MiB, and converts 22,000 to 53,000 messages a second in the send process,
+  one message in 51 to 115 µs at p99.
 
 ## What is measured, and how
 
@@ -72,7 +120,8 @@ number and the `CLOCK_MONOTONIC` time it was sent; the sink counts only its own 
 | Relay UDP | the relay test's namespaces: a remote namespace whose WireGuard interface (`wga`, MTU 1,420) is a peer of the relay machine's `wg0`; the relay (`goatrope relay`, foreground) forwards rule port 7002 to a host on the link (`r0`, veth) | datagrams that reached the link host's socket |
 | WireGuard alone | the same tunnel to a socket on the relay machine, no relay | the same |
 | Remote mirror | the listen test's veth `tp0` with a clsact qdisc and a `matchall` filter whose action is `mirred egress mirror` to an ERSPAN type II interface (`seq key 1`, `nopmtudisc ignore-df`, MTU 9,000) from `10.99.0.1` to `10.99.0.2` over `wg0`, the settings of ADR 0004 module 5; the collector is an ERSPAN interface in the remote namespace | its `rx_packets` counter |
-| Decode-and-send | a listen tap on `tp0` with one `[[send]]`: match UDP port 5000, `convert` Remote ID to Cursor on Target, destination `udp://127.0.0.1:9201`; frames of a 25-byte Remote ID message injected at the far end of `tp0` | converted messages at the destination |
+| Decode-and-send | a listen tap on `tp0` with one `[[send]]`: match UDP port 5000, `convert` Remote ID to Cursor on Target, destination `udp://127.0.0.1:9201`; frames of a 25-byte Remote ID message injected at the far end of `tp0`. Before ADR 0006 the convert named a pinned goat-xf `binary`, run once per message; after, it is the engine linked into goatrope, with `packs_sha256` from `goatrope packs-digest` | converted messages at the destination |
+| Relay UDP in a tc program | `tests/netns/relay_tc.c`, compiled by run.sh with clang when clang is on the machine, the link interface's index written into it, loaded with `tc filter add dev wg0 ingress bpf direct-action`; the user-space relay keeps running and receives nothing on that port | as for the relay |
 | goat-xf-pipe | `goat-xf-pipe --packs-only --from-format remote-id --in udp://127.0.0.1:9210 --out udp://127.0.0.1:9211 --to-format cot-xml`, run by the bench beside the container's goatrope | converted messages at the destination |
 
 - **A ceiling** is found in one trial with the generator unpaced, then a binary search
@@ -84,12 +133,12 @@ number and the `CLOCK_MONOTONIC` time it was sent; the sink counts only its own 
   loaded workstation the p99 of both paths is about 3 ms, so a p99 difference that is
   negative, or a p50 difference smaller than its run-to-run spread, is reported as below the
   noise.
-- **A converter run once per message** is measured by offering far more than it can take for
-  12 s; the rate is the messages that arrived, from the first to the last, over the time
-  between them.
-- The bench uses `GOATROPE_TEST_COMPONENTS` for the real `goat-xf` and `goat-xf-pipe`.
-  Without them it measures the stand-in converter (a shell script running `tr`) and leaves
-  goat-xf-pipe out, and says so in its result line.
+- **Decode-and-send** is measured by offering far more than the converter takes for 12 s;
+  the rate is the messages that arrived, from the first to the last, over the time between
+  them. A second trial at 90 % of that rate gives the share that arrived.
+- The packs are those of the goat-transformers commit goatrope links (run.sh copies them from
+  Cargo's checkout), or those given in `GOATROPE_TEST_COMPONENTS`, which also gives
+  `goat-xf-pipe`; without it, goat-xf-pipe is left out.
 
 ## Run it
 

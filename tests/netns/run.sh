@@ -29,6 +29,23 @@ if [ ! -x "$repo/bin/$(uname -m)/goatrope" ] || [ ! -x "$repo/bin/$(uname -m)/go
     GOATROPE_BUILD_UNITS=1 "$repo/tools/build-bin.sh"
 fi
 
+# The packs and model modules of the goat-transformers commit the linked engine is built from
+# (docs/adr/0006-data-path.md), from Cargo's checkout of it: the "linked-engine" phase and the bench use them.
+rev=$(sed -n 's/^pub const COMMIT: &str = "\(.*\)";/\1/p' "$repo/src/engine.rs")
+engine_tree=""
+for d in "${CARGO_HOME:-$HOME/.cargo}" "$repo/target/cargo-home"; do
+    for t in "$d"/git/checkouts/goat-transformers-*/"${rev:0:7}"; do
+        [ -f "$t/packs/remote-id/pack.def" ] && engine_tree=$t
+    done
+done
+[ -n "$engine_tree" ] || echo "no checkout of goat-transformers ${rev:0:7}: the linked-engine phase will not run" >&2
+# The tc prototype the bench measures (docs/adr/0006-data-path.md), when clang is here.
+mkdir -p "$here/build"
+if command -v clang >/dev/null; then
+    clang -O2 -target bpf -I"/usr/include/$(uname -m)-linux-gnu" -c "$here/relay_tc.c" -o "$here/build/relay_tc.o" \
+        || echo "relay_tc.c did not compile: the bench leaves the tc prototype out" >&2
+fi
+
 [ "${#versions[@]}" -gt 0 ] || versions=(24.04 26.04)
 rc=0
 
@@ -62,6 +79,12 @@ start() { # container, image tag
     fi
 }
 
+engine_packs() { # container: the pinned commit's two test packs and its model modules, at /opt/gt-engine
+    [ -n "$engine_tree" ] || return 0
+    docker exec "$1" mkdir -p /opt/gt-engine
+    tar -C "$engine_tree" -cf - model packs/remote-id/pack.def packs/cot-xml/pack.def | docker exec -i "$1" tar -C /opt/gt-engine --no-same-owner -xf -
+}
+
 phase() { # container, log, phases...
     local c=$1 log=$2
     shift 2
@@ -91,7 +114,8 @@ for v in "${versions[@]}"; do
     docker rm -f "$c" >/dev/null
 
     start "$c" "$v"
-    phase "$c" "$log" listen uninstall send components relay boundary uninstall relay-service relay-tcp units erspan proxy
+    engine_packs "$c"
+    phase "$c" "$log" listen uninstall send linked-engine components relay boundary uninstall relay-service relay-tcp units erspan proxy fragments
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 
@@ -115,6 +139,7 @@ for v in "${versions[@]}"; do
     # Data-path ceilings: measurements, never a pass or a failure of a number (docs/performance.md).
     if [ "${GOATROPE_BENCH:-1}" != 0 ]; then
         start "$c" "$v"
+        engine_packs "$c"
         docker exec -e "GOATROPE_BENCH_SECONDS=${GOATROPE_BENCH_SECONDS:-0.5}" -e "GOATROPE_BENCH_STEPS=${GOATROPE_BENCH_STEPS:-4}" \
             "$c" python3 -I /src/tests/netns/test_tap.py bench 2>&1 | tee -a "$log" || rc=1
         docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true

@@ -182,10 +182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "goat-transformers"
+version = "0.8.0"
+source = "git+https://github.com/USAREUR-AF/goat-transformers?rev=37d243021cb404f1f090d36d64d9bb567f60b126#37d243021cb404f1f090d36d64d9bb567f60b126"
+
+[[package]]
 name = "goatrope"
 version = "0.0.0"
 dependencies = [
  "getrandom 0.3.4",
+ "goat-transformers",
  "libc",
  "netlink-packet-core",
  "netlink-packet-generic",

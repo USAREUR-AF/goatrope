@@ -11,5 +11,11 @@ released under the same License. See INTENT.md.
 Licensed under the Apache License, Version 2.0. See LICENSE.
 
 goatrope runs, and does not include, tcpdump, ethtool, iproute2 and systemd from
-the operating system, and optionally first-bite and goat-transformers binaries
-that the operator installs and pins.
+the operating system, and optionally first-bite binaries that the operator
+installs and pins.
+
+The goatrope binary includes the goat-transformers reference engine
+(github.com/USAREUR-AF/goat-transformers, engines/rust, the commit Cargo.toml
+names), Copyright 2025-2026 U.S. Federal Government (in countries where
+recognized), Apache License, Version 2.0. It includes no pack and no model
+module: the operator installs those and pins them by digest.
