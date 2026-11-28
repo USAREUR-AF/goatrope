@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- ADR 0007, Proposed: one flow model. The eight declaration tables become shorthands for a flow
+  (source, destination, filter, transform, carriage); schema 1 stays accepted through 1.x; `check`
+  and `status` report per flow; each flow writes a health record with goat's link-health fields.
+  Designed, not built.
 - fuzzing (#44): cargo-fuzz targets for frames from a tapped link (with fragment reassembly), ARP
   on the relay's link, the linked converter's input and the declaration; a `fuzz` workflow runs
   each for a minute on every pull request and half an hour weekly. goatrope is now a library
