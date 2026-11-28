@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- check: a listen port's egress drop is judged by what the first egress filter does (the only
+  filter at the lowest pref, a matchall on every protocol that drops), not by words in `tc`'s
+  output; a pass filter ahead of the drop makes check exit 3. Fixes #42.
 - relay: it follows its interfaces. One that is not there is waited for, at start and after a
   restart, and is never a refusal: a relay that starts before the mesh client, or outlives a mesh
   outage of any length, starts forwarding once the interface is back. One that vanishes, or comes

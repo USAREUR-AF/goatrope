@@ -762,6 +762,14 @@ def phase_listen() -> None:
     sh("tc qdisc del dev tp1 clsact")
     check_exit(3, "listen: egress drop removed")
     sh("systemctl restart goatrope-ports.service"); ports_settled()
+    # #42: a pass ahead of the drop lets frames out though the words "matchall" and "drop" are still listed
+    sh("tc filter del dev tp1 egress pref 1 && tc filter add dev tp1 egress pref 1 handle 1 matchall action pass "
+       "&& tc filter add dev tp1 egress pref 2 handle 2 matchall action drop")
+    check_exit(3, "listen: a pass filter ahead of the egress drop")
+    sh("systemctl restart goatrope-ports.service"); ports_settled()
+    sh("tc filter add dev tp1 egress pref 5 handle 5 matchall action pass")
+    check_exit(0, "listen: a filter after the drop, never reached")
+    sh("tc filter del dev tp1 egress pref 5", check=False)
     check_exit(0, "listen: after goatrope-ports restores them")
 
 

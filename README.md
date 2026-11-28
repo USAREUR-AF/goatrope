@@ -130,7 +130,7 @@ proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`).
 | the `.network` file systemd-networkd applies to each port is goatrope's | yes | yes |
 | one bridge of exactly the two ports, STP off, forward delay 0, ports forwarding | yes | no bridge holds a port |
 | LLDP frames (group address 01:80:C2:00:00:0E) forwarded across the bridge | yes | n/a |
-| every outgoing frame from an ordinary process dropped (tc egress `matchall drop`), ARP off; the port goes up only after the drop is in place. **A process with `CAP_NET_RAW` (root has it) that sends with `PACKET_QDISC_BYPASS` skips this drop** (the tests show it) | n/a | yes |
+| every outgoing frame from an ordinary process dropped (tc egress `matchall drop`, and `check` requires it to be the first filter tc runs: the only one at the lowest pref, on every protocol), ARP off; the port goes up only after the drop is in place. **A process with `CAP_NET_RAW` (root has it) that sends with `PACKET_QDISC_BYPASS` skips this drop** (the tests show it) | n/a | yes |
 | GRO, LRO, TSO and GSO off; Energy-Efficient Ethernet off; declared speed | yes | yes |
 | recording on a port, not the bridge device, as a bounded tcpdump ring (`files` x `file_mb`) | yes | one ring per port |
 | boot waits for no tap port (`RequiredForOnline=no`; the port service does not block boot) | yes | yes |
