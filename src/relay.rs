@@ -92,6 +92,7 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             fwd.join(", ")
         ));
     }
+    crate::relay_filter::preflight(r).map_err(RelayRefusal)?;
     proxy::preflight(r).map_err(RelayRefusal)?;
     let addrs = nl::addresses(&r.link_interface);
     if !addrs.contains(&r.link_address) {
@@ -114,6 +115,8 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
             b.peer_endpoint
         );
     }
+    // from here the link reaches only the rules' ports on this machine
+    crate::relay_filter::up(r).map_err(RelayRefusal)?;
     crate::l2::up(cfg).map_err(RelayRefusal)?;
     Ok(())
 }
@@ -327,7 +330,7 @@ fn bound_json(bound: &Bound) -> String {
     format!("{{{}}}", rows.join(", "))
 }
 
-fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> String {
+fn health_json(r: &Relay, time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> String {
     let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
@@ -349,19 +352,20 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
     let (fails, timeouts) = reassembly();
     let (f0, t0) = *REASM_AT_START.get_or_init(reassembly);
     format!(
-        "{{\"time\": {}, \"interfaces\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
+        "{{\"time\": {}, \"interfaces\": {}, \"rules\": [{}], \"proxies\": {}, \"link_filter\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
         json_float(time),
         bound_json(bound),
         rows.join(", "),
         proxies.health_json(),
+        crate::relay_filter::health_json(r),
         fails.saturating_sub(f0),
         timeouts.saturating_sub(t0)
     )
 }
 
-fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> Result<(), String> {
+fn health(r: &Relay, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> Result<(), String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
-    write_health(&health_json(now, state, tcp, proxies, bound));
+    write_health(&health_json(r, now, state, tcp, proxies, bound));
     Ok(())
 }
 
@@ -538,7 +542,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         .enumerate()
         .flat_map(|(i, s)| std::iter::once((i, None)).chain((0..s.outs.len()).map(move |k| (i, Some(k)))))
         .collect();
-    health(&state, &tcp, &proxies, &bound_to)?; // at once, so a service manager sees it running
+    health(r, &state, &tcp, &proxies, &bound_to)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut path = Batched::new();
     let mut denied_log = DeniedLog(None);
@@ -572,7 +576,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         }
         if last.elapsed() >= Duration::from_secs(2) {
             proxies.check_tunnels();
-            health(&state, &tcp, &proxies, &bound_to)?;
+            health(r, &state, &tcp, &proxies, &bound_to)?;
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
@@ -606,6 +610,11 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                     eprintln!("goatrope relay: stopping: {} no longer matches the declaration: {}", r.remote_interface, drift.join("; "));
                     return Ok(crate::EXIT_ERROR);
                 }
+            }
+            if let Err(e) = crate::relay_filter::tick(r) {
+                crate::l2::close_all();
+                eprintln!("goatrope relay: stopping: {e}");
+                return Ok(crate::EXIT_ERROR);
             }
             if let Err(e) = crate::l2::tick(r) {
                 eprintln!("goatrope relay: stopping: {e}");
@@ -921,6 +930,8 @@ WantedBy=multi-user.target
             l2 = crate::l2::unit_lines(cfg),
         ),
     );
+    let r = cfg.relay.as_ref().unwrap();
+    files.insert(crate::relay_filter::SYSCTL.to_string(), crate::relay_filter::sysctl_file(r, &h));
     files
 }
 
@@ -973,6 +984,7 @@ pub fn check(cfg: &Config) -> Vec<Item> {
         item(&mut items, "relay-interfaces", Some(ok), "the relay's sockets are bound to its interfaces as they are now", have);
     }
     proxy::check(cfg.relay.as_ref().unwrap(), health.as_ref().map(|(v, _)| v), &mut items);
+    items.extend(crate::relay_filter::check(cfg, health.as_ref().map(|(v, _)| v)));
     items
 }
 
@@ -1029,6 +1041,7 @@ pub fn status(cfg: &Config) {
             );
         }
     }
+    crate::relay_filter::status(r);
     proxy::status(r, health.as_ref().map(|(v, _)| v));
     for rule in &r.rules {
         let line = match (rule.link_initiated(), rule.protocol.as_str()) {
