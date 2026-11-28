@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- relay: it follows its interfaces. One that is not there is waited for, at start and after a
+  restart, and is never a refusal: a relay that starts before the mesh client, or outlives a mesh
+  outage of any length, starts forwarding once the interface is back. One that vanishes, or comes
+  back under a new index (a NetBird restart or upgrade makes `wt0` again; a USB adapter is plugged
+  in again), stops the relay (exit 1) so the service starts it again on the interface as it is;
+  before, the relay kept running and forwarded nothing. `relay.health` records the bound indexes,
+  and `check` item `relay-interfaces` exits 3 on a mismatch or while it waits. Namespace phase
+  `relay-recreate`; found on a real NetBird mesh.
 - layer-2 lane (ADR 0004 module 6): `[[relay.l2]]` bridges one dedicated port with a GRETAP
   interface to one mesh peer, only with `accept_layer2 = true`. tc flower passes only the declared
   EtherTypes, and from the tunnel only the declared source MACs (ARP only with a matching sender

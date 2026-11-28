@@ -13,6 +13,11 @@
 //!
 //! The relay TRANSMITS on the link, from its own interface and address. It never
 //! uses a tap port, never bridges and forwards no broadcast or multicast.
+//! An interface that is not there (a mesh client not started yet, or restarting) is waited for,
+//! at start and after a restart, and is never a refusal: relay.health and `check` say what the
+//! relay is waiting for. The relay stops (exit 1) when IP forwarding is turned on, or when one of
+//! its interfaces vanishes or comes back under a new index, so the service starts it again: it
+//! waits for the interface, then binds its sockets to it as it is.
 //! `goatrope install` installs goatrope-relay.service, which runs `goatrope relay`;
 //! a refusal exits with the refusal code, which the unit does not restart.
 //! `goatrope relay` also runs it in the foreground.
@@ -311,7 +316,18 @@ pub fn reassembly() -> (u64, u64) {
     (fails, timeouts)
 }
 
-fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> String {
+/// Each interface the relay's sockets are bound to, and its index then.
+type Bound = Vec<(String, Option<u32>)>;
+
+fn bound_json(bound: &Bound) -> String {
+    let rows: Vec<String> = bound
+        .iter()
+        .map(|(n, i)| format!("{}: {}", serde_json::Value::String(n.clone()), i.map(|i| i.to_string()).unwrap_or("null".into())))
+        .collect();
+    format!("{{{}}}", rows.join(", "))
+}
+
+fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> String {
     let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
@@ -333,8 +349,9 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
     let (fails, timeouts) = reassembly();
     let (f0, t0) = *REASM_AT_START.get_or_init(reassembly);
     format!(
-        "{{\"time\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
+        "{{\"time\": {}, \"interfaces\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
         json_float(time),
+        bound_json(bound),
         rows.join(", "),
         proxies.health_json(),
         fails.saturating_sub(f0),
@@ -342,18 +359,72 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
     )
 }
 
-fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> Result<(), String> {
-    let dir = std::path::Path::new(HEALTH).parent().unwrap();
-    std::fs::create_dir_all(dir).map_err(|e| sys::oserror(&e, &dir.to_string_lossy()))?;
+fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> Result<(), String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+    write_health(&health_json(now, state, tcp, proxies, bound));
+    Ok(())
+}
+
+/// relay.health, written whole (a new file renamed over the old); an error is printed, not fatal.
+fn write_health(body: &str) {
+    let dir = std::path::Path::new(HEALTH).parent().unwrap();
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        println!("health: {}", sys::oserror(&e, &dir.to_string_lossy()));
+        return;
+    }
     let tmp = format!("{HEALTH}.new");
-    let res = std::fs::write(&tmp, health_json(now, state, tcp, proxies))
+    let res = std::fs::write(&tmp, body)
         .map_err(|e| sys::oserror(&e, &tmp))
         .and_then(|_| std::fs::rename(&tmp, HEALTH).map_err(|e| sys::oserror(&e, &tmp)));
     if let Err(e) = res {
         println!("health: {e}");
     }
-    Ok(())
+}
+
+/// The interfaces the relay needs before it can start: the link interface, the remote interface
+/// unless the relay makes it itself (transport "boundary"), and each lane's port.
+fn needed(r: &Relay) -> Vec<&String> {
+    let mut v = vec![&r.link_interface];
+    if r.transport != "boundary" {
+        v.insert(0, &r.remote_interface);
+    }
+    v.extend(r.l2.iter().map(|l| &l.port)); // a lane's dedicated port: a USB adapter may come late too
+    v
+}
+
+/// Wait until every needed interface exists, and each lane's address and peer are on the mesh
+/// interface, writing relay.health (what it waits for) every 2 s.
+/// Some(exit code) when a stop signal comes first.
+fn wait_interfaces(r: &Relay) -> Option<i32> {
+    let mut said: Vec<String> = Vec::new();
+    let mut last: Option<Instant> = None;
+    loop {
+        let mut missing: Vec<String> = needed(r).into_iter().filter(|i| !sys::exists(i)).cloned().collect();
+        if missing.is_empty() {
+            missing = crate::l2::waiting_for(r); // the lane's address and peer, which the mesh client adds after its interface
+        }
+        if missing.is_empty() {
+            if !said.is_empty() {
+                println!("goatrope relay: {} is there; starting", said.join(", "));
+            }
+            return None;
+        }
+        if missing != said {
+            println!("goatrope relay: waiting for {} (not there yet)", missing.join(", "));
+            said = missing.clone();
+        }
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+            let w: Vec<String> = missing.iter().map(|m| serde_json::Value::String(m.clone()).to_string()).collect();
+            write_health(&format!("{{\"time\": {}, \"waiting\": [{}], \"rules\": [], \"proxies\": []}}", json_float(now), w.join(", ")));
+            last = Some(Instant::now());
+        }
+        if sys::stop_requested() {
+            println!("goatrope relay: stopping on a signal");
+            return Some(crate::EXIT_OK);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// The reassembly counters when the relay started; relay.health reports what happened since.
@@ -362,6 +433,9 @@ static REASM_AT_START: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::ne
 pub fn run(cfg: &Config) -> i32 {
     // first, so a stop request during start-up still ends in the loop, which removes what it added
     sys::catch_stop_signals();
+    if let Some(code) = wait_interfaces(cfg.relay.as_ref().unwrap()) {
+        return code;
+    }
     if let Err(e) = preflight(cfg) {
         eprintln!("goatrope relay: refused: {}", e.0);
         return crate::EXIT_REFUSED;
@@ -381,6 +455,10 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     let link_ip = r.link_address.split('/').next().unwrap_or_default();
     let link_addr: IpAddr = link_ip.parse().map_err(|_| format!("bad link address {link_ip}"))?;
     let ip = |s: &str| -> Result<IpAddr, String> { s.parse().map_err(|_| format!("bad address {s}")) };
+    // Every socket is bound to an interface (SO_BINDTODEVICE), which the kernel keeps as its index. A mesh client
+    // that restarts deletes and recreates its interface (NetBird's wt0 does), and a USB adapter that is replugged
+    // comes back the same way: under a new index the sockets receive nothing.
+    let bound_to: Bound = [&r.remote_interface, &r.link_interface].iter().map(|i| (i.to_string(), ifindex(i))).collect();
     let mut state: Vec<RuleState> = Vec::new();
     let mut tcp: Vec<(&RelayRule, Arc<relay_tcp::Counters>)> = Vec::new();
     // dropped on every path out of serve, which removes the proxy addresses it added
@@ -460,7 +538,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         .enumerate()
         .flat_map(|(i, s)| std::iter::once((i, None)).chain((0..s.outs.len()).map(move |k| (i, Some(k)))))
         .collect();
-    health(&state, &tcp, &proxies)?; // at once, so a service manager sees it running
+    health(&state, &tcp, &proxies, &bound_to)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut path = Batched::new();
     let mut denied_log = DeniedLog(None);
@@ -494,13 +572,33 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         }
         if last.elapsed() >= Duration::from_secs(2) {
             proxies.check_tunnels();
-            health(&state, &tcp, &proxies)?;
+            health(&state, &tcp, &proxies, &bound_to)?;
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
                 crate::l2::close_all();
                 eprintln!("goatrope relay: stopping: IP forwarding was turned on ({})", fwd.join(", "));
                 return Ok(crate::EXIT_ERROR);
+            }
+            // an interface gone or made again under a new index: the sockets on it receive nothing. Stop; the
+            // service starts the relay again, which waits for the interface and binds to it as it is then.
+            for (name, was) in &bound_to {
+                match ifindex(name) {
+                    Some(n) if Some(n) == *was => {}
+                    Some(n) => {
+                        crate::l2::close_all();
+                        eprintln!(
+                            "goatrope relay: stopping: {name} was made again (index {} -> {n}); the service starts the relay again on it",
+                            was.map(|w| w.to_string()).unwrap_or("none".into())
+                        );
+                        return Ok(crate::EXIT_ERROR);
+                    }
+                    None => {
+                        crate::l2::close_all();
+                        eprintln!("goatrope relay: stopping: {name} is gone; the service starts the relay again, and it waits for {name}");
+                        return Ok(crate::EXIT_ERROR);
+                    }
+                }
             }
             if r.transport == "boundary" {
                 let drift = boundary::check(r.boundary.as_ref().unwrap(), &r.remote_interface);
@@ -515,6 +613,11 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             }
         }
     }
+}
+
+/// The interface's index; None when there is no such interface.
+pub(crate) fn ifindex(name: &str) -> Option<u32> {
+    sys::read(&format!("/sys/class/net/{name}/ifindex")).and_then(|s| s.parse().ok())
 }
 
 /// The address a rule's link-side sockets bind to: its proxy address, else the relay's own.
@@ -865,8 +968,45 @@ pub fn check(cfg: &Config) -> Vec<Item> {
     };
     item(&mut items, "relay-health", want, format!("written in the last {STALE_S:.0} s"), have);
     let health = read_health();
+    if let Some((v, _)) = &health {
+        let (ok, have) = interfaces_state(v, cfg.relay.as_ref().unwrap());
+        item(&mut items, "relay-interfaces", Some(ok), "the relay's sockets are bound to its interfaces as they are now", have);
+    }
     proxy::check(cfg.relay.as_ref().unwrap(), health.as_ref().map(|(v, _)| v), &mut items);
     items
+}
+
+/// From relay.health: whether the relay is bound to the declaration's interfaces under their live index,
+/// and in words. Only the interfaces this declaration names are compared.
+fn interfaces_state(v: &serde_json::Value, r: &Relay) -> (bool, String) {
+    if let Some(w) = v["waiting"].as_array().filter(|w| !w.is_empty()) {
+        let names: Vec<&str> = w.iter().filter_map(|x| x.as_str()).collect();
+        return (false, format!("waiting for {}", names.join(", ")));
+    }
+    let Some(bound) = v["interfaces"].as_object() else {
+        return (true, "not reported".into());
+    };
+    let mut bad = Vec::new();
+    let mut good = Vec::new();
+    let declared = [&r.remote_interface, &r.link_interface];
+    for (name, idx) in bound.iter().filter(|(n, _)| declared.contains(n)) {
+        let was = idx.as_u64().map(|i| i as u32);
+        match (was, ifindex(name)) {
+            (Some(w), Some(n)) if w == n => good.push(format!("{name} (index {n})")),
+            (w, n) => bad.push(format!(
+                "{name} bound under index {}, now {}",
+                w.map(|x| x.to_string()).unwrap_or("none".into()),
+                n.map(|x| x.to_string()).unwrap_or("gone".into())
+            )),
+        }
+    }
+    if good.is_empty() && bad.is_empty() {
+        (true, "not reported for this declaration's interfaces".into())
+    } else if bad.is_empty() {
+        (true, format!("bound to {}", good.join(", ")))
+    } else {
+        (false, bad.join("; "))
+    }
 }
 
 pub fn status(cfg: &Config) {
@@ -878,6 +1018,8 @@ pub fn status(cfg: &Config) {
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
     }
     if let Some((v, _)) = &health {
+        let (ok, have) = interfaces_state(v, r);
+        println!("  relay  {have}{}", if ok { "" } else { " (not forwarding)" });
         let n = |k: &str| v["reassembly"][k].as_u64().unwrap_or(0);
         if n("failed") + n("timed_out") > 0 {
             println!(

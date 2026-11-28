@@ -222,7 +222,25 @@ The unit has `Restart=on-failure`, so a relay that stops (for example because IP
 was turned on while it ran, exit 1) is started again. A refusal (exit 2: IPv6 or IP forwarding
 on, an interface missing or not WireGuard, the address not held) is not restarted
 (`RestartPreventExitStatus=2`): the unit stays failed and `check` exits 3 until the cause is
-fixed and the unit is started again. The relay runs with `CAP_NET_RAW` (to bind its sockets to
+fixed and the unit is started again.
+
+The relay's sockets are bound to its two interfaces, which the kernel tracks by index. A mesh
+client that restarts or is upgraded deletes its interface and makes it again (NetBird's `wt0`
+does), a mesh client may come up after the relay at boot, and a USB adapter that is plugged in
+again comes back under a new index. So:
+
+| The interface | The relay |
+|---|---|
+| not there when it starts | waits for it (the unit stays active), then runs its checks and starts forwarding; never a refusal |
+| gone while it runs | stops (exit 1); systemd starts it again, and it waits as above |
+| back under a new index | stops (exit 1); systemd starts it again on the interface as it is now |
+
+`relay.health` records each interface's index as the relay bound to it, or what it is waiting
+for; `check` item `relay-interfaces` compares them with the live indexes and exits 3 on a
+mismatch or while it waits ("waiting for wt0"). The boundary interface is the relay's own, so
+with `transport = "boundary"` only the link interface is waited for.
+
+The relay runs with `CAP_NET_RAW` (to bind its sockets to
 an interface) and `CAP_NET_ADMIN` (the boundary interface) only, on a read-only system except
 `/var/lib/goatrope`. `wip` is no longer needed; `wip = true` is accepted and does nothing.
 

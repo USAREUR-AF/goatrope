@@ -322,7 +322,7 @@ pub fn preflight(r: &Relay) -> Result<(), String> {
         return Err(format!("{} has no Ethernet address", r.link_interface));
     }
     let all = nl::address_list(None).map_err(|e| format!("cannot list addresses: {}", sys::strerror(&e)))?;
-    let link_idx = link_index(&r.link_interface);
+    let link_idx = crate::relay::ifindex(&r.link_interface);
     for p in &r.proxies {
         let ip: IpAddr = p.address.parse().unwrap();
         for (idx, a) in all.iter().filter(|(_, a)| a.ip == ip) {
@@ -341,10 +341,6 @@ pub fn preflight(r: &Relay) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn link_index(ifname: &str) -> Option<u32> {
-    sys::read(&format!("/sys/class/net/{ifname}/ifindex")).and_then(|s| s.parse().ok())
 }
 
 fn remove(link_if: &str, o: &mut One, why: &str) {
