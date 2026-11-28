@@ -152,11 +152,19 @@ fragments, keeps the UDP datagrams its `match` names (at least one address or
 port is required), optionally converts each payload with the goat-transformers engine linked into goatrope,
 and sends it to each destination: `udp://`, `tcp://`
 (`framing = "len32be"` or `"raw"`), `http(s)://` (one POST per message, redirects
-refused) or `file:///var/lib/goatrope/...` (`format = "jsonl"` or `"raw"`, and
+refused) or `file:///var/lib/goatrope/send/...` (`format = "jsonl"` or `"raw"`, and
 `max_mb`: the file is cut there and one older file kept). A destination whose
 route leaves through a tap port, or whose name does not resolve, is refused at
 install and at send time: decode-and-send never transmits on the tapped link. TCP
 stream reassembly is not built.
+
+Each `[[send]]` runs as `goatrope-send@<name>.service`, which parses link traffic and converts
+it, so it runs as a dynamic user of its own (`goatrope-send`, shared by every send), not root,
+with `CAP_NET_RAW` only (to read the tap port) and a read-only system. It can write only its
+directory, `/var/lib/goatrope/send` (a systemd `StateDirectory`, kept under
+`/var/lib/private/goatrope/send`), so file destinations must be there, and it cannot read
+root-only files such as the boundary transport's private key or goatrope's state file. The packs
+a `convert` names must be readable by others. `uninstall --purge` removes the directory.
 
 A `convert` converts with the goat-transformers engine linked into goatrope
 ([ADR 0006](docs/adr/0006-data-path.md)), the only converter: the send process loads the two
@@ -369,7 +377,8 @@ the host's kernel. No hardware is involved. They cover:
   the file tree and port state (IPv6 address generation included) exactly as before
   install;
 - decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, and a
-  file destination cut at `max_mb`;
+  file destination cut at `max_mb`; the send process runs as its own user with `CAP_NET_RAW` only,
+  cannot read a root-only key or the state file, and cannot write outside its directory;
 - `fragments`: a 1,400-byte datagram relayed and a 1,514-byte frame mirrored whole over a
   1,420-byte tunnel; after an overload of them, unfragmented datagrams and small frames still
   cross, `relay.health` counts the reassembly failures, and fragmented traffic crosses again

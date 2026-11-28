@@ -1058,12 +1058,6 @@ pub fn uninstall(purge: bool) -> R<()> {
             }
         }
     }
-    if Path::new("/var/lib/private").is_dir()
-        && fs::read_dir("/var/lib/private").map(|mut r| r.next().is_none()).unwrap_or(false)
-        && state["var_lib_private_existed"].as_bool() == Some(false)
-    {
-        let _ = fs::remove_dir("/var/lib/private");
-    }
     let mut kept: Vec<String> = Vec::new();
     let rec = s(&state, "record_directory").map(String::from);
     for f in [decl(), format!("{ETC}/goatrope.toml.prev")] {
@@ -1080,9 +1074,17 @@ pub fn uninstall(purge: bool) -> R<()> {
             continue;
         }
         if purge {
-            let _ = fs::remove_dir_all(&d);
+            remove_state_dir(&d);
         } else if fs::read_dir(&d).map(|mut r| r.next().is_some()).unwrap_or(false) {
             kept.push(d);
+        }
+    }
+    if Path::new("/var/lib/private").is_dir() && state["var_lib_private_existed"].as_bool() == Some(false) {
+        if fs::read_dir("/var/lib/private").map(|mut r| r.next().is_none()).unwrap_or(false) {
+            let _ = fs::remove_dir("/var/lib/private");
+        } else if !purge && Path::new(STATE_DIR).is_dir() {
+            // it holds kept data; --purge removes it once that is gone
+            let _ = fs::write(PRIVATE_MADE, "");
         }
     }
     remove(STATE);
@@ -1108,13 +1110,36 @@ pub fn uninstall(purge: bool) -> R<()> {
     Ok(())
 }
 
+/// Left by a plain uninstall when /var/lib/private was made for goatrope and still holds kept data.
+const PRIVATE_MADE: &str = "/var/lib/goatrope/.var-lib-private-made";
+
+/// A directory under /var/lib/goatrope, with what systemd keeps for it: decode-and-send's
+/// directory is a dynamic user's StateDirectory, a link to /var/lib/private/goatrope/send (#40).
+fn remove_state_dir(d: &str) {
+    let p = Path::new(d);
+    if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = fs::remove_file(p);
+    } else {
+        let _ = fs::remove_dir_all(p);
+    }
+    if let Some(name) = d.strip_prefix("/var/lib/") {
+        let private = Path::new("/var/lib/private").join(name);
+        let _ = fs::remove_dir_all(&private);
+        if let Some(parent) = private.parent().filter(|x| *x != Path::new("/var/lib/private")) {
+            if fs::read_dir(parent).map(|mut r| r.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
 /// After a plain uninstall: the declaration and the recordings are all that remain.
 fn purge_leftovers() {
     let mut removed = Vec::new();
     let rec = config::load(&decl()).ok().and_then(|c| c.tap.map(|t| t.record.directory));
     for d in [rec, Some(format!("{STATE_DIR}/record")), Some(format!("{STATE_DIR}/send"))].into_iter().flatten() {
         if d.starts_with(&format!("{STATE_DIR}/")) && Path::new(&d).is_dir() && !removed.contains(&d) {
-            let _ = fs::remove_dir_all(&d);
+            remove_state_dir(&d);
             removed.push(d);
         }
     }
@@ -1122,6 +1147,13 @@ fn purge_leftovers() {
         if Path::new(&f).exists() {
             remove(&f);
             removed.push(f);
+        }
+    }
+    // /var/lib/private, when it was made for goatrope's dynamic users (the plain uninstall left a mark)
+    if Path::new(PRIVATE_MADE).exists() {
+        remove(PRIVATE_MADE);
+        if fs::read_dir("/var/lib/private").map(|mut r| r.next().is_none()).unwrap_or(false) {
+            let _ = fs::remove_dir("/var/lib/private");
         }
     }
     for d in [ETC, STATE_DIR] {
