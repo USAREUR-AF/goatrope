@@ -330,7 +330,14 @@ fn bound_json(bound: &Bound) -> String {
     format!("{{{}}}", rows.join(", "))
 }
 
-fn health_json(r: &Relay, time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> String {
+fn health_json(
+    r: &Relay,
+    time: f64,
+    state: &[RuleState],
+    tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)],
+    proxies: &Proxies,
+    bound: &Bound,
+) -> String {
     let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
@@ -363,7 +370,13 @@ fn health_json(r: &Relay, time: f64, state: &[RuleState], tcp: &[(&RelayRule, Ar
     )
 }
 
-fn health(r: &Relay, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, bound: &Bound) -> Result<(), String> {
+fn health(
+    r: &Relay,
+    state: &[RuleState],
+    tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)],
+    proxies: &Proxies,
+    bound: &Bound,
+) -> Result<(), String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     write_health(&health_json(r, now, state, tcp, proxies, bound));
     Ok(())
