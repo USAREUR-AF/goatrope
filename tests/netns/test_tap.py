@@ -2594,110 +2594,6 @@ def wait_for(cond, timeout: float, step: float = 0.5) -> float | None:
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
         forwarding_off()
-
-
-# ---------------------------------------------------------------- layer-2 lane (ADR 0004 module 6)
-
-MAC_A, MAC_B = "02:00:00:00:a0:01", "02:00:00:00:b0:01"
-L2_A = """schema = 1
-[relay]
-remote_interface = "wgl0"
-link_interface = "l2d0"
-link_address = "198.51.100.129/25"
-allow = [{ direction = "remote-to-link", protocol = "udp", remote = "203.0.113.2", listen_port = 7100, target = "198.51.100.130", target_port = 7100 }]
-[[relay.l2]]
-name = "lane0"
-port = "lp0"
-peer = "203.0.113.2"
-local = "203.0.113.1"
-key = 4242
-accept_layer2 = true
-ethertypes = ["0x0806", "0x0800", "0x88b5"]
-macs = ["02:00:00:00:b0:01"]
-"""
-L2_B = (L2_A.replace('"wgl0"', '"wgl1"').replace('"l2d0"', '"l2d1"').replace('remote = "203.0.113.2"', 'remote = "203.0.113.1"')
-        .replace('peer = "203.0.113.2"', 'peer = "203.0.113.9"').replace('local = "203.0.113.1"', 'local = "203.0.113.2"')
-        .replace('peer = "203.0.113.9"', 'peer = "203.0.113.1"').replace('"lp0"', '"lp1"').replace(MAC_B, MAC_A))
-CFG_B = f"{WORK}/goatrope-b.toml"
-
-
-def topo_l2() -> None:
-    """Two lane ends joined by WireGuard over an underlay veth: this machine (end A, the installed relay)
-    and namespace endB (a relay in the foreground). Each end's port leads to its own link host.
-
-      hostA [ha0 192.0.2.1] == lp0 ]-l2b-lane0-[ l2g-lane0 ~ wgl0 203.0.113.1 == underlay ==
-          == wgl1 203.0.113.2 (ns endB) ~ l2g-lane0 ]-l2b-lane0-[ lp1 == [hb0 192.0.2.2] hostB
-    """
-    for ns in ("hostA", "hostB", "endB"):
-        sh(f"ip netns del {ns}", check=False)
-    for leftover in ("wg0", "u0", "r0", "grb0", "bp0", "er0", "l2u0", "wgl0", "lp0", "l2d0", "l2g-lane0", "l2b-lane0"):
-        sh(f"ip link del {leftover}", check=False)
-    for ns in ("hostA", "hostB", "endB"):
-        sh(f"ip netns add {ns} && ip -n {ns} link set lo up")
-    for ns in ("hostA", "hostB"):  # the link hosts send no IPv6, so the counters below count only what the test sends
-        sh(f"ip netns exec {ns} sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1")
-    sh("ip link add l2u0 address 02:00:00:00:e1:01 type veth peer name l2u1 address 02:00:00:00:e1:02 && ip link set l2u1 netns endB")
-    sh("ip addr add 198.51.100.1/30 dev l2u0 && ip link set l2u0 up")
-    sh("ip -n endB addr add 198.51.100.2/30 dev l2u1 && ip -n endB link set l2u1 up")
-    keys = {}
-    for k in ("l2a", "l2b"):
-        priv = sh("wg genkey").stdout.strip()
-        keys[k] = (priv, subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True).stdout.strip())
-    sh("ip link add wgl0 type wireguard")
-    subprocess.run(["wg", "set", "wgl0", "listen-port", "51830", "private-key", "/dev/stdin", "peer", keys["l2b"][1],
-                    "endpoint", "198.51.100.2:51831", "allowed-ips", "203.0.113.2/32", "persistent-keepalive", "5"],
-                   input=keys["l2a"][0] + "\n", text=True, check=True)
-    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 up")
-    sh("ip -n endB link add wgl1 type wireguard")
-    subprocess.run(["ip", "netns", "exec", "endB", "wg", "set", "wgl1", "listen-port", "51831", "private-key", "/dev/stdin",
-                    "peer", keys["l2a"][1], "endpoint", "198.51.100.1:51830", "allowed-ips", "203.0.113.1/32",
-                    "persistent-keepalive", "5"], input=keys["l2b"][0] + "\n", text=True, check=True)
-    sh("ip -n endB addr add 203.0.113.2/24 dev wgl1 && ip -n endB link set wgl1 up")
-    for pre, port, peer, ns, mac, addr in (("", "lp0", "ha0", "hostA", MAC_A, "192.0.2.1"),
-                                           ("ip netns exec endB ", "lp1", "hb0", "hostB", MAC_B, "192.0.2.2")):
-        end = "endB" if pre else None
-        sh(f"ip link add {port} address 02:00:00:00:{'a' if port == 'lp0' else 'b'}0:fe type veth peer name {peer} address {mac}")
-        sh(f"ip link set {peer} netns {ns}")
-        if end:
-            sh(f"ip link set {port} netns {end}")
-        sh(f"ip -n {ns} addr add {addr}/24 dev {peer} && ip -n {ns} link set {peer} up")
-        sh(f"{pre}ip link set {port} up")  # IPv6 stays on for the port here: the first start must refuse
-        dummy = "l2d0" if not end else "l2d1"
-        sh(f"{pre}ip link add {dummy} type dummy && {pre}ip addr add 198.51.100.129/25 dev {dummy}")
-        sh(f"{pre}sysctl -qw net.ipv6.conf.{dummy}.disable_ipv6=1 net.ipv4.conf.all.forwarding=0 net.ipv6.conf.all.forwarding=0")
-        sh(f"{pre}ip link set {dummy} up")
-
-
-def l2_inject(ns: str, ifname: str, n: int, tag: bytes, src: str, ethertype: int = 0x88b5) -> None:
-    s = bytes.fromhex(src.replace(":", ""))
-    code = (f"import socket,time\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\ns.bind(({ifname!r},0))\n"
-            f"for i in range({n}):\n s.send(b'\\xff'*6+{s!r}+{ethertype.to_bytes(2, 'big')!r}+"
-            f"{MAGIC!r}+{tag!r}+i.to_bytes(4,'big')+b'z'*40)\n time.sleep(0.002)\n")
-    sh(f"ip netns exec {ns} python3 -c \"{code}\"")
-
-
-def l2_counter(dev: str, ns: str | None = None, drop: bool = True) -> int:
-    """Packets counted by the lane's drop (or its pass) filters on dev's ingress."""
-    pre = f"ip netns exec {ns} " if ns else ""
-    p = sh(f"{pre}tc -s -j filter show dev {dev} ingress", check=False)
-    try:
-        rows = json.loads(p.stdout or "[]")
-    except ValueError:
-        return -1
-    want = "matchall" if drop else "flower"
-    return sum(f["options"]["actions"][0]["stats"]["packets"] for f in rows if f.get("kind") == want and "options" in f)
-
-
-def l2_up(dev: str, ns: str | None = None) -> bool:
-    pre = f"ip -n {ns} " if ns else "ip "
-    p = sh(f"{pre}-j link show dev {dev}", check=False)
-    return p.returncode == 0 and "UP" in json.loads(p.stdout)[0].get("flags", [])
-
-
-def l2_wait(cond, timeout: float, step: float = 0.5) -> float | None:
-    """Seconds until cond() held, or None."""
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
         if cond():
             return time.monotonic() - t0
         time.sleep(step)
@@ -3241,6 +3137,114 @@ def phase_fragments() -> None:
 
 HEALTH_FILE = "/var/lib/goatrope/relay.health"
 PHASES["fragments"] = phase_fragments
+
+
+# ---------------------------------------------------------------- layer-2 lane (ADR 0004 module 6)
+
+MAC_A, MAC_B = "02:00:00:00:a0:01", "02:00:00:00:b0:01"
+L2_A = """schema = 1
+[relay]
+remote_interface = "wgl0"
+link_interface = "l2d0"
+link_address = "198.51.100.129/25"
+allow = [{ direction = "remote-to-link", protocol = "udp", remote = "203.0.113.2", listen_port = 7100, target = "198.51.100.130", target_port = 7100 }]
+[[relay.l2]]
+name = "lane0"
+port = "lp0"
+peer = "203.0.113.2"
+local = "203.0.113.1"
+key = 4242
+accept_layer2 = true
+ethertypes = ["0x0806", "0x0800", "0x88b5"]
+macs = ["02:00:00:00:b0:01"]
+"""
+L2_B = (L2_A.replace('"wgl0"', '"wgl1"').replace('"l2d0"', '"l2d1"').replace('remote = "203.0.113.2"', 'remote = "203.0.113.1"')
+        .replace('peer = "203.0.113.2"', 'peer = "203.0.113.9"').replace('local = "203.0.113.1"', 'local = "203.0.113.2"')
+        .replace('peer = "203.0.113.9"', 'peer = "203.0.113.1"').replace('"lp0"', '"lp1"').replace(MAC_B, MAC_A))
+CFG_B = f"{WORK}/goatrope-b.toml"
+
+
+def topo_l2() -> None:
+    """Two lane ends joined by WireGuard over an underlay veth: this machine (end A, the installed relay)
+    and namespace endB (a relay in the foreground). Each end's port leads to its own link host.
+
+      hostA [ha0 192.0.2.1] == lp0 ]-l2b-lane0-[ l2g-lane0 ~ wgl0 203.0.113.1 == underlay ==
+          == wgl1 203.0.113.2 (ns endB) ~ l2g-lane0 ]-l2b-lane0-[ lp1 == [hb0 192.0.2.2] hostB
+    """
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns del {ns}", check=False)
+    for leftover in ("wg0", "u0", "r0", "grb0", "bp0", "er0", "l2u0", "wgl0", "lp0", "l2d0", "l2g-lane0", "l2b-lane0"):
+        sh(f"ip link del {leftover}", check=False)
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns add {ns} && ip -n {ns} link set lo up")
+    for ns in ("hostA", "hostB"):  # the link hosts send no IPv6, so the counters below count only what the test sends
+        sh(f"ip netns exec {ns} sysctl -qw net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1")
+    sh("ip link add l2u0 address 02:00:00:00:e1:01 type veth peer name l2u1 address 02:00:00:00:e1:02 && ip link set l2u1 netns endB")
+    sh("ip addr add 198.51.100.1/30 dev l2u0 && ip link set l2u0 up")
+    sh("ip -n endB addr add 198.51.100.2/30 dev l2u1 && ip -n endB link set l2u1 up")
+    keys = {}
+    for k in ("l2a", "l2b"):
+        priv = sh("wg genkey").stdout.strip()
+        keys[k] = (priv, subprocess.run(["wg", "pubkey"], input=priv, capture_output=True, text=True).stdout.strip())
+    sh("ip link add wgl0 type wireguard")
+    subprocess.run(["wg", "set", "wgl0", "listen-port", "51830", "private-key", "/dev/stdin", "peer", keys["l2b"][1],
+                    "endpoint", "198.51.100.2:51831", "allowed-ips", "203.0.113.2/32", "persistent-keepalive", "5"],
+                   input=keys["l2a"][0] + "\n", text=True, check=True)
+    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 up")
+    sh("ip -n endB link add wgl1 type wireguard")
+    subprocess.run(["ip", "netns", "exec", "endB", "wg", "set", "wgl1", "listen-port", "51831", "private-key", "/dev/stdin",
+                    "peer", keys["l2a"][1], "endpoint", "198.51.100.1:51830", "allowed-ips", "203.0.113.1/32",
+                    "persistent-keepalive", "5"], input=keys["l2b"][0] + "\n", text=True, check=True)
+    sh("ip -n endB addr add 203.0.113.2/24 dev wgl1 && ip -n endB link set wgl1 up")
+    for pre, port, peer, ns, mac, addr in (("", "lp0", "ha0", "hostA", MAC_A, "192.0.2.1"),
+                                           ("ip netns exec endB ", "lp1", "hb0", "hostB", MAC_B, "192.0.2.2")):
+        end = "endB" if pre else None
+        sh(f"ip link add {port} address 02:00:00:00:{'a' if port == 'lp0' else 'b'}0:fe type veth peer name {peer} address {mac}")
+        sh(f"ip link set {peer} netns {ns}")
+        if end:
+            sh(f"ip link set {port} netns {end}")
+        sh(f"ip -n {ns} addr add {addr}/24 dev {peer} && ip -n {ns} link set {peer} up")
+        sh(f"{pre}ip link set {port} up")  # IPv6 stays on for the port here: the first start must refuse
+        dummy = "l2d0" if not end else "l2d1"
+        sh(f"{pre}ip link add {dummy} type dummy && {pre}ip addr add 198.51.100.129/25 dev {dummy}")
+        sh(f"{pre}sysctl -qw net.ipv6.conf.{dummy}.disable_ipv6=1 net.ipv4.conf.all.forwarding=0 net.ipv6.conf.all.forwarding=0")
+        sh(f"{pre}ip link set {dummy} up")
+
+
+def l2_inject(ns: str, ifname: str, n: int, tag: bytes, src: str, ethertype: int = 0x88b5) -> None:
+    s = bytes.fromhex(src.replace(":", ""))
+    code = (f"import socket,time\ns=socket.socket(socket.AF_PACKET,socket.SOCK_RAW)\ns.bind(({ifname!r},0))\n"
+            f"for i in range({n}):\n s.send(b'\\xff'*6+{s!r}+{ethertype.to_bytes(2, 'big')!r}+"
+            f"{MAGIC!r}+{tag!r}+i.to_bytes(4,'big')+b'z'*40)\n time.sleep(0.002)\n")
+    sh(f"ip netns exec {ns} python3 -c \"{code}\"")
+
+
+def l2_counter(dev: str, ns: str | None = None, drop: bool = True) -> int:
+    """Packets counted by the lane's drop (or its pass) filters on dev's ingress."""
+    pre = f"ip netns exec {ns} " if ns else ""
+    p = sh(f"{pre}tc -s -j filter show dev {dev} ingress", check=False)
+    try:
+        rows = json.loads(p.stdout or "[]")
+    except ValueError:
+        return -1
+    want = "matchall" if drop else "flower"
+    return sum(f["options"]["actions"][0]["stats"]["packets"] for f in rows if f.get("kind") == want and "options" in f)
+
+
+def l2_up(dev: str, ns: str | None = None) -> bool:
+    pre = f"ip -n {ns} " if ns else "ip "
+    p = sh(f"{pre}-j link show dev {dev}", check=False)
+    return p.returncode == 0 and "UP" in json.loads(p.stdout)[0].get("flags", [])
+
+
+def l2_wait(cond, timeout: float, step: float = 0.5) -> float | None:
+    """Seconds until cond() held, or None."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        if cond():
+            return time.monotonic() - t0
+        time.sleep(step)
+    return None
 
 
 def l2_ping(src_ns: str, dst: str, n: int, size: int = 56) -> int:
