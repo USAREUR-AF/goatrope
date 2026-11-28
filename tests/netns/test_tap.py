@@ -1148,8 +1148,9 @@ print(n)
     for name, bad, undo, want in (
             ("the peer may send from more than one address", f"wg set grb0 peer {bpub} allowed-ips 10.200.0.0/30",
              f"wg set grb0 peer {bpub} allowed-ips 10.200.0.1/32", "allows only"),
-            ("another endpoint", f"wg set grb0 peer {bpub} endpoint 203.0.113.9:51900",
-             f"wg set grb0 peer {bpub} endpoint 203.0.113.7:51900", "endpoint"),
+            # the boundary point is down meanwhile: a packet from it would move the endpoint back (roaming)
+            ("another endpoint", f"ip -n bpoint link set bpw down && wg set grb0 peer {bpub} endpoint 203.0.113.9:51900",
+             f"wg set grb0 peer {bpub} endpoint 203.0.113.7:51900 && ip -n bpoint link set bpw up", "endpoint"),
             ("another listen port", "wg set grb0 listen-port 51999", "wg set grb0 listen-port 51901", "listens on"),
             ("a key file others can read", f"chmod 644 {key}", f"chmod 600 {key}", "mode 600")):
         sh(bad)
