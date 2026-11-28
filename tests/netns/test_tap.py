@@ -3443,6 +3443,150 @@ def phase_l2() -> None:
 PHASES["l2"] = phase_l2
 
 
+def recreate_wg0() -> None:
+    """Delete wg0 and make it again with the same key, peers and address, as a mesh client does when it restarts."""
+    conf = sh("wg showconf wg0").stdout
+    sh("ip link del wg0")
+    sh("ip link add wg0 type wireguard")
+    subprocess.run(["wg", "setconf", "wg0", "/dev/stdin"], input=conf, text=True, check=True)
+    sh("ip addr add 10.99.0.1/24 dev wg0 && ip link set wg0 up && sysctl -qw net.ipv4.conf.wg0.forwarding=0")
+
+
+def wg0_handshake(timeout: float = 40) -> float | None:
+    """Seconds until the remote's peer on a fresh wg0 has a handshake. The remote keeps sending on its old
+    session, which the new interface does not know, until WireGuard starts a new handshake (about 15 s)."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        sh("ip netns exec remote ping -c 1 -W 1 -I wga 10.99.0.1", check=False)
+        if any(ln.split()[1] != "0" for ln in sh("wg show wg0 latest-handshakes", check=False).stdout.splitlines() if len(ln.split()) == 2):
+            return time.monotonic() - t0
+    return None
+
+
+def make_wg0(conf: str) -> None:
+    sh("ip link add wg0 type wireguard")
+    subprocess.run(["wg", "setconf", "wg0", "/dev/stdin"], input=conf, text=True, check=True)
+    sh("ip addr add 10.99.0.1/24 dev wg0 && ip link set wg0 up && sysctl -qw net.ipv4.conf.wg0.forwarding=0")
+
+
+def first_through(timeout: float = 40) -> float | None:
+    """Seconds from now until the first datagram from the remote (sent 10 a second to rule port 7002) reaches the
+    link host."""
+    t0 = time.time()
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c",
+                           "import socket,sys,time\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('192.0.2.2',7002))\n"
+                           f"s.settimeout({timeout})\ntry:\n s.recv(100); print(time.time())\nexcept socket.timeout: print(0)\n"],
+                          stdout=subprocess.PIPE, text=True)
+    tx = subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, "-c",
+                           "import socket,time\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.SOL_SOCKET,25,b'wga')\n"
+                           "s.bind(('10.99.0.2',0))\nwhile True:\n s.sendto(b'probe',('10.99.0.1',7002)); time.sleep(0.1)\n"])
+    got = float((rx.communicate(timeout=timeout + 10)[0].strip() or "0"))
+    tx.kill()
+    return round(got - t0, 1) if got else None
+
+
+def restarts() -> int:
+    return int(unit_props().get("NRestarts", "0"))
+
+
+def interfaces_item() -> dict:
+    j = json.loads(gr("check", "--config", CFG, "--json").stdout or "{}")
+    return next((i for i in j.get("items", []) if i.get("id") == "relay-interfaces"), {})
+
+
+def phase_relay_recreate() -> None:
+    """The relay follows its interfaces: one made again under a new index restarts it on the new one; one that is
+    gone is waited for (never a refusal), at start and while running, and traffic resumes once it is back."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    write_cfg(RELAY)
+    gr("install", "--config", CFG)
+    u = wait_unit("active")
+    n = relay_through(10, "before")
+    result(u.get("ActiveState") == "active" and n == 10, "relay recreate: the service forwards", f"{n} of 10")
+    conf = sh("wg showconf wg0").stdout
+
+    # 1. made again under a new index: the relay stops, is started again on the new wg0, and forwards
+    old = open("/sys/class/net/wg0/ifindex").read().strip()
+    r0 = restarts()
+    recreate_wg0()
+    new = open("/sys/class/net/wg0/ifindex").read().strip()
+    end = time.monotonic() + 20
+    while time.monotonic() < end and not (restarts() == r0 + 1 and unit_props().get("ActiveState") == "active"):
+        time.sleep(0.5)
+    hs = wg0_handshake()
+    n = relay_through(10, "after")
+    result(restarts() == r0 + 1 and n == 10, "relay recreate: wg0 made again (new index): the relay restarts once on it and forwards",
+           f"index {old} -> {new}; restarts {restarts() - r0}; tunnel back after {hs if hs is None else round(hs, 1)} s; {n} of 10")
+    check_exit(0, "relay recreate: after the restart")
+
+    # 2. the deaf state: a relay bound to an index that is gone (paused here so it cannot react) fails check
+    sh("systemctl kill --signal=SIGSTOP goatrope-relay.service")
+    recreate_wg0()
+    it = interfaces_item()
+    p = gr("check", "--config", CFG)
+    result(p.returncode == 3 and it.get("ok") is False and "bound under index" in str(it.get("have")),
+           "relay recreate: check exits 3 when the relay is bound to an index wg0 no longer has",
+           f"exit {p.returncode}: {it.get('have')}")
+    r0 = restarts()
+    sh("systemctl kill --signal=SIGCONT goatrope-relay.service")
+    end = time.monotonic() + 20
+    while time.monotonic() < end and not (restarts() == r0 + 1 and unit_props().get("ActiveState") == "active"):
+        time.sleep(0.5)
+    wg0_handshake()
+    n = relay_through(10, "resumed")
+    result(restarts() == r0 + 1 and n == 10, "relay recreate: resumed, it sees the new index, restarts and forwards",
+           f"restarts {restarts() - r0}; {n} of 10")
+
+    # 3. gone for 90 s: the relay waits (the unit stays active, check says what for) and forwards once wg0 is back
+    r0 = restarts()
+    sh("ip link del wg0")
+    t_gone = time.monotonic()
+    time.sleep(12)
+    u = unit_props()
+    it = interfaces_item()
+    p = gr("check", "--config", CFG)
+    st = gr("status", "--config", CFG).stdout
+    result(u.get("ActiveState") == "active" and p.returncode == 3 and it.get("have") == "waiting for wg0"
+           and "waiting for wg0" in st,
+           "relay recreate: wg0 gone: the relay restarts once and waits; check exits 3 'waiting for wg0'",
+           f"{u.get('ActiveState')}, restarts {restarts() - r0}; check {p.returncode}: {it.get('have')}")
+    time.sleep(max(0.0, 90 - (time.monotonic() - t_gone)))
+    u = unit_props()
+    result(u.get("ActiveState") == "active" and restarts() == r0 + 1,
+           "relay recreate: still waiting after 90 s, not failed and not restarting", f"{u.get('ActiveState')}, restarts {restarts() - r0}")
+    make_wg0(conf)
+    first = first_through()
+    n = relay_through(10, "back")
+    result(first is not None and n == 10, "relay recreate: wg0 back after 90 s: traffic resumes with no one touching the relay",
+           f"first datagram through {first} s after wg0 returned (WireGuard's new handshake included); {n} of 10; "
+           f"restarts {restarts() - r0}")
+    check_exit(0, "relay recreate: after wg0 returned")
+
+    # 4. boot order: the relay starts before wg0 exists
+    sh("systemctl stop goatrope-relay.service")
+    sh("ip link del wg0")
+    sh("systemctl start goatrope-relay.service")
+    r0 = restarts()  # a stop and a start set systemd's count back to 0
+    time.sleep(5)
+    u = unit_props()
+    it = interfaces_item()
+    result(u.get("ActiveState") == "active" and it.get("have") == "waiting for wg0",
+           "relay recreate: started before wg0 exists: active and waiting for it, not refused", f"{u.get('ActiveState')}: {it.get('have')}")
+    make_wg0(conf)
+    first = first_through()
+    result(first is not None and restarts() == r0, "relay recreate: once wg0 appears it starts forwarding, without a restart",
+           f"first datagram {first} s after wg0 appeared; restarts {restarts() - r0}")
+    check_exit(0, "relay recreate: started before wg0")
+    gr("uninstall", "--purge")
+
+
+PHASES["relay-recreate"] = phase_relay_recreate
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:
