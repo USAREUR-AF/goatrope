@@ -3190,12 +3190,13 @@ def topo_l2() -> None:
     subprocess.run(["wg", "set", "wgl0", "listen-port", "51830", "private-key", "/dev/stdin", "peer", keys["l2b"][1],
                     "endpoint", "198.51.100.2:51831", "allowed-ips", "203.0.113.2/32", "persistent-keepalive", "5"],
                    input=keys["l2a"][0] + "\n", text=True, check=True)
-    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 up")
+    # NetBird's default WireGuard MTU: a GRETAP made on it starts below IPv6's minimum MTU
+    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 mtu 1280 up")
     sh("ip -n endB link add wgl1 type wireguard")
     subprocess.run(["ip", "netns", "exec", "endB", "wg", "set", "wgl1", "listen-port", "51831", "private-key", "/dev/stdin",
                     "peer", keys["l2a"][1], "endpoint", "198.51.100.1:51830", "allowed-ips", "203.0.113.1/32",
                     "persistent-keepalive", "5"], input=keys["l2b"][0] + "\n", text=True, check=True)
-    sh("ip -n endB addr add 203.0.113.2/24 dev wgl1 && ip -n endB link set wgl1 up")
+    sh("ip -n endB addr add 203.0.113.2/24 dev wgl1 && ip -n endB link set wgl1 mtu 1280 up")
     for pre, port, peer, ns, mac, addr in (("", "lp0", "ha0", "hostA", MAC_A, "192.0.2.1"),
                                            ("ip netns exec endB ", "lp1", "hb0", "hostB", MAC_B, "192.0.2.2")):
         end = "endB" if pre else None
@@ -3292,6 +3293,15 @@ def phase_l2() -> None:
     if loaded:
         sh("modprobe -r br_netfilter", check=False)
     result(not sh("ip link show l2b-lane0", check=False).returncode == 0, "l2: a refused start made no lane interface")
+    # A failure while the lane is being made (another GRETAP already has its local, remote and key, so
+    # the kernel refuses ours after the bridge exists): the refusal removes what was made.
+    sh("ip link add dup0 type gretap local 203.0.113.1 remote 203.0.113.2 key 4242 dev wgl0")
+    p = gr("relay", "--config", CFG)
+    left = [i for i in ("l2b-lane0", "l2g-lane0") if os.path.exists(f"/sys/class/net/{i}")]
+    qd = sh("tc qdisc show dev lp0").stdout
+    sh("ip link del dup0")
+    result(p.returncode == 2 and not left and "clsact" not in qd,
+           "l2: a start that fails while making the lane removes what it made", f"exit {p.returncode}, left {left}: {p.stderr.strip()[-120:]}")
 
     before = snapshot()
     p = gr("install", "--config", CFG)
@@ -3358,7 +3368,7 @@ def phase_l2() -> None:
            f"{len(fb)} frames, {len(other)} other: {other[:3]}")
     wg_mtu = json.loads(sh("ip -j link show wgl0").stdout)[0]["mtu"]
     n = l2_ping("hostA", "192.0.2.2", 10, 1472)
-    result(n == 10 and wg_mtu < 1500, "l2: a 1,472-byte ping (a 1,514-byte frame, DF set) crosses a WireGuard MTU below 1,500",
+    result(n == 10 and wg_mtu == 1280, "l2: a 1,472-byte ping (a 1,514-byte frame, DF set) crosses a WireGuard MTU of 1,280",
            f"{n} of 10, WireGuard MTU {wg_mtu}")
     fwd = {i: (open(f"/proc/sys/net/ipv4/conf/{i}/forwarding").read().strip()) for i in ("lp0", "l2b-lane0", "l2g-lane0", "wgl0")}
     fwd["ipv6"] = open("/proc/sys/net/ipv6/conf/all/forwarding").read().strip()

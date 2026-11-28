@@ -364,7 +364,8 @@ the host's kernel. No hardware is involved. They cover:
 - `l2` (ADR 0004 module 6): refusals without `accept_layer2` and of bad lists; ARP, IPv4 and a
   declared EtherType crossing both ways between two link hosts, each behind its own lane end,
   over real WireGuard; an undeclared EtherType, an undeclared source MAC and a spoofed ARP sender
-  dropped and counted; a 1,472-byte ping over a WireGuard MTU of 1,420; the lane down within
+  dropped and counted; a 1,472-byte ping over a WireGuard MTU of 1,280 (NetBird's); a start that
+  fails while making the lane removes what it made; the lane down within
   180 s and one tick of the last handshake and up again when it is fresh; check 3 when a filter,
   the GRETAP interface or the bridge is removed, and 0 once the restarted relay builds it again;
   uninstall leaves nothing;

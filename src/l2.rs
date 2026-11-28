@@ -449,96 +449,113 @@ pub fn preflight(cfg: &Config) -> Result<(), String> {
 pub fn up(cfg: &Config) -> Result<(), String> {
     let Some(r) = &cfg.relay else { return Ok(()) };
     for l in &r.l2 {
-        let (br, gt) = (bridge(l), gretap(l));
-        if !su::exists(&br) {
-            ip(&[
-                "link",
-                "add",
-                &br,
-                "type",
-                "bridge",
-                "stp_state",
-                "0",
-                "forward_delay",
-                "0",
-                "mcast_snooping",
-                "0",
-                "mcast_querier",
-                "0",
-            ])?;
+        if let Err(e) = build(l, r) {
+            // a refusal leaves no half-made lane: every lane of this declaration goes
+            for l in &r.l2 {
+                teardown(l);
+            }
+            return Err(format!("lane {}: {e}", l.name));
         }
-        // STP off first: the kernel refuses a forward delay under 2 s while STP is on.
-        ip(&["link", "set", &br, "type", "bridge", "stp_state", "0"])?;
+    }
+    Ok(())
+}
+
+/// Remove one lane's interfaces and the port's filters (ours by name, and by cookie on the port).
+fn teardown(l: &L2) {
+    let (br, gt) = (bridge(l), gretap(l));
+    if su::exists(&gt) && su::kind(&gt).as_deref() == Some("gretap") {
+        let _ = nl::delete_link(&gt);
+    }
+    if su::exists(&br) && su::kind(&br).as_deref() == Some("bridge") {
+        let _ = nl::delete_link(&br);
+    }
+    let port = filters(l).into_iter().find(|(d, _)| *d == l.port);
+    if let Some((dev, want)) = port {
+        if su::exists(&dev) && filters_match(&dev, &want) {
+            su::run(&["tc", "qdisc", "del", "dev", &dev, "clsact"]);
+        }
+    }
+}
+
+fn build(l: &L2, r: &Relay) -> Result<(), String> {
+    let (br, gt) = (bridge(l), gretap(l));
+    if !su::exists(&br) {
+        ip(&["link", "add", &br, "type", "bridge", "stp_state", "0", "forward_delay", "0", "mcast_snooping", "0", "mcast_querier", "0"])?;
+    }
+    // STP off first: the kernel refuses a forward delay under 2 s while STP is on.
+    ip(&["link", "set", &br, "type", "bridge", "stp_state", "0"])?;
+    ip(&[
+        "link",
+        "set",
+        &br,
+        "type",
+        "bridge",
+        "forward_delay",
+        "0",
+        "mcast_snooping",
+        "0",
+        "mcast_querier",
+        "0",
+        "vlan_filtering",
+        "0",
+        "group_fwd_mask",
+        "0",
+    ])?;
+    ip(&["link", "set", &br, "addrgenmode", "none"])?;
+    let key = l.key.to_string();
+    let built = link_json(&gt).is_some_and(|g| {
+        info(&g, "local").as_str() == Some(l.local.as_str())
+            && info(&g, "remote").as_str() == Some(l.peer.as_str())
+            && info(&g, "ikey").as_str() == Some(Ipv4Addr::from(l.key).to_string().as_str())
+            && g["link"].as_str() == Some(r.remote_interface.as_str())
+            && info(&g, "pmtudisc").as_bool() == Some(false)
+            && info(&g, "ignore_df").as_bool() == Some(true)
+    });
+    if !built {
+        if su::exists(&gt) {
+            nl::delete_link(&gt).map_err(|e| format!("{gt}: {e}"))?;
+        }
         ip(&[
             "link",
-            "set",
-            &br,
+            "add",
+            &gt,
             "type",
-            "bridge",
-            "forward_delay",
-            "0",
-            "mcast_snooping",
-            "0",
-            "mcast_querier",
-            "0",
-            "vlan_filtering",
-            "0",
-            "group_fwd_mask",
-            "0",
+            "gretap",
+            "local",
+            &l.local,
+            "remote",
+            &l.peer,
+            "key",
+            &key,
+            "nopmtudisc",
+            "ignore-df",
+            "dev",
+            &r.remote_interface,
         ])?;
-        ip(&["link", "set", &br, "addrgenmode", "none"])?;
-        let key = l.key.to_string();
-        let built = link_json(&gt).is_some_and(|g| {
-            info(&g, "local").as_str() == Some(l.local.as_str())
-                && info(&g, "remote").as_str() == Some(l.peer.as_str())
-                && info(&g, "ikey").as_str() == Some(Ipv4Addr::from(l.key).to_string().as_str())
-                && g["link"].as_str() == Some(r.remote_interface.as_str())
-                && info(&g, "pmtudisc").as_bool() == Some(false)
-                && info(&g, "ignore_df").as_bool() == Some(true)
-        });
-        if !built {
-            if su::exists(&gt) {
-                nl::delete_link(&gt).map_err(|e| format!("{gt}: {e}"))?;
-            }
-            ip(&[
-                "link",
-                "add",
-                &gt,
-                "type",
-                "gretap",
-                "local",
-                &l.local,
-                "remote",
-                &l.peer,
-                "key",
-                &key,
-                "nopmtudisc",
-                "ignore-df",
-                "dev",
-                &r.remote_interface,
-            ])?;
-        }
-        ip(&["link", "set", &gt, "mtu", "1500", "addrgenmode", "none"])?;
-        for (dev, want) in filters(l) {
-            if !filters_match(&dev, &want) {
-                put_filters(&dev, &want)?;
-            }
-        }
-        ip(&["link", "set", &gt, "master", &br])?;
-        ip(&["link", "set", &l.port, "master", &br])?;
-        ip(&["link", "set", &br, "up"])?;
-        ip(&["link", "set", &l.port, "up"])?;
-        println!(
-            "goatrope relay: lane {}: {} and {gt} ({} to {} key {}) in {br}; {} EtherType(s), {} source MAC(s) from the tunnel; the rest dropped",
-            l.name,
-            l.port,
-            l.local,
-            l.peer,
-            l.key,
-            l.ethertypes.len(),
-            l.macs.len()
-        );
     }
+    // Two requests: made on a WireGuard MTU of 1280 (NetBird's), the GRETAP starts below IPv6's
+    // minimum MTU and has no IPv6 state, so addrgenmode is refused until the MTU is 1500.
+    ip(&["link", "set", &gt, "mtu", "1500"])?;
+    ip(&["link", "set", &gt, "addrgenmode", "none"])?;
+    for (dev, want) in filters(l) {
+        if !filters_match(&dev, &want) {
+            put_filters(&dev, &want)?;
+        }
+    }
+    ip(&["link", "set", &gt, "master", &br])?;
+    ip(&["link", "set", &l.port, "master", &br])?;
+    ip(&["link", "set", &br, "up"])?;
+    ip(&["link", "set", &l.port, "up"])?;
+    println!(
+        "goatrope relay: lane {}: {} and {gt} ({} to {} key {}) in {br}; {} EtherType(s), {} source MAC(s) from the tunnel; the rest dropped",
+        l.name,
+        l.port,
+        l.local,
+        l.peer,
+        l.key,
+        l.ethertypes.len(),
+        l.macs.len()
+    );
     Ok(())
 }
 
