@@ -381,23 +381,28 @@ fn write_health(body: &str) {
     }
 }
 
-/// The interfaces the relay needs before it can start: the link interface, and the remote
-/// interface unless the relay makes it itself (transport "boundary").
+/// The interfaces the relay needs before it can start: the link interface, the remote interface
+/// unless the relay makes it itself (transport "boundary"), and each lane's port.
 fn needed(r: &Relay) -> Vec<&String> {
     let mut v = vec![&r.link_interface];
     if r.transport != "boundary" {
         v.insert(0, &r.remote_interface);
     }
+    v.extend(r.l2.iter().map(|l| &l.port)); // a lane's dedicated port: a USB adapter may come late too
     v
 }
 
-/// Wait until every needed interface exists, writing relay.health (what it waits for) every 2 s.
+/// Wait until every needed interface exists, and each lane's address and peer are on the mesh
+/// interface, writing relay.health (what it waits for) every 2 s.
 /// Some(exit code) when a stop signal comes first.
 fn wait_interfaces(r: &Relay) -> Option<i32> {
     let mut said: Vec<String> = Vec::new();
     let mut last: Option<Instant> = None;
     loop {
-        let missing: Vec<String> = needed(r).into_iter().filter(|i| !sys::exists(i)).cloned().collect();
+        let mut missing: Vec<String> = needed(r).into_iter().filter(|i| !sys::exists(i)).cloned().collect();
+        if missing.is_empty() {
+            missing = crate::l2::waiting_for(r); // the lane's address and peer, which the mesh client adds after its interface
+        }
         if missing.is_empty() {
             if !said.is_empty() {
                 println!("goatrope relay: {} is there; starting", said.join(", "));
@@ -581,6 +586,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                 match ifindex(name) {
                     Some(n) if Some(n) == *was => {}
                     Some(n) => {
+                        crate::l2::close_all();
                         eprintln!(
                             "goatrope relay: stopping: {name} was made again (index {} -> {n}); the service starts the relay again on it",
                             was.map(|w| w.to_string()).unwrap_or("none".into())
@@ -588,6 +594,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
                         return Ok(crate::EXIT_ERROR);
                     }
                     None => {
+                        crate::l2::close_all();
                         eprintln!("goatrope relay: stopping: {name} is gone; the service starts the relay again, and it waits for {name}");
                         return Ok(crate::EXIT_ERROR);
                     }
@@ -962,15 +969,16 @@ pub fn check(cfg: &Config) -> Vec<Item> {
     item(&mut items, "relay-health", want, format!("written in the last {STALE_S:.0} s"), have);
     let health = read_health();
     if let Some((v, _)) = &health {
-        let (ok, have) = interfaces_state(v);
+        let (ok, have) = interfaces_state(v, cfg.relay.as_ref().unwrap());
         item(&mut items, "relay-interfaces", Some(ok), "the relay's sockets are bound to its interfaces as they are now", have);
     }
     proxy::check(cfg.relay.as_ref().unwrap(), health.as_ref().map(|(v, _)| v), &mut items);
     items
 }
 
-/// From relay.health: whether the relay is bound to its interfaces under their live index, and in words.
-fn interfaces_state(v: &serde_json::Value) -> (bool, String) {
+/// From relay.health: whether the relay is bound to the declaration's interfaces under their live index,
+/// and in words. Only the interfaces this declaration names are compared.
+fn interfaces_state(v: &serde_json::Value, r: &Relay) -> (bool, String) {
     if let Some(w) = v["waiting"].as_array().filter(|w| !w.is_empty()) {
         let names: Vec<&str> = w.iter().filter_map(|x| x.as_str()).collect();
         return (false, format!("waiting for {}", names.join(", ")));
@@ -980,7 +988,8 @@ fn interfaces_state(v: &serde_json::Value) -> (bool, String) {
     };
     let mut bad = Vec::new();
     let mut good = Vec::new();
-    for (name, idx) in bound {
+    let declared = [&r.remote_interface, &r.link_interface];
+    for (name, idx) in bound.iter().filter(|(n, _)| declared.contains(n)) {
         let was = idx.as_u64().map(|i| i as u32);
         match (was, ifindex(name)) {
             (Some(w), Some(n)) if w == n => good.push(format!("{name} (index {n})")),
@@ -991,7 +1000,9 @@ fn interfaces_state(v: &serde_json::Value) -> (bool, String) {
             )),
         }
     }
-    if bad.is_empty() {
+    if good.is_empty() && bad.is_empty() {
+        (true, "not reported for this declaration's interfaces".into())
+    } else if bad.is_empty() {
         (true, format!("bound to {}", good.join(", ")))
     } else {
         (false, bad.join("; "))
@@ -1007,7 +1018,7 @@ pub fn status(cfg: &Config) {
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
     }
     if let Some((v, _)) = &health {
-        let (ok, have) = interfaces_state(v);
+        let (ok, have) = interfaces_state(v, r);
         println!("  relay  {have}{}", if ok { "" } else { " (not forwarding)" });
         let n = |k: &str| v["reassembly"][k].as_u64().unwrap_or(0);
         if n("failed") + n("timed_out") > 0 {

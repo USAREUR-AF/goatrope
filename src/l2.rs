@@ -431,6 +431,30 @@ pub fn preflight(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// What the lanes wait for on the mesh before the relay can build them: this end's address on the
+/// remote interface, and a WireGuard peer there allowed the far end. A mesh client adds both after it
+/// makes its interface (NetBird does), so neither is a refusal; preflight refuses only what is wrong.
+/// Empty when nothing is missing, or when the remote interface is not a WireGuard one (preflight says why).
+pub fn waiting_for(r: &Relay) -> Vec<String> {
+    let mut out = Vec::new();
+    if r.l2.is_empty() || r.transport != "mesh" || su::kind(&r.remote_interface).as_deref() != Some("wireguard") {
+        return out;
+    }
+    let addrs = nl::addresses(&r.remote_interface);
+    let dev = nl::wg_get(&r.remote_interface).ok();
+    for l in &r.l2 {
+        if !addrs.iter().any(|a| a.split('/').next() == Some(l.local.as_str())) {
+            out.push(format!("{} on {}", l.local, r.remote_interface));
+        }
+        let Ok(peer) = l.peer.parse::<IpAddr>() else { continue };
+        let known = dev.as_ref().is_some_and(|d| d.peers.iter().any(|p| p.allowed_ips.iter().any(|(n, c)| nl::prefix_holds(*n, *c, peer))));
+        if !known {
+            out.push(format!("the peer {} on {}", l.peer, r.remote_interface));
+        }
+    }
+    out
+}
+
 /// Build every lane that is not as declared, the GRETAP interface down. Idempotent: what already
 /// matches is left alone. Filters go on before any member joins the bridge, and the bridge comes
 /// up last, so no frame crosses unfiltered.

@@ -3587,6 +3587,62 @@ def phase_relay_recreate() -> None:
 PHASES["relay-recreate"] = phase_relay_recreate
 
 
+def phase_relay_recreate_l2() -> None:
+    """The layer-2 lane follows its WireGuard interface as the relay does: wgl0 gone for 30 s under the installed
+    relay, then made again; the relay waits, builds the lane again, and frames cross with no one touching it."""
+    topo_l2()
+    sh("sysctl -qw net.ipv6.conf.lp0.disable_ipv6=1")
+    sh("ip netns exec endB sysctl -qw net.ipv6.conf.lp1.disable_ipv6=1")
+    for pre in ("", "ip netns exec endB "):
+        for k in ("iptables", "ip6tables", "arptables"):
+            sh(f"{pre}sysctl -qw net.bridge.bridge-nf-call-{k}=0", check=False)
+    for f in ("/var/lib/goatrope/relay.health",):
+        if os.path.exists(f):
+            os.remove(f)
+    write_cfg(L2_B, CFG_B)
+    write_cfg(L2_A)
+    p = gr("install", "--config", CFG)
+    b_log = open(f"{WORK}/relay-b-recreate.log", "w")
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    up = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
+    n = l2_ping("hostA", "192.0.2.2", 5)
+    result(p.returncode == 0 and up is not None and n == 5, "relay recreate l2: the lane is up and carries frames", f"{n} of 5 pings")
+    conf = sh("wg showconf wgl0").stdout
+    r0 = restarts()
+    sh("ip link del wgl0")
+    time.sleep(8)
+    it = interfaces_item()
+    closed = not l2_up("l2g-lane0")
+    n = l2_ping("hostA", "192.0.2.2", 3)
+    result(unit_props().get("ActiveState") == "active" and it.get("have") == "waiting for wgl0" and closed and n == 0,
+           "relay recreate l2: wgl0 gone: the lane is closed (its GRETAP down), and the relay waits for wgl0",
+           f"{unit_props().get('ActiveState')}, restarts {restarts() - r0}; {it.get('have')}; GRETAP down {closed}; {n} of 3 pings crossed")
+    time.sleep(22)
+    sh("ip link add wgl0 type wireguard")
+    subprocess.run(["wg", "setconf", "wgl0", "/dev/stdin"], input=conf, text=True, check=True)
+    sh("ip addr add 203.0.113.1/24 dev wgl0 && ip link set wgl0 up")
+    t0 = time.monotonic()
+    back = l2_wait(lambda: l2_up("l2g-lane0") and l2_ping("hostA", "192.0.2.2", 1) == 1, 90, 1)
+    n = l2_ping("hostA", "192.0.2.2", 10)
+    result(back is not None and n == 10, "relay recreate l2: wgl0 back after 30 s: the lane is built again and frames cross",
+           f"after {back if back is None else round(back, 1)} s; {n} of 10 pings; restarts {restarts() - r0}")
+    check_exit(0, "relay recreate l2: lane back")
+    relay_b.terminate()
+    try:
+        relay_b.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        relay_b.kill()
+    gr("uninstall", "--purge")
+    for ns in ("hostA", "hostB", "endB"):
+        sh(f"ip netns del {ns}", check=False)
+    for leftover in ("l2u0", "wgl0", "lp0", "l2d0"):
+        sh(f"ip link del {leftover}", check=False)
+    _ = t0
+
+
+PHASES["relay-recreate-l2"] = phase_relay_recreate_l2
+
+
 if __name__ == "__main__":
     os.makedirs(WORK, exist_ok=True)
     for name in sys.argv[1:]:
