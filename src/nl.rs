@@ -451,3 +451,116 @@ mod tests {
         assert!(!prefix_holds(ip("2001:db8::"), 32, ip("198.51.100.5")));
     }
 }
+
+// ---------------------------------------------------------------- tc: the relay's kernel path (docs/adr/0006)
+
+/// The handle of a tc filter on a clsact qdisc's ingress hook.
+const INGRESS_PARENT: u32 = 0xFFFF_FFF2;
+
+pub fn ifindex(ifname: &str) -> io::Result<u32> {
+    index(ifname)
+}
+
+/// Add a clsact qdisc to the device; one that is there already is kept.
+pub fn tc_clsact(ifname: &str) -> io::Result<()> {
+    use netlink_packet_route::tc::{TcAttribute, TcHandle, TcMessage};
+    let mut m = TcMessage::with_index(index(ifname)? as i32);
+    m.header.parent = TcHandle::CLSACT;
+    m.header.handle = TcHandle { major: 0xFFFF, minor: 0 };
+    m.attributes.push(TcAttribute::Kind("clsact".to_string()));
+    match route(RouteNetlinkMessage::NewQueueDiscipline(m), NLM_F_CREATE | NLM_F_EXCL) {
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Ok(()),
+        r => r.map(|_| ()),
+    }
+}
+
+/// Attach a loaded SCHED_CLS program (direct action) to the device's ingress at this priority.
+pub fn tc_bpf_ingress(ifname: &str, prio: u16, prog_fd: i32, name: &str) -> io::Result<()> {
+    use netlink_packet_route::tc::{TcAttribute, TcBpfFlags, TcFilterBpfOption, TcHandle, TcMessage, TcOption};
+    let mut m = TcMessage::with_index(index(ifname)? as i32);
+    m.header.parent = TcHandle::from(INGRESS_PARENT);
+    m.header.handle = TcHandle { major: 0, minor: 1 };
+    m.header.info = ((prio as u32) << 16) | (libc::ETH_P_ALL as u16).to_be() as u32;
+    m.attributes.push(TcAttribute::Kind("bpf".to_string()));
+    m.attributes.push(TcAttribute::Options(vec![
+        TcOption::Bpf(TcFilterBpfOption::ProgFd(prog_fd as u32)),
+        TcOption::Bpf(TcFilterBpfOption::ProgName(name.to_string())),
+        TcOption::Bpf(TcFilterBpfOption::Flags(TcBpfFlags::DirectAction)),
+    ]));
+    route(RouteNetlinkMessage::NewTrafficFilter(m), NLM_F_CREATE | NLM_F_EXCL).map(|_| ())
+}
+
+/// One filter on a device's ingress hook, as a dump gives it.
+#[derive(Debug, Clone)]
+pub struct IngressFilter {
+    pub prio: u16,
+    pub protocol: u16,
+    pub handle: u32,
+    pub kind: String,
+    /// a bpf filter's program name and id
+    pub name: Option<String>,
+    pub prog_id: Option<u32>,
+}
+
+/// Every filter on the device's ingress hook (none when it has no clsact or ingress qdisc).
+pub fn tc_ingress_filters(ifname: &str) -> io::Result<Vec<IngressFilter>> {
+    use netlink_packet_route::tc::{TcAttribute, TcFilterBpfOption, TcHandle, TcMessage, TcOption};
+    let idx = match index(ifname) {
+        Ok(i) => i,
+        Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let mut m = TcMessage::with_index(idx as i32);
+    m.header.parent = TcHandle::from(INGRESS_PARENT);
+    let replies = match route(RouteNetlinkMessage::GetTrafficFilter(m), NLM_F_DUMP) {
+        Ok(r) => r,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOENT)) => return Ok(vec![]),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for r in replies {
+        let RouteNetlinkMessage::NewTrafficFilter(t) = r else { continue };
+        if t.header.index as u32 != idx {
+            continue;
+        }
+        let mut f = IngressFilter {
+            prio: (t.header.info >> 16) as u16,
+            protocol: (t.header.info & 0xffff) as u16,
+            handle: u32::from(t.header.handle),
+            kind: String::new(),
+            name: None,
+            prog_id: None,
+        };
+        for a in &t.attributes {
+            match a {
+                TcAttribute::Kind(k) => f.kind = k.clone(),
+                TcAttribute::Options(opts) => {
+                    for o in opts {
+                        match o {
+                            TcOption::Bpf(TcFilterBpfOption::ProgName(n)) => f.name = Some(n.clone()),
+                            TcOption::Bpf(TcFilterBpfOption::ProgId(i)) => f.prog_id = Some(*i),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // a dump also lists the chain heads (handle 0) of each priority
+        if f.handle != 0 {
+            out.push(f);
+        }
+    }
+    Ok(out)
+}
+
+/// Remove exactly this filter from the device's ingress.
+pub fn tc_filter_del_exact(ifname: &str, f: &IngressFilter) -> io::Result<()> {
+    use netlink_packet_route::tc::{TcHandle, TcMessage};
+    let mut m = TcMessage::with_index(index(ifname)? as i32);
+    m.header.parent = TcHandle::from(INGRESS_PARENT);
+    m.header.handle = TcHandle::from(f.handle);
+    m.header.info = ((f.prio as u32) << 16) | f.protocol as u32;
+    m.attributes.push(netlink_packet_route::tc::TcAttribute::Kind(f.kind.clone()));
+    route(RouteNetlinkMessage::DelTrafficFilter(m), 0).map(|_| ())
+}

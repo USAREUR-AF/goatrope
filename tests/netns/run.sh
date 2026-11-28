@@ -39,12 +39,6 @@ for d in "${CARGO_HOME:-$HOME/.cargo}" "$repo/target/cargo-home"; do
     done
 done
 [ -n "$engine_tree" ] || echo "no checkout of goat-transformers ${rev:0:7}: the linked-engine phase will not run" >&2
-# The tc prototype the bench measures (docs/adr/0006-data-path.md), when clang is here.
-mkdir -p "$here/build"
-if command -v clang >/dev/null; then
-    clang -O2 -target bpf -I"/usr/include/$(uname -m)-linux-gnu" -c "$here/relay_tc.c" -o "$here/build/relay_tc.o" \
-        || echo "relay_tc.c did not compile: the bench leaves the tc prototype out" >&2
-fi
 
 [ "${#versions[@]}" -gt 0 ] || versions=(24.04 26.04)
 rc=0
@@ -115,7 +109,7 @@ for v in "${versions[@]}"; do
 
     start "$c" "$v"
     engine_packs "$c"
-    phase "$c" "$log" listen uninstall send linked-engine components relay boundary uninstall relay-service relay-tcp units erspan proxy fragments l2
+    phase "$c" "$log" listen uninstall send linked-engine components relay boundary uninstall relay-service relay-tcp units erspan proxy fragments l2 relay-kernel
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 

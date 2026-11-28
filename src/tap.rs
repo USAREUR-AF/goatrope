@@ -964,6 +964,10 @@ pub fn uninstall(purge: bool) -> R<()> {
     }
     crate::l2::remove(&state["relay"]["l2"], &[]);
     remove(crate::relay::HEALTH);
+    // the relay's kernel-path filter, if one is left: nothing may forward once the relay is gone
+    if let Err(e) = crate::kpath::detach_all() {
+        println!("{e}");
+    }
     if su::nm_active() {
         su::run(&["nmcli", "general", "reload", "conf"]);
     }
@@ -1108,6 +1112,9 @@ pub fn uninstall(purge: bool) -> R<()> {
 
 /// After a plain uninstall: the declaration and the recordings are all that remain.
 fn purge_leftovers() {
+    if let Err(e) = crate::kpath::detach_all() {
+        println!("{e}");
+    }
     let mut removed = Vec::new();
     let rec = config::load(&decl()).ok().and_then(|c| c.tap.map(|t| t.record.directory));
     for d in [rec, Some(format!("{STATE_DIR}/record")), Some(format!("{STATE_DIR}/send"))].into_iter().flatten() {

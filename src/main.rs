@@ -7,6 +7,7 @@
 mod boundary;
 mod config;
 mod engine;
+mod kpath;
 mod l2;
 mod link;
 mod nl;
@@ -300,6 +301,26 @@ fn relay_cmd(rest: &[String]) -> i32 {
     })
 }
 
+/// `goatrope relay-kernel-off`: remove every filter of the relay's kernel path, on any interface,
+/// with no declaration needed (the unit's ExecStopPost; also when the declaration is invalid or gone).
+fn relay_kernel_off(rest: &[String]) -> i32 {
+    if !rest.is_empty() {
+        return usage_error(&format!("unrecognized arguments: {}", rest.join(" ")));
+    }
+    match kpath::detach_all() {
+        Ok(n) => {
+            if n > 0 {
+                println!("goatrope: removed {n} kernel-path filter(s)");
+            }
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("goatrope: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
 const BOUNDARY_ACTIONS: [&str; 5] = ["key", "sheet", "up", "check", "down"];
 const BOUNDARY_USAGE: &str = "usage: goatrope boundary [-h] [--config CONFIG] {key,sheet,up,check,down}";
 
@@ -452,6 +473,7 @@ fn main() {
             v @ ("validate" | "install" | "deploy" | "status" | "check" | "uninstall" | "apply-ports" | "run-send" | "verify-component"),
         ) => run(v, &args[1..]),
         Some("relay") => relay_cmd(&args[1..]),
+        Some("relay-kernel-off") => relay_kernel_off(&args[1..]),
         Some("boundary") => boundary_cmd(&args[1..]),
         Some("packs-digest") => packs_digest(&args[1..]),
         Some("l2") => l2_cmd(&args[1..]),

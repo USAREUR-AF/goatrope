@@ -2239,9 +2239,6 @@ def bench_relay_udp() -> None:
     # default), and every later fragmented datagram is then dropped; 2 s keeps one trial from spoiling the next.
     sh("sysctl -qw net.ipv4.ipfrag_time=2")
     sh("ip netns exec remote sysctl -qw net.ipv4.ipfrag_time=2")
-    write_cfg(RELAY)
-    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    time.sleep(2)
     D = BENCH_SECONDS
 
     def trial_path(path: str, size: int):
@@ -2261,29 +2258,40 @@ def bench_relay_udp() -> None:
                         "relay_socket_drops": udp_drops("") - d0}
         return trial
 
-    for size in (64, 512, 1400):
-        base = ceiling(trial_path("wireguard", size), 0.001)
-        rel = ceiling(trial_path("relay", size), 0.001)
-        lat_b = trial_path("wireguard", size)(10000)
-        lat_r = trial_path("relay", size)(10000)
-        add50 = round(lat_r["p50_us"] - lat_b["p50_us"], 1) if lat_r["p50_us"] is not None and lat_b["p50_us"] is not None else None
-        add99 = round(lat_r["p99_us"] - lat_b["p99_us"], 1) if lat_r["p99_us"] is not None and lat_b["p99_us"] is not None else None
-        un = rel["unpaced"]
-        frag = ", two fragments in the tunnel (WireGuard MTU 1,420)" if size + 28 > 1420 else ""
-        bench(f"relay UDP {size}-byte payload{frag}: {fmt(rel['rate'])} datagrams/s with loss under 0.1 %",
-              f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'] / max(un['seconds'], 1e-9))} delivered/s, "
-              f"{fmt(un['relay_socket_drops'])} dropped at the relay's socket; WireGuard alone (no relay) "
-              f"{fmt(base['rate'])}/s{' (generator-bound)' if base['generator_bound'] else ''}; "
-              f"latency at 10,000/s: relay path p50 {lat_r['p50_us']} us p99 {lat_r['p99_us']} us, WireGuard alone "
-              f"p50 {lat_b['p50_us']} us p99 {lat_b['p99_us']} us, added p50 {add50} us p99 {add99} us; "
-              f"{rel['trials']} trials of {D:g} s; {host_line()}",
-              {"path": "relay-udp", "size": size, "rate": rel["rate"], "loss": rel["loss"], "unpaced": un,
-               "wireguard_alone_rate": base["rate"], "wireguard_alone_generator_bound": base["generator_bound"],
-               "latency_relay": [lat_r["p50_us"], lat_r["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
-               "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
-    bench_relay_tc(trial_path)
-    relay.terminate()
-    relay.wait(timeout=10)
+    for mode in ("user space", "kernel path"):
+        write_cfg(KCFG if mode == "kernel path" else RELAY)
+        if os.path.exists(HEALTH_FILE):
+            os.remove(HEALTH_FILE)
+        relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        h = wait_health(lambda h: "kernel_path" in h, 10)
+        loaded = h.get("kernel_path", {}).get("loaded")
+        if mode == "kernel path" and not loaded:
+            bench("relay UDP, kernel path: not measured", f"it did not load: {json.dumps(h.get('kernel_path'))}", {})
+            relay.terminate()
+            relay.wait(timeout=10)
+            continue
+        for size in (64, 512, 1400):
+            base = ceiling(trial_path("wireguard", size), 0.001)
+            rel = ceiling(trial_path("relay", size), 0.001)
+            lat_b = trial_path("wireguard", size)(10000)
+            lat_r = trial_path("relay", size)(10000)
+            add50 = round(lat_r["p50_us"] - lat_b["p50_us"], 1) if lat_r["p50_us"] is not None and lat_b["p50_us"] is not None else None
+            add99 = round(lat_r["p99_us"] - lat_b["p99_us"], 1) if lat_r["p99_us"] is not None and lat_b["p99_us"] is not None else None
+            un = rel["unpaced"]
+            frag = ", two fragments in the tunnel (WireGuard MTU 1,420; the socket path)" if size + 28 > 1420 else ""
+            bench(f"relay UDP, {mode}, {size}-byte payload{frag}: {fmt(rel['rate'])} datagrams/s with loss under 0.1 %",
+                  f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'] / max(un['seconds'], 1e-9))} delivered/s, "
+                  f"{fmt(un['relay_socket_drops'])} dropped at the relay's socket; WireGuard alone (no relay) "
+                  f"{fmt(base['rate'])}/s{' (generator-bound)' if base['generator_bound'] else ''}; "
+                  f"latency at 10,000/s: relay path p50 {lat_r['p50_us']} us p99 {lat_r['p99_us']} us, WireGuard alone "
+                  f"p50 {lat_b['p50_us']} us p99 {lat_b['p99_us']} us, added p50 {add50} us p99 {add99} us; "
+                  f"{rel['trials']} trials of {D:g} s; {host_line()}",
+                  {"path": "relay-udp", "mode": mode, "size": size, "rate": rel["rate"], "loss": rel["loss"], "unpaced": un,
+                   "wireguard_alone_rate": base["rate"], "wireguard_alone_generator_bound": base["generator_bound"],
+                   "latency_relay": [lat_r["p50_us"], lat_r["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
+                   "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
+        relay.terminate()
+        relay.wait(timeout=10)
 
 
 def bench_mirror() -> None:
@@ -2917,46 +2925,6 @@ def phase_proxy() -> None:
 
 PHASES["proxy"] = phase_proxy
 
-TC_OBJ = os.path.join(SRC, "tests", "netns", "build", "relay_tc.o")  # run.sh compiles relay_tc.c when clang is there
-
-
-def bench_relay_tc(trial_path) -> None:
-    """The prototype of ADR 0006: the same rule (port 7002) rewritten and redirected by a tc program on wg0."""
-    if not os.path.exists(TC_OBJ):
-        bench("relay UDP in a tc program: not measured", "no clang on the machine that ran run.sh, so relay_tc.o was not built", {})
-        return
-    ifindex = int(open("/sys/class/net/r0/ifindex").read())
-    obj = open(TC_OBJ, "rb").read()
-    placeholder = (0x7E1F1D00).to_bytes(4, "little")
-    if obj.count(placeholder) != 1:
-        bench("relay UDP in a tc program: not measured", "relay_tc.o does not hold the interface placeholder once", {})
-        return
-    path = f"{WORK}/relay_tc.o"
-    with open(path, "wb") as f:
-        f.write(obj.replace(placeholder, ifindex.to_bytes(4, "little")))
-    sh("tc qdisc add dev wg0 clsact")
-    p = sh(f"tc filter add dev wg0 ingress pref 1 bpf direct-action obj {path} sec tc", check=False)
-    if p.returncode != 0:
-        bench("relay UDP in a tc program: not measured", f"tc refused the program: {(p.stdout + p.stderr).strip()[-300:]}", {})
-        sh("tc qdisc del dev wg0 clsact", check=False)
-        return
-    D = BENCH_SECONDS
-    for size in (64, 512):
-        c = ceiling(trial_path("relay", size), 0.001)
-        lat_b = trial_path("wireguard", size)(10000)
-        lat_t = trial_path("relay", size)(10000)
-        add50 = round(lat_t["p50_us"] - lat_b["p50_us"], 1) if lat_t["p50_us"] is not None and lat_b["p50_us"] is not None else None
-        add99 = round(lat_t["p99_us"] - lat_b["p99_us"], 1) if lat_t["p99_us"] is not None and lat_b["p99_us"] is not None else None
-        un = c["unpaced"]
-        bench(f"relay UDP {size}-byte payload in a tc program (prototype): {fmt(c['rate'])} datagrams/s with loss under 0.1 %",
-              f"unpaced: {fmt(un['offered_per_s'])} offered, {fmt(un['received'] / max(un['seconds'], 1e-9))} delivered/s; "
-              f"latency at 10,000/s: p50 {lat_t['p50_us']} us p99 {lat_t['p99_us']} us, WireGuard alone p50 {lat_b['p50_us']} us "
-              f"p99 {lat_b['p99_us']} us, added p50 {add50} us p99 {add99} us; {c['trials']} trials of {D:g} s; {host_line()}",
-              {"path": "relay-udp-tc", "size": size, "rate": c["rate"], "loss": c["loss"], "unpaced": un,
-               "latency": [lat_t["p50_us"], lat_t["p99_us"]], "latency_wireguard": [lat_b["p50_us"], lat_b["p99_us"]],
-               "added_p50_us": add50, "added_p99_us": add99, "trial_seconds": D})
-    sh("tc qdisc del dev wg0 clsact", check=False)
-
 
 # ---------------------------------------------------------------- the linked engine (docs/adr/0006-data-path.md)
 
@@ -3441,6 +3409,433 @@ def phase_l2() -> None:
 
 
 PHASES["l2"] = phase_l2
+# ---------------------------------------------------------------- the relay's kernel path (docs/adr/0006-data-path.md)
+
+def relay_health() -> dict:
+    try:
+        return json.load(open(HEALTH_FILE))
+    except (OSError, ValueError):
+        return {}
+
+
+def rule_row(h: dict, port: int) -> dict:
+    return next((r for r in h.get("rules", []) if r.get("listen_port") == port and r.get("protocol") == "udp"), {})
+
+
+def wait_health(pred, timeout: float = 8) -> dict:
+    end = time.time() + timeout
+    h = relay_health()
+    while time.time() < end and not pred(h):
+        time.sleep(0.5)
+        h = relay_health()
+    return h
+
+
+KCFG = RELAY.replace("[relay]\n", "[relay]\nkernel_path = true\n")
+
+RX_TAGS = """
+import socket, sys, json, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", int(sys.argv[1]))); s.settimeout(float(sys.argv[2]))
+got = {}
+try:
+    while True:
+        d = s.recv(65535); t = d[:4].decode(errors="replace"); got[t] = got.get(t, 0) + 1
+except socket.timeout: pass
+print(json.dumps(got), flush=True)
+"""
+
+
+def ip_csum(h: bytes) -> int:
+    if len(h) % 2:
+        h += b"\0"
+    t = sum(struct.unpack(f"!{len(h) // 2}H", h))
+    while t >> 16:
+        t = (t & 0xFFFF) + (t >> 16)
+    return (~t) & 0xFFFF
+
+
+def craft(src: str, dst: str, sport: int, dport: int, payload: bytes, *, opts: bytes = b"", flags_frag: int = 0x4000,
+          ulen: int | None = None, bad_ipsum: bool = False, udpsum: int | None = None, totlen: int | None = None) -> bytes:
+    """An IPv4 UDP packet with the fields a test needs wrong; checksums right unless told otherwise."""
+    ihl = 5 + len(opts) // 4
+    udp_len = 8 + len(payload)
+    tl = totlen if totlen is not None else ihl * 4 + udp_len
+    ip = struct.pack("!BBHHHBBH4s4s", 0x40 | ihl, 0, tl, 0x1234, flags_frag, 64, 17, 0,
+                     socket.inet_aton(src), socket.inet_aton(dst)) + opts
+    cs = ip_csum(ip)
+    ip = ip[:10] + struct.pack("!H", cs ^ 0x5555 if bad_ipsum else cs) + ip[12:]
+    u = struct.pack("!HHHH", sport, dport, ulen if ulen is not None else udp_len, 0) + payload
+    if udpsum is None:
+        pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 17, udp_len)
+        c = ip_csum(pseudo + u) or 0xFFFF
+    else:
+        c = udpsum
+    u = u[:6] + struct.pack("!H", c) + u[8:]
+    return ip + u
+
+
+def inject(dev: str, packets: list[bytes]) -> None:
+    """Send IP packets as they are into a WireGuard interface in the remote namespace (AF_PACKET, SOCK_DGRAM)."""
+    hexes = json.dumps([p.hex() for p in packets])
+    code = ("import socket, json, sys, time\n"
+            "s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))\n"
+            f"s.bind(({dev!r}, 0x0800))\n"
+            "for h in json.loads(sys.stdin.read()):\n"
+            f"    s.sendto(bytes.fromhex(h), ({dev!r}, 0x0800)); time.sleep(0.002)\n")
+    subprocess.run(["ip", "netns", "exec", "remote", sys.executable, "-c", code], input=hexes, text=True, check=True)
+
+
+def frames_ok(frames: list[bytes], tag: bytes) -> tuple[int, int, int, int]:
+    """(frames with tag, IP checksum right, UDP checksum right, UDP checksum 0) among captured link frames."""
+    n = ip_ok = u_ok = zero = 0
+    for f in frames:
+        if f[12:14] != b"\x08\x00" or f[23] != 17:
+            continue
+        ip = f[14:34]
+        ulen = int.from_bytes(f[38:40], "big")
+        u = f[34:34 + ulen]
+        if not u[8:].startswith(tag):
+            continue
+        n += 1
+        ip_ok += ip_csum(ip) == 0
+        csum = int.from_bytes(u[6:8], "big")
+        if csum == 0:
+            zero += 1
+            continue
+        pseudo = ip[12:16] + ip[16:20] + struct.pack("!BBH", 0, 17, ulen)
+        u_ok += ip_csum(pseudo + u) == 0
+    return n, ip_ok, u_ok, zero
+
+
+def phase_relay_kernel() -> None:
+    """The relay's kernel path (opt-in): it forwards only what the socket path would, well formed; every denied
+    and malformed case is still denied or left to the socket path; it follows address and MTU changes; it does not
+    load past a netfilter rule unless that is accepted by name; and no filter is left behind."""
+    for dev in ("r0", "u0", "wg0", "tp0", "tp1", "grbm1"):
+        sh(f"ip link del {dev}", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")
+    sh("sysctl -qw net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 net.ipv6.conf.all.forwarding=0")
+    sh("nft flush ruleset", check=False)
+    tc_has = lambda dev="wg0": "goatrope_relay" in sh(f"tc filter show dev {dev} ingress", check=False).stdout  # noqa: E731
+
+    def start(cfg: str, extra: list[str] | None = None) -> subprocess.Popen:
+        write_cfg(cfg)
+        if os.path.exists(HEALTH_FILE):
+            os.remove(HEALTH_FILE)
+        p = subprocess.Popen((extra or []) + GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        wait_health(lambda h: "kernel_path" in h, 10)
+        return p
+
+    def stop(p: subprocess.Popen) -> str:
+        p.terminate()
+        return p.communicate(timeout=10)[0]
+
+    def send(port: int, n: int, size: int = 64, src: str = "10.99.0.2", dev: str = "wga", dst: str = "10.99.0.1") -> int:
+        run = next_run()
+        sink = SinkArgs("linkhost", "192.0.2.2", port, n / 500, run, 1, n / 500 + 5)
+        gen("remote", "udp-send", src, dst, port, size, 500, n / 500, run, dev)
+        return sink.result()["received"]
+
+    def kcount(port: int = 7002) -> int:
+        return rule_row(wait_health(lambda h: True, 0), port).get("kernel_to_link", 0)
+
+    def settled(port: int = 7002) -> int:
+        time.sleep(2.5)  # relay.health is rewritten every 2 s
+        return kcount(port)
+
+    relay = start(RELAY)
+    k = relay_health().get("kernel_path", {})
+    stop(relay)
+    result(k.get("loaded") is False and not tc_has(), "relay kernel path: off unless declared", json.dumps(k))
+
+    relay = start(KCFG)
+    k = relay_health().get("kernel_path", {})
+    result(k.get("loaded") is True and k.get("rules") == 2 and tc_has(),
+           "relay kernel path: kernel_path = true loads it on wg0 for both UDP remote-to-link rules", json.dumps(k))
+
+    cap = Capture("linkhost", "l0", "kpath-link")
+    got = send(7002, 200)
+    frames = cap.stop()
+    n = settled()
+    result(got == 200 and n == 200, "relay kernel path: 200 allowed datagrams reach the target, all forwarded by the kernel path",
+           f"{got} of 200; kernel {n}")
+    ports = {int(ln.split()[3].rsplit(":", 1)[1]) for ln in sh("ss -Huan").stdout.splitlines()
+             if ln.split()[3].startswith(("192.0.2.50:", "192.0.2.50%"))}
+    ok_frames = [f for f in frames if f[12:14] == b"\x08\x00" and f[23] == 17 and f[36:38] == (7002).to_bytes(2, "big")]
+    sports = {int.from_bytes(f[34:36], "big") for f in ok_frames}
+    shape = {(f[26:30] == bytes([192, 0, 2, 50]), f[22], f[15]) for f in ok_frames}
+    result(len(ok_frames) == 200 and shape == {(True, 64, 0)} and len(sports) == 1 and sports <= ports,
+           "relay kernel path: on the link each is what the relay's socket sends (its address, TTL 64, TOS 0, the rule's link socket port)",
+           f"{len(ok_frames)} frames; {sorted(shape)}; source ports {sorted(sports)} of the relay's {sorted(ports)}")
+    ipsum = sum(ip_csum(f[14:34]) == 0 for f in ok_frames)
+    usum = 0
+    for f in ok_frames:
+        ulen = int.from_bytes(f[38:40], "big")
+        pseudo = f[26:34] + struct.pack("!BBH", 0, 17, ulen)
+        usum += ip_csum(pseudo + f[34:34 + ulen]) == 0
+    result(ipsum == 200 and usum == 200, "relay kernel path: the rewritten IP and UDP checksums are right (verified in the captured frames)",
+           f"IP {ipsum} of 200, UDP {usum} of 200")
+
+    # crafted packets, sent into the tunnel as they are: (tag, packet, expect kernel-forwarded, expect arrived)
+    mk = lambda tag, **kw: craft("10.99.0.2", "10.99.0.1", 40000, 7002, tag + b"x" * 20, **kw)  # noqa: E731
+    cases = [
+        ("well formed, DF set", b"OKDF", mk(b"OKDF"), 20),
+        ("UDP checksum 0 (none)", b"CS00", mk(b"CS00", udpsum=0), 20),
+        ("IP options (IHL 6)", b"OPTS", mk(b"OPTS", opts=b"\x01\x01\x01\x00"), 0),
+        ("more-fragments alone", b"MFRG", mk(b"MFRG", flags_frag=0x2000), 0),
+        ("a fragment offset", b"OFFS", mk(b"OFFS", flags_frag=0x0010), 0),
+        ("UDP length beyond the packet", b"ULBG", mk(b"ULBG", ulen=8 + 24 + 40), 0),
+        ("UDP length below 8", b"UL04", mk(b"UL04", ulen=4), 0),
+        ("UDP length short of the IP payload", b"ULSH", mk(b"ULSH", ulen=8 + 10), 0),
+        ("a bad IP header checksum", b"BDIP", mk(b"BDIP", bad_ipsum=True), 0),
+        ("IP total length beyond the packet", b"TLBG", mk(b"TLBG", totlen=20 + 8 + 24 + 40), 0),
+        ("a destination that is not the relay's", b"NOTL", craft("10.99.0.2", "10.99.0.77", 40000, 7002, b"NOTL" + b"x" * 20), 0),
+        ("a source that is not the rule's remote (another peer's tunnel)", b"WSRC",
+         craft("10.99.0.3", "10.99.0.1", 40000, 7002, b"WSRC" + b"x" * 20), 0),
+    ]
+    # the tunnel carries a destination that is not the relay's when the remote's peer allows it
+    tappub = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/tap.key").read(), capture_output=True, text=True).stdout.strip()
+    sh(f"ip netns exec remote wg set wga peer {tappub} allowed-ips 10.99.0.1/32,10.99.0.77/32")
+    def run_cases() -> tuple[dict, dict, list]:
+        rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", RX_TAGS, "7002", "8"],
+                              stdout=subprocess.PIPE, text=True)
+        time.sleep(0.5)
+        cap = Capture("linkhost", "l0", "kpath-crafted")
+        seen = {}
+        for name, tag, pkt, kexp in cases:
+            k0 = settled()
+            inject("wgo" if tag == b"WSRC" else "wga", [pkt] * 20)
+            seen[tag] = settled() - k0
+        arrived = json.loads(rx.communicate(timeout=180)[0] or "{}")
+        return seen, arrived, cap.stop()
+
+    # the same packets through the relay with its kernel path off (the socket path alone), then on
+    stop(relay)
+    relay = start(RELAY)
+    _, base, _ = run_cases()
+    stop(relay)
+    relay = start(KCFG)
+    seen, arrived, frames = run_cases()
+    for name, tag, pkt, kexp in cases:
+        t = tag.decode()
+        where = "forwarded by the kernel path" if kexp else "left to the socket path"
+        result(seen[tag] == kexp and arrived.get(t, 0) == base.get(t, 0),
+               f"relay kernel path: {name}: {where}; what reaches the link is what the socket path alone delivers",
+               f"kernel forwarded {seen[tag]} of 20; arrived {arrived.get(t, 0)}, socket path alone {base.get(t, 0)}")
+    n0, _, _, zero = frames_ok(frames, b"CS00")
+    nok, ipok, uok, _ = frames_ok(frames, b"OKDF")
+    result(n0 == 20 and zero == 20 and nok == 20 and ipok == 20 and uok == 20,
+           "relay kernel path: a UDP checksum of 0 stays 0, a set one is rewritten right",
+           f"checksum-0 frames {zero} of {n0}; well-formed IP {ipok}, UDP {uok} of {nok}")
+
+    # denied: another authenticated peer, a port with no rule, and the relay's address from outside the tunnel
+    denied0 = rule_row(relay_health(), 7000).get("denied", 0)
+    other = send(7000, 20, src="10.99.0.3", dev="wgo")
+    noport = send(7001, 20)
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", RX_TAGS, "7002", "3"], stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    # the remote's own tunnel address and port, but over the underlay, as a spoofed packet
+    spoof = craft("10.99.0.2", "10.99.0.1", 40000, 7002, b"SPUF" + b"x" * 20)
+    code = ("import socket\ns=socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_RAW)\n"
+            "s.setsockopt(socket.SOL_SOCKET,25,b'u1')\n"
+            f"[s.sendto(bytes.fromhex({spoof.hex()!r}),('198.51.100.1',0)) for i in range(20)]\n")
+    sh(f"ip netns exec remote python3 -c \"{code}\"", check=False)
+    outside = json.loads(rx.communicate(timeout=30)[0] or "{}").get("SPUF", 0)
+    h = settled(7000)
+    result(other == 0, "relay kernel path: still denied: an authenticated peer that is not the rule's remote", f"{other} of 20")
+    result(noport == 0, "relay kernel path: still denied: a port with no rule", f"{noport} of 20")
+    result(outside == 0, "relay kernel path: still denied: the remote's address and the rule's port, sent over the underlay outside the tunnel",
+           f"{outside} of 20")
+    row = rule_row(relay_health(), 7000)
+    result(row.get("denied", 0) - denied0 >= 20 and row.get("kernel_to_link", 0) == 0,
+           "relay kernel path: the other peer's datagrams reach the relay's socket and are counted as denied there",
+           f"denied +{row.get('denied', 0) - denied0}, kernel forwarded {row.get('kernel_to_link', 0)}")
+
+    # fragments, and datagrams longer than the link's MTU: the socket path
+    k0 = settled()
+    big = send(7002, 50, size=1400)
+    result(big == 50 and settled() == k0, "relay kernel path: 1,400-byte datagrams (fragments in the tunnel) go by the socket path",
+           f"{big} of 50 arrived; kernel +{kcount() - k0}")
+    sh("ip link set r0 mtu 576")
+    time.sleep(2.5)
+    k0 = kcount()
+    over = send(7002, 20, size=1000)
+    k1 = settled()
+    sh("ip link set r0 mtu 1500")
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1")  # an MTU below 1,280 resets it
+    time.sleep(2.5)
+    result(over == 20 and k1 == k0, "relay kernel path: a datagram longer than the link's MTU goes by the socket path",
+           f"{over} of 20 arrived (link MTU 576); kernel +{k1 - k0}")
+
+    # a second address on wg0, added and removed while the relay runs
+    sh(f"ip netns exec remote wg set wga peer {tappub} allowed-ips 10.99.0.1/32,10.99.0.9/32")
+    sh("ip -n remote route add 10.99.0.9/32 dev wga", check=False)
+    sh("ip addr add 10.99.0.9/32 dev wg0")
+    time.sleep(2.5)
+    k0 = kcount()
+    via9 = send(7002, 20, dst="10.99.0.9")
+    via1 = send(7002, 20)
+    k1 = settled()
+    result(via9 == 20 and via1 == 20 and k1 - k0 == 40,
+           "relay kernel path: an address added to wg0 is matched within 2 s, beside the first (two addresses)",
+           f"to 10.99.0.9 {via9} of 20, to 10.99.0.1 {via1} of 20; kernel +{k1 - k0}")
+    sh("ip addr del 10.99.0.9/32 dev wg0")
+    time.sleep(2.5)
+    k0 = kcount()
+    gone9 = send(7002, 20, dst="10.99.0.9")
+    k1 = settled()
+    result(gone9 == 0 and k1 == k0, "relay kernel path: an address removed from wg0 is no longer matched", f"{gone9} of 20; kernel +{k1 - k0}")
+
+    # replies (direction both): the remote's datagrams by the kernel path, the target's replies by user space
+    rx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, "-c", """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("192.0.2.2", 7000)); s.settimeout(8)
+n = 0
+try:
+    while n < 20:
+        d, a = s.recvfrom(65535); s.sendto(b"reply-" + d, a); n += 1
+except socket.timeout: pass
+print(n)
+"""], stdout=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    sender = """
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setsockopt(socket.SOL_SOCKET, 25, b"wga")
+s.bind(("10.99.0.2", 0)); s.settimeout(0.5)
+r = 0
+for i in range(20):
+    s.sendto(b"k%d" % i, ("10.99.0.1", 7000))
+    try:
+        if s.recv(65535).startswith(b"reply-"): r += 1
+    except socket.timeout: pass
+print(r)
+"""
+    rep = sh(f"ip netns exec remote python3 -c '{sender}'", check=False).stdout.strip()
+    rx.communicate(timeout=20)
+    row = rule_row(wait_health(lambda h: rule_row(h, 7000).get("kernel_to_link", 0) >= 20), 7000)
+    result(rep == "20" and row.get("kernel_to_link", 0) >= 20 and row.get("to_remote", 0) >= 20,
+           "relay kernel path: replies from the target return to the remote (the remote learned by the kernel path)",
+           f"{rep} of 20 replies; kernel {row.get('kernel_to_link')}, to_remote {row.get('to_remote')}")
+    stop(relay)
+    result(not tc_has(), "relay kernel path: removed when the relay stops")
+    got = send(7002, 20)
+    result(got == 0, "relay kernel path: with the relay stopped, nothing is forwarded", f"{got} of 20")
+
+    # netfilter: a rule that would see the datagrams stops the kernel path unless the bypass is accepted
+    sh("nft add table inet grtest")
+    sh("nft 'add chain inet grtest in { type filter hook input priority 0; policy accept; }'")
+    sh("nft add rule inet grtest in iifname eth9 udp dport 7002 drop")
+    relay = start(KCFG)
+    k = relay_health().get("kernel_path", {})
+    stop(relay)
+    result(k.get("loaded") is True, "relay kernel path: a netfilter rule for another interface does not stop it", json.dumps(k))
+    sh("nft add rule inet grtest in iifname wg0 udp dport 7002 drop")
+    write_cfg(KCFG)
+    p = gr("relay", "--config", CFG)
+    result(p.returncode == 2 and "kernel_path_bypasses_netfilter" in p.stderr and not tc_has(),
+           "relay kernel path: refused while a netfilter rule can see wg0's datagrams, unless accepted by name", p.stderr.strip()[-220:])
+    relay = start(RELAY)
+    user = send(7002, 20)
+    stop(relay)
+    result(user == 0, "relay kernel path: with the kernel path off, that netfilter rule drops them", f"{user} of 20 arrived")
+    relay = start(KCFG.replace("kernel_path = true\n", "kernel_path = true\nkernel_path_bypasses_netfilter = true\n"))
+    k = relay_health().get("kernel_path", {})
+    bypass = send(7002, 20)
+    out = stop(relay)
+    result(k.get("loaded") is True and "bypasses netfilter" in k.get("mode", "") and bypass == 20,
+           "relay kernel path: with kernel_path_bypasses_netfilter = true it loads, and that rule does not see its datagrams",
+           f"{bypass} of 20 arrived despite the drop rule; {k.get('mode')}")
+    sh("nft delete table inet grtest")
+
+    # left behind: a killed relay's filter, removed by the next relay (whatever it declares) or by relay-kernel-off
+    relay = start(KCFG)
+    relay.kill()
+    relay.wait(timeout=10)
+    left = tc_has()
+    stray = send(7002, 20)
+    relay = start(RELAY)
+    cleared = not tc_has()
+    stop(relay)
+    result(left and cleared, "relay kernel path: a killed relay's filter is removed by the next relay, even one with kernel_path off",
+           f"left after the kill: {left} (it forwarded {stray} of 20 with no relay); removed at the next start: {cleared}")
+    relay = start(KCFG)
+    relay.kill()
+    relay.wait(timeout=10)
+    left = tc_has()
+    write_cfg("not a declaration")
+    p = gr("relay-kernel-off")
+    result(left and p.returncode == 0 and not tc_has(), "relay kernel path: relay-kernel-off removes it with no valid declaration",
+           f"left after the kill: {left}; exit {p.returncode}")
+
+    # kernel_path = true without CAP_BPF: not loaded, forwarded in user space
+    relay = start(KCFG, ["setpriv", "--bounding-set=-bpf,-sys_admin", "--"])
+    h = relay_health()
+    got = send(7002, 50)
+    out = stop(relay)
+    line = next((ln for ln in out.splitlines() if "kernel path" in ln), "")
+    result(h.get("kernel_path", {}).get("loaded") is False and got == 50 and not tc_has(),
+           "relay kernel path: without CAP_BPF the program does not load and the relay forwards in user space", f"{got} of 50; {line[-160:]}")
+
+    # as the service: loaded, CAP_BPF dropped, checked; a killed relay's filter removed; an invalid declaration leaves none
+    write_cfg(KCFG)
+    if os.path.exists(HEALTH_FILE):
+        os.remove(HEALTH_FILE)
+    p = gr("install", "--config", CFG)
+    h = wait_health(lambda h: "kernel_path" in h, 15)
+    got = send(7002, 50)
+    h = wait_health(lambda h: rule_row(h, 7002).get("kernel_to_link", 0) >= 50)
+    result(p.returncode == 0 and h.get("kernel_path", {}).get("loaded") is True and got == 50 and rule_row(h, 7002).get("kernel_to_link") == 50,
+           "relay kernel path: goatrope-relay.service loads it and forwards through it",
+           f"install exit {p.returncode}; {json.dumps(h.get('kernel_path'))}; {got} of 50, kernel {rule_row(h, 7002).get('kernel_to_link')}")
+    pid = sh("systemctl show -p MainPID --value goatrope-relay.service").stdout.strip()
+    caps = {ln.split(":")[0]: int(ln.split()[1], 16) for ln in open(f"/proc/{pid}/status") if ln.startswith(("CapEff", "CapPrm"))}
+    result(all(not (v >> 39) & 1 for v in caps.values()) and all((v >> 12) & 1 for v in caps.values()),
+           "relay kernel path: the service drops CAP_BPF once it is attached (keeps CAP_NET_ADMIN)", f"{ {k: hex(v) for k, v in caps.items()} }")
+    def kitem() -> tuple[int, dict]:
+        c = gr("check", "--json", "--config", CFG)
+        try:
+            items = json.loads(c.stdout).get("items", [])
+        except ValueError:
+            items = []
+        return c.returncode, next((i for i in items if i.get("id") == "relay-kernel-path"), {})
+
+    rc, it = kitem()
+    result(rc == 0 and it.get("ok") is True, "relay kernel path: check reads the filter and matches it with the declaration", json.dumps(it)[:240])
+    sh("tc filter add dev u0 ingress pref 3000 matchall action pass", check=False)
+    sh("tc qdisc add dev u0 clsact", check=False)
+    sh("tc filter add dev u0 ingress pref 3000 matchall action pass", check=False)
+    rc, it = kitem()
+    result(rc == 3 and it.get("ok") is False, "relay kernel path: check reports another filter at pref 3000", json.dumps(it)[:240])
+    sh("tc qdisc del dev u0 clsact", check=False)
+    sh("systemctl kill --kill-whom=main -s KILL goatrope-relay.service", check=False)
+    gone = False
+    for _ in range(10):
+        time.sleep(0.2)
+        if not tc_has():
+            gone = True
+            break
+    result(gone, "relay kernel path: after the relay process is killed, the unit's ExecStopPost removes the filter before the restart")
+    time.sleep(4)  # restarted
+    with open("/etc/goatrope/goatrope.toml", "w") as f:
+        f.write("this is not a declaration\n")
+    sh("systemctl kill --kill-whom=main -s KILL goatrope-relay.service", check=False)
+    time.sleep(5)
+    state = sh("systemctl is-active goatrope-relay.service", check=False).stdout.strip()
+    result(not tc_has(), "relay kernel path: with the declaration made invalid under the unit, no filter is left",
+           f"unit {state}")
+    write_cfg(KCFG)
+    shutil.copyfile(CFG, "/etc/goatrope/goatrope.toml")
+    sh("systemctl reset-failed goatrope-relay.service; systemctl restart goatrope-relay.service", check=False)
+    wait_health(lambda h: h.get("kernel_path", {}).get("loaded") is True and h.get("time", 0) > time.time() - 3, 15)
+    had = tc_has()
+    gr("uninstall", "--purge")
+    result(had and not tc_has(), "relay kernel path: uninstall --purge removes the filter", f"attached before: {had}")
+    if os.path.exists(HEALTH_FILE):
+        os.remove(HEALTH_FILE)
+
+
+PHASES["relay-kernel"] = phase_relay_kernel
 
 
 if __name__ == "__main__":
