@@ -3478,7 +3478,10 @@ def phase_l2() -> None:
     unit = open("/etc/systemd/system/goatrope-relay.service").read() if os.path.exists("/etc/systemd/system/goatrope-relay.service") else ""
     result("ExecStopPost=/usr/local/sbin/goatrope l2 down" in unit, "l2: the unit closes the lane however the relay stops (ExecStopPost)")
     b_log = open(f"{WORK}/relay-b.log", "w")
-    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    # end B is another machine: its relay.health is its own (ip netns exec gives it a mount namespace)
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB", "sh", "-c",
+                                "mount -t tmpfs tmpfs /var/lib/goatrope && exec \"$0\" relay --config \"$1\"", GR[0], CFG_B],
+                               stdout=b_log, stderr=subprocess.STDOUT)
     waited = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
     result(waited is not None, "l2: both lane ends come up once the WireGuard peers handshake",
            f"after {waited:.1f} s" if waited is not None else open(f"{WORK}/relay-b.log").read()[-300:])
@@ -3769,7 +3772,9 @@ def phase_relay_recreate_l2() -> None:
     write_cfg(L2_A)
     p = gr("install", "--config", CFG)
     b_log = open(f"{WORK}/relay-b-recreate.log", "w")
-    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB", "sh", "-c",
+                                "mount -t tmpfs tmpfs /var/lib/goatrope && exec \"$0\" relay --config \"$1\"", GR[0], CFG_B],
+                               stdout=b_log, stderr=subprocess.STDOUT)
     up = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
     n = l2_ping("hostA", "192.0.2.2", 5)
     result(p.returncode == 0 and up is not None and n == 5, "relay recreate l2: the lane is up and carries frames", f"{n} of 5 pings")
