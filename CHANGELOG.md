@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- fuzzing (#44): cargo-fuzz targets for frames from a tapped link (with fragment reassembly), ARP
+  on the relay's link, the linked converter's input and the declaration; a `fuzz` workflow runs
+  each for a minute on every pull request and half an hour weekly. goatrope is now a library
+  (`src/lib.rs`) with the command line on top (`src/main.rs`), so the targets call the same code.
 - relay: from the link, the relay machine admits only replies and the `link-to-remote` rules'
   ports at its link and proxy addresses; everything else to the machine is dropped and counted,
   and nothing addressed to those addresses is admitted from another interface (an nftables table

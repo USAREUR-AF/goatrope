@@ -4,29 +4,7 @@
 //!
 //! Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 
-mod boundary;
-mod config;
-mod engine;
-mod l2;
-mod link;
-mod nl;
-mod proxy;
-mod relay;
-mod relay_filter;
-mod relay_tcp;
-mod send;
-mod sys;
-mod sysutil;
-mod tap;
-#[cfg(test)]
-mod units;
-
-pub const VERSION: &str = include_str!("../VERSION");
-
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_ERROR: i32 = 1;
-pub const EXIT_REFUSED: i32 = 2;
-pub const EXIT_DIFFERS: i32 = 3;
+use goatrope::{boundary, config, engine, l2, relay, send, sys, tap, version, EXIT_DIFFERS, EXIT_ERROR, EXIT_OK, EXIT_REFUSED};
 
 const USAGE: &str = "\
 usage: goatrope [-h] [--version] COMMAND ...
@@ -49,26 +27,6 @@ goatrope command line.
 
 Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 ";
-
-/// The version of the software this binary belongs to: the VERSION file of the checkout,
-/// unpacked release or installed tree it runs from, else the one it was built with. A release
-/// is the archive, and its VERSION file is part of what the archive's hash covers.
-pub fn version() -> String {
-    if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
-        let mut candidates: Vec<std::path::PathBuf> = exe.ancestors().skip(1).take(3).map(|d| d.join("VERSION")).collect();
-        candidates.push("/usr/local/lib/goatrope/VERSION".into());
-        candidates.push("/usr/local/lib/goatrope/goatrope/VERSION".into());
-        for c in candidates {
-            if let Ok(v) = std::fs::read_to_string(&c) {
-                let v = v.trim();
-                if !v.is_empty() {
-                    return v.to_string();
-                }
-            }
-        }
-    }
-    VERSION.trim().to_string()
-}
 
 struct Args {
     pos: Vec<String>,

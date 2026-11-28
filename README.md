@@ -470,6 +470,14 @@ Not tested: real hardware (a Raspberry Pi, USB adapters, a passive tap), the Pi'
 own watchdog, forced link speed (veth cannot be forced), recording throughput, and the phases
 on two machines joined by a real NetBird mesh.
 
+`fuzz/` fuzzes what goatrope parses from untrusted input with cargo-fuzz (libFuzzer):
+`frame` (Ethernet, IPv4 and UDP frames from a tapped link, fragment reassembly included),
+`arp` (ARP on the relay's link, as the address proxy reads it), `convert` (payloads for the
+linked converter, with the pinned packs) and `declaration` (any text as a declaration). Each must
+end without a panic. The `fuzz` workflow runs each for a minute on every pull request and for half
+an hour every week, and keeps a crashing input as an artifact. Locally:
+`cargo +nightly fuzz run frame` (for `convert`, `GOATROPE_FUZZ_PACKS=<the packs directory>`).
+
 `bench`, in a container of its own after the others, measures the data paths: relay UDP
 over real WireGuard, the remote mirror, and decode-and-send with a converter. It records
 numbers and passes or fails nothing; [performance.md](docs/performance.md) has the method
@@ -480,7 +488,8 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `fuzz/` | the fuzz targets (cargo-fuzz) for frames, ARP, converter input and the declaration |
+| `src/` | the Rust source: `lib.rs` (the library the command line and the fuzz targets use), `main.rs` (the command line); `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |

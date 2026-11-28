@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
+# SPDX-License-Identifier: Apache-2.0
+# Fuzz targets for what goatrope parses from untrusted input (#44): frames from a tapped link,
+# ARP on the relay's link, the payloads the linked converter reads, and the declaration.
+#   cargo +nightly fuzz run <target> -- -max_total_time=60
+[package]
+name = "goatrope-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+goatrope = { path = ".." }
+
+# its own workspace: the fuzz build never joins goatrope's
+[workspace]
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arp"
+path = "fuzz_targets/arp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "convert"
+path = "fuzz_targets/convert.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "declaration"
+path = "fuzz_targets/declaration.rs"
+test = false
+doc = false
+bench = false
