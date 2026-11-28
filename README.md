@@ -107,6 +107,10 @@ files = 40
 (`relay-boundary.toml`), started from the link (`relay-link-initiated.toml`), with an address
 proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`).
 
+The tables above are schema 1. [ADR 0007](docs/adr/0007-one-flow-model.md) (Proposed) makes
+every path a flow with a source, a destination, a filter, a transform and a carriage, keeps
+schema 1 accepted through 1.x, and adds a per-flow health record; nothing of it is built.
+
 ## Commands
 
 | Command | Does |
