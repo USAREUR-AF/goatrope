@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- relay TCP: a rule's listening socket has a socket filter that passes only SYNs from the rule's
+  `remote` or `sources`, so any other sender gets no SYN-ACK and cannot tell the port is open
+  (#48). `relay.health` counts the refused segments as `listener_drops`; the relay's own check
+  after accept stays as a second layer. Namespace phase `relay-tcp`: 3 of 3 attempts from another
+  peer, and 3 of 3 from an unlisted link address, got no SYN-ACK.
 - relay: it follows its interfaces. One that is not there is waited for, at start and after a
   restart, and is never a refusal: a relay that starts before the mesh client, or outlives a mesh
   outage of any length, starts forwarding once the interface is back. One that vanishes, or comes
