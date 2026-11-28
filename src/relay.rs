@@ -361,7 +361,7 @@ static REASM_AT_START: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::ne
 
 pub fn run(cfg: &Config) -> i32 {
     // first, so a stop request during start-up still ends in the loop, which removes what it added
-    nl::catch_stop_signals();
+    sys::catch_stop_signals();
     if let Err(e) = preflight(cfg) {
         eprintln!("goatrope relay: refused: {}", e.0);
         return crate::EXIT_REFUSED;
@@ -465,7 +465,7 @@ fn serve(cfg: &Config) -> Result<i32, String> {
     let mut path = Batched::new();
     let mut denied_log = DeniedLog(None);
     loop {
-        if nl::stop_requested() {
+        if sys::stop_requested() {
             crate::l2::close_all();
             println!("goatrope relay: stopping on a signal");
             return Ok(crate::EXIT_OK);

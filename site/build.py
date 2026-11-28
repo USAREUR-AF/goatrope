@@ -246,7 +246,7 @@ def role_relay():
     o += [box(152, 44, 76, 76, "gr"), text(190, 87, "goatrope", "b on", "middle")]
     o += [line(228, 64, 254, 64, "copy"), '<path class="head" d="M251 57L262 64L251 71z"/>', box(264, 42, 72, 44, "node"), text(300, 69, "target", "b", "middle")]
     o += [line(228, 104, 250, 104, "deny"), '<path class="x" d="M251 97L265 111M265 97L251 111"/>', text(273, 109, "dropped", "s")]
-    o += [text(170, 152, "one rule: one address, one port, one way in", "s", "middle")]
+    o += [text(170, 152, "one rule: one address and port at each end", "s", "middle")]
     return "".join(o) + "</svg>"
 
 
@@ -292,10 +292,23 @@ def measures():
     t = read("tests/netns/test_tap.py")
     for need in ("inline: 500 of 500 datagrams a -> b arrived", "inline: 500 of 500 datagrams b -> a arrived",
                  "listen: no frame sent on either listen port (install, traffic, provocation, restarts)",
-                 "deploy: a second inline run loses no ping through the bridge", '"-c", "400"'):
+                 "deploy: a second inline run loses no ping through the bridge", '"-c", "400"',
+                 "l2: a 1,472-byte ping (a 1,514-byte frame, DF set) crosses a WireGuard MTU of 1,280", "wgl0 mtu 1280"):
         if need not in t:
             sys.exit(f"site: the page quotes a test that is not there: {need}")
-    return {"inline": "500 of 500", "listen": "0", "ping": "400 of 400", "static": str(static_checked())}
+    return {"inline": "500 of 500", "listen": "0", "ping": "400 of 400", "lane": "10 of 10", "static": str(static_checked())}
+
+
+def perf_checked(page):
+    """Every number in a data-perf figure is in docs/performance.md or in ADR 0004's results."""
+    src = read("docs/performance.md") + read("docs/adr/0004-relay-1-0.md")
+    figs = re.findall(r'data-perf="[^"]+">([^<]*)<', page)
+    if not figs:
+        sys.exit("site: the page quotes no measured figure")
+    for fig in figs:
+        for n in re.findall(r"[0-9][0-9,.]*[0-9]", fig):
+            if n not in src:
+                sys.exit(f"site: the measured figure {fig} quotes {n}, which is not in performance.md or ADR 0004")
 
 
 def build():
@@ -315,6 +328,7 @@ def build():
         got = re.findall(rf'data-measure="{k}">([^<]*)<', page)
         if not got or any(g != v for g in got):
             sys.exit(f"site: data-measure {k} is {got} on the page and {v} in the tree")
+    perf_checked(page)
     for href in re.findall(r'https://github\.com/USAREUR-AF/goatrope/blob/main/([^"#]+)', page):
         if not os.path.exists(os.path.join(REPO, href)):
             sys.exit(f"site: the page links to {href}, which is not in the tree")

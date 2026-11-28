@@ -6,8 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # goatrope
 
 goatrope takes a copy of the traffic on one network link and records it, sends on the
-datagrams you name, and can relay named datagrams to a remote machine. The copy can
-come from any of these:
+datagrams you name, and lets remote machines reach named machines on the link through
+WireGuard. The copy can come from any of these:
 
 | Where the copy comes from | goatrope declaration | Status |
 |---|---|---|
@@ -19,15 +19,39 @@ come from any of these:
 When the system that sends the data seems locked down, [three-ways.md](docs/three-ways.md)
 compares the ways to get a copy without taking control of it.
 [related-work.md](docs/related-work.md) lists the established practice goatrope follows, with
-its sources, and the practice it does not follow yet.
+its sources, and the practice it does not follow yet, and compares goatrope on a WireGuard mesh
+with the ZeroTier overlay network, job by job.
 
 On the machine that receives the copy, goatrope runs in up to three declared roles:
 
 | Role | What it does | Status |
 |---|---|---|
 | **tap** | records the link: **listen** (a tap device or mirror port hands the machine a copy) or **inline** (the machine bridges the link) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
-| **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
-| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service; an address proxy for a remote machine; an opt-in layer-2 lane); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
+| **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes them with a pinned first-bite decoder or converts them with the goat-transformers engine linked into goatrope, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
+| **relay** | lets remote machines exchange the UDP datagrams and TCP connections its rules name with machines on the link, in either direction, over the WireGuard mesh the site already runs or, for a site outside the deployment, over a dedicated tunnel whose one peer is the declared boundary point. It can give a remote machine an address of its own on the link, and, accepted by name, bridge one port to one peer at layer 2 | built on `main`, not yet in a release (0.2.0 has the UDP rules and the boundary transport, as work in progress); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
+
+The relay's parts, and the data paths under them, each with its status on `main`:
+
+| Feature | Declaration | Status |
+|---|---|---|
+| The relay as a service | `[relay]`; `goatrope install` writes `goatrope-relay.service` | built ([ADR 0004](docs/adr/0004-relay-1-0.md) §1) |
+| UDP rules, remote to link, with replies | `[relay].allow`, `protocol = "udp"`, `direction = "remote-to-link"` or `"both"` | built ([ADR 0002](docs/adr/0002-relay.md)) |
+| TCP rules, and traffic that machines on the link start | `protocol = "tcp"`; `direction = "link-to-remote"` with `sources` | built (ADR 0004 §2) |
+| Multicast groups on the link | | designed (ADR 0004 §3), not built |
+| A remote machine under a local address of its own | `[[relay.proxy]]` and a rule's `link_address` | built (ADR 0004 §4) |
+| Frames from a tap port sent to a remote collector as ERSPAN | `[[tap.mirror]]` | designed (ADR 0004 §5), not built; the kernel path it uses is measured in [performance.md](docs/performance.md) |
+| One port bridged to one peer, filtered by EtherType and source MAC | `[[relay.l2]]` with `accept_layer2 = true` | built (ADR 0004 §6); also run in the emulated arm64 VM |
+| A dedicated tunnel to a boundary point | `transport = "boundary"`, `[relay.boundary]` | built |
+| Batched UDP forwarding | a rule's `receive_buffer_kb` (default 8,192) | built ([ADR 0006](docs/adr/0006-data-path.md)) |
+| UDP forwarding inside the kernel (a tc program) | | designed (ADR 0006); a prototype is measured, not built |
+| Conversion in the send process, with the goat-transformers engine linked in | `convert` in a `[[send]]`, with `packs_sha256` | built (ADR 0006) |
+| Every phase on two machines joined by a real NetBird mesh | | not run yet |
+
+Measured in network namespaces on one shared workstation ([performance.md](docs/performance.md)):
+the relay forwards 97,260 to 157,750 datagrams of 64 bytes a second over WireGuard with under
+0.1 % loss, and the linked converter turns 22,581 to 52,666 Remote ID messages a second into
+Cursor on Target, one message in 51 to 115 µs at p99. No hardware link and no real mesh is
+measured yet.
 
 It runs with no goat component installed. Why it is a repository of its own, and
 what it leaves to other repositories: [ADR 0001](docs/adr/0001-goatrope-is-its-own-repository.md).
@@ -77,8 +101,11 @@ file_mb = 50
 files = 40
 ```
 
-`examples/` holds an inline tap, a listen tap behind a passive copper tap, and a
-listen tap with decode-and-send.
+`examples/` holds an inline tap (`inline.toml`), a listen tap behind a passive copper tap
+(`listen-copper-tap.toml`), an ERSPAN listen tap (`listen-erspan.toml`), decode-and-send
+(`send.toml`), and relays: over the mesh (`relay-over-mesh.toml`), to a boundary point
+(`relay-boundary.toml`), started from the link (`relay-link-initiated.toml`), with an address
+proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`).
 
 ## Commands
 
@@ -388,7 +415,8 @@ Known limits the tests record: a process with `CAP_NET_RAW` sending with
 lose up to the last second of frames that tcpdump had not yet written.
 
 Not tested: real hardware (a Raspberry Pi, USB adapters, a passive tap), the Pi's
-own watchdog, forced link speed (veth cannot be forced), and recording throughput.
+own watchdog, forced link speed (veth cannot be forced), recording throughput, and the phases
+on two machines joined by a real NetBird mesh.
 
 `bench`, in a container of its own after the others, measures the data paths: relay UDP
 over real WireGuard, the remote mirror, and decode-and-send with a converter. It records
@@ -400,7 +428,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |

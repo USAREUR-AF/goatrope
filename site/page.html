@@ -117,17 +117,17 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
 <a class="skip" href="#main">Skip to the content</a>
 <nav class="goat-tree" aria-label="goat pages"><a href="https://usareur-af.github.io/goatdocs/goat/pages/"><span aria-hidden="true">&larr;</span> All goat pages</a></nav>
 <div class="wrap top"><a class="brand" href="#main">{{mark}}goatrope</a>
-  <nav aria-label="Page"><a href="#sources">Sources</a><a href="#roles">Roles</a><a href="#locked">Locked down</a><a href="#modes">Fail-open or not</a><a href="#install">Install</a><a href="#safety">Safety</a><a class="gh" href="https://github.com/USAREUR-AF/goatrope">GitHub</a></nav></div>
+  <nav aria-label="Page"><a href="#sources">Sources</a><a href="#roles">Roles</a><a href="#relay">Relay</a><a href="#measured">Measured</a><a href="#locked">Locked down</a><a href="#modes">Fail-open or not</a><a href="#install">Install</a><a href="#safety">Safety</a><a class="gh" href="https://github.com/USAREUR-AF/goatrope">GitHub</a></nav></div>
 <main id="main">
 <div class="hero"><div class="wrap">
   <h1>{{wordmark}}</h1>
   <div class="hero-row">
     <div><p class="tag">Tie distant machines to one link, or tap the link they share.</p>
-    <p class="lede">goatrope takes a copy of one network link, from a tap device, a switch mirror port or its own inline tap on a small computer, and records it, sends on what you name, or relays named datagrams. The relay joins distant sites over the mesh they already share, or through a declared boundary point when a site stands outside it; it is work in progress. One file declares what it does. It runs with nothing else of ours installed.</p></div>
+    <p class="lede">goatrope takes a copy of one network link, from a tap device, a switch mirror port or its own inline tap on a small computer, and records it, sends on what you name, or relays named datagrams. The relay joins distant sites over the mesh they already share, or through a declared boundary point when a site stands outside it. One file declares what it does. It runs with nothing else of ours installed.</p></div>
     <div class="acts"><a class="btn main star" href="https://github.com/USAREUR-AF/goatrope"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l2.8 5.8 6.4.9-4.6 4.5 1.1 6.3L12 17.3l-5.7 3 1.1-6.3-4.6-4.5 6.4-.9z"/></svg>Star on GitHub</a><a class="btn" href="#install">Install 0.2.0</a></div>
   </div>
   <figure class="worm">{{worm-wide}}{{worm-narrow}}
-    <figcaption><b>Joining distant sites: work in progress.</b> A controller at one site reaching sensors at others. Where the sites already share an encrypted mesh, goatrope uses it and adds no tunnel. A site that must stay outside, for technical or policy reasons, is reached through a tunnel of goatrope's own whose one peer is the declared boundary point. Addresses are documentation addresses.</figcaption></figure>
+    <figcaption><b>Joining distant sites.</b> A controller at one site reaching sensors at others. Where the sites already share an encrypted mesh, goatrope uses it and adds no tunnel. A site that must stay outside, for technical or policy reasons, is reached through a tunnel of goatrope's own whose one peer is the declared boundary point. Addresses are documentation addresses.</figcaption></figure>
 </div></div>
 
 <div class="wrap"><div class="strip">
@@ -154,8 +154,34 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
   <div class="roles">
     <div>{{role-tap}}<h3>Tap</h3><p>Records the link to a bounded ring of capture files, inline or from a copy.</p><p class="st">Built. Tested in network namespaces on Ubuntu 24.04 and 26.04.</p></div>
     <div>{{role-send}}<h3>Decode and send</h3><p>Takes the tap's copy, keeps the datagrams you name, and delivers them. It never sends on the tapped link.</p><p class="st">Built. Tested the same way.</p></div>
-    <div>{{role-relay}}<h3>Relay</h3><p>Lets one remote machine exchange named datagrams with named machines on the link.</p><p class="st">Work in progress. Runs only while someone runs it.</p></div>
+    <div>{{role-relay}}<h3>Relay</h3><p>Lets remote machines reach named machines on the link, and machines on the link reach them, through WireGuard. Only what a rule names crosses.</p><p class="st">Built on main, as a service; not yet in a release. Tested in network namespaces on Ubuntu 24.04 and 26.04.</p></div>
   </div>
+</div></section>
+
+<section id="relay"><div class="wrap">
+  <h2>What the relay carries</h2>
+  <p class="sub">Each part is declared in the same file and is off until declared. These are on main; release 0.2.0 has the UDP rules and the boundary point, as work in progress, and the next release carries the rest.</p>
+  <div class="ways">
+    <div class="way"><h3>UDP and TCP rules</h3><p>One port on the tunnel to one machine and port on the link, either way round, sent from the relay's own address. Everything else is dropped and counted.</p><p class="st">Built. <code>[relay].allow</code></p></div>
+    <div class="way"><h3>A local address for a remote machine</h3><p>The remote appears on the link under an address of its own, taken only after an ARP probe finds no other holder, and held only while its tunnel is up.</p><p class="st">Built. <code>[[relay.proxy]]</code></p></div>
+    <div class="way"><h3>A layer-2 lane</h3><p>One dedicated port bridged to one peer, accepted by name. Only the declared EtherTypes cross, and from the tunnel only the declared source MACs; the lane closes when the tunnel goes quiet.</p><p class="st">Built. <code>[[relay.l2]]</code></p></div>
+    <div class="way"><h3>A boundary point</h3><p>A site outside the mesh is reached through a WireGuard interface of goatrope's own whose one peer is the declared boundary point, checked every 2 s.</p><p class="st">Built. <code>transport = "boundary"</code></p></div>
+    <div class="way"><h3>Multicast groups</h3><p>A group on the link as a rule's target, and a joined group sent to several remotes.</p><p class="st">Designed (ADR 0004), not built.</p></div>
+    <div class="way"><h3>A remote mirror</h3><p>Every frame of a tap port, sent as ERSPAN over the mesh to a collector elsewhere.</p><p class="st">Designed (ADR 0004), not built.</p></div>
+  </div>
+  <p class="cap">Rules, refusals and what <code>check</code> reads: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/README.md">README</a>. How it compares with an overlay network: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/related-work.md">related-work.md</a>.</p>
+</div></section>
+
+<section id="measured"><div class="wrap">
+  <h2>Measured</h2>
+  <p class="sub">In network namespaces with real WireGuard, on one shared workstation whose load average was 14 to 51. No hardware link and no real mesh is measured yet.</p>
+  <div class="strip" style="margin-top:28px">
+    <div><b data-perf="relay">97,260 to 157,750</b><span>64-byte datagrams a second through the relay, under 0.1 % lost</span><code>docs/performance.md</code></div>
+    <div><b data-perf="convert">22,581 to 52,666</b><span>messages a second converted in the send process, Remote ID to Cursor on Target</span><code>docs/performance.md</code></div>
+    <div><b data-measure="lane">10 of 10</b><span>1,472-byte pings with DF set across the lane, over a WireGuard MTU of 1,280</span><code>tests/netns, l2</code></div>
+    <div><b data-perf="handshake">180.6 to 182.8</b><span>seconds from the peer's last WireGuard handshake until the lane closed</span><code>docs/adr/0004-relay-1-0.md</code></div>
+  </div>
+  <p class="cap">The method and every run: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/performance.md">performance.md</a>.</p>
 </div></section>
 
 <section id="modes"><div class="wrap">{{divider}}
