@@ -195,7 +195,11 @@ interface and address. Everything else is dropped and counted. The rules and the
 
 TCP: the relay accepts a connection, opens one to the other side, and copies both ways until
 each side has closed; a side that closes only its sending half is passed on as a half-close.
-A connection it does not accept is closed at once and counted as denied. `max_connections`
+A sender the rule does not name gets no answer at all: a socket filter on the rule's listening
+socket passes only SYNs from the rule's `remote` (or `sources`), so the kernel never sends that
+sender a SYN-ACK, and the port looks closed, as a UDP rule's does. The kernel counts each refused
+segment (`listener_drops` in `relay.health`). The relay checks the peer again after accepting; a
+connection that got past the filter is closed at once and counted as denied. `max_connections`
 (default 64) bounds the connections open on a rule at once; one more is closed and counted.
 `direction = "both"` is refused for TCP, because a connection always carries both directions.
 A peer that vanishes without closing (the normal case when a WireGuard path dies) frees its slot

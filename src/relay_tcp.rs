@@ -10,7 +10,10 @@
 //! connects to the remote through the remote interface. It then copies both ways until each side
 //! has closed; a side that closes its sending half (shutdown) is passed on as a half-close.
 //!
-//! Every other connection is closed at once and counted as denied. At most `max_connections`
+//! A socket filter on the listening socket passes only SYNs (and every other segment) from those
+//! addresses, so the kernel never answers another sender: no SYN-ACK, the port looks closed, as a
+//! UDP rule's does, and the drop is counted (listener_drops). The relay checks the peer again after
+//! accept; a connection that got past the filter is closed at once and counted as denied. At most `max_connections`
 //! are open on a rule at once; one more is closed and counted as over the limit.
 //!
 //! A peer that vanishes without closing (the normal case when a WireGuard path dies) is found
@@ -23,7 +26,7 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,7 +42,6 @@ const KEEPCNT: libc::c_int = 6;
 pub const DEAD_PEER_S: libc::c_int = KEEPIDLE_S + KEEPINTVL_S * KEEPCNT;
 
 /// A rule's counters, written to relay.health by the relay's main loop.
-#[derive(Default)]
 pub struct Counters {
     /// connections open now
     pub open: AtomicU64,
@@ -52,6 +54,24 @@ pub struct Counters {
     pub send_errors: AtomicU64,
     /// connections ended by an error: a reset, or a peer that stopped answering (keepalive, user timeout)
     pub broken: AtomicU64,
+    /// the listening socket, whose kernel drop count is read for relay.health (-1: none yet)
+    pub listen_fd: AtomicI32,
+}
+
+impl Default for Counters {
+    fn default() -> Counters {
+        Counters {
+            open: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            bytes_to_link: AtomicU64::new(0),
+            bytes_to_remote: AtomicU64::new(0),
+            denied: AtomicU64::new(0),
+            over_limit: AtomicU64::new(0),
+            send_errors: AtomicU64::new(0),
+            broken: AtomicU64::new(0),
+            listen_fd: AtomicI32::new(-1),
+        }
+    }
 }
 
 impl Counters {
@@ -59,7 +79,7 @@ impl Counters {
     pub fn json(&self) -> String {
         let n = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "\"connections\": {}, \"accepted\": {}, \"bytes_to_link\": {}, \"bytes_to_remote\": {}, \"denied\": {}, \"over_limit\": {}, \"send_errors\": {}, \"broken\": {}",
+            "\"connections\": {}, \"accepted\": {}, \"bytes_to_link\": {}, \"bytes_to_remote\": {}, \"denied\": {}, \"over_limit\": {}, \"send_errors\": {}, \"broken\": {}, \"listener_drops\": {}",
             n(&self.open),
             n(&self.accepted),
             n(&self.bytes_to_link),
@@ -67,13 +87,104 @@ impl Counters {
             n(&self.denied),
             n(&self.over_limit),
             n(&self.send_errors),
-            n(&self.broken)
+            n(&self.broken),
+            listener_drops(self.listen_fd.load(Ordering::Relaxed))
         )
     }
 }
 
-fn listener(dev: &str, addr: IpAddr, port: u16, freebind: bool) -> io::Result<TcpListener> {
+/// Packets the kernel dropped at a listening socket (SO_MEMINFO, SK_MEMINFO_DROPS): the SYNs and
+/// other segments its source filter refused, and any dropped because the accept queue was full.
+fn listener_drops(fd: libc::c_int) -> u64 {
+    if fd < 0 {
+        return 0;
+    }
+    let mut info = [0u32; 16]; // SK_MEMINFO_VARS is 9 today; room for more
+    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+    // SAFETY: info is a buffer of len bytes.
+    let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_MEMINFO, info.as_mut_ptr() as *mut libc::c_void, &mut len) };
+    if rc != 0 {
+        return 0;
+    }
+    info[libc::SK_MEMINFO_DROPS as usize] as u64
+}
+
+/// A classic BPF socket filter that passes a packet only when its IP source address is one of
+/// `allowed` (those of the listening socket's family). On a listening TCP socket the kernel runs it
+/// before it answers a SYN, so a sender the rule does not name gets no SYN-ACK: the port looks
+/// closed to it, as a UDP rule's does. Accepted connections inherit it.
+fn source_filter(allowed: &[IpAddr], v6: bool) -> Vec<libc::sock_filter> {
+    const LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    const JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    const RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+    let net = |off: i32| (libc::SKF_NET_OFF + off) as u32;
+    let ins = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    let words: Vec<[u32; 4]> = allowed
+        .iter()
+        .filter_map(|a| match (a, v6) {
+            (IpAddr::V4(x), false) => Some([u32::from_be_bytes(x.octets()), 0, 0, 0]),
+            (IpAddr::V6(x), true) => {
+                let o = x.octets();
+                let w = |i: usize| u32::from_be_bytes([o[i], o[i + 1], o[i + 2], o[i + 3]]);
+                Some([w(0), w(4), w(8), w(12)])
+            }
+            _ => None,
+        })
+        .collect();
+    let mut prog = Vec::new();
+    if !v6 {
+        // the IPv4 source address, then one comparison per allowed address
+        prog.push(ins(LD_W_ABS, 0, 0, net(12)));
+        let n = words.len();
+        for (k, w) in words.iter().enumerate() {
+            prog.push(ins(JEQ_K, (n - k) as u8, 0, w[0])); // jump over the rest and the drop, to the accept
+        }
+    } else {
+        // the IPv6 source address, four words, one block of eight per allowed address
+        let n = words.len();
+        for (b, w) in words.iter().enumerate() {
+            // from the instruction at `at` in this block to the accept, past the rest and the drop
+            let to_accept = |at: usize| ((n - b) * 8 - at) as u8;
+            for (i, &word) in w.iter().enumerate() {
+                prog.push(ins(LD_W_ABS, 0, 0, net(8 + 4 * i as i32)));
+                let at = 2 * i + 1; // this comparison's index in the block
+                if i == 3 {
+                    prog.push(ins(JEQ_K, to_accept(at), 0, word));
+                } else {
+                    prog.push(ins(JEQ_K, 0, (6 - 2 * i) as u8, word)); // a mismatch skips to the next block
+                }
+            }
+        }
+    }
+    prog.push(ins(RET_K, 0, 0, 0)); // drop
+    prog.push(ins(RET_K, 0, 0, u32::MAX)); // accept the whole packet
+    prog
+}
+
+fn attach_source_filter(fd: libc::c_int, allowed: &[IpAddr], v6: bool) -> io::Result<()> {
+    let mut prog = source_filter(allowed, v6);
+    let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_mut_ptr() };
+    // SAFETY: fprog points to prog, which outlives the call; the kernel copies it.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &fprog as *const libc::sock_fprog as *const libc::c_void,
+            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // no process can take the filter off or replace it
+    opt(fd, libc::SOL_SOCKET, libc::SO_LOCK_FILTER, 1)
+}
+
+fn listener(dev: &str, addr: IpAddr, port: u16, freebind: bool, allowed: &[IpAddr]) -> io::Result<TcpListener> {
     let fd = bound_fd_free(dev, addr, port, libc::SOCK_STREAM, freebind)?;
+    // before listen(2): no SYN from another sender is answered, even for a moment
+    attach_source_filter(fd.as_raw_fd(), allowed, addr.is_ipv6())?;
     // SAFETY: fd is a bound stream socket.
     if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
         return Err(io::Error::last_os_error());
@@ -183,8 +294,9 @@ pub fn start(
     let l2r = rule.link_initiated();
     let (listen_dev, listen_addr) = if l2r { (&r.link_interface, link_addr) } else { (&r.remote_interface, any_of(clients[0])) };
     let (out_dev, out_addr) = if l2r { (r.remote_interface.clone(), any_of(dest.ip())) } else { (r.link_interface.clone(), link_addr) };
-    let l = listener(listen_dev, listen_addr, rule.listen_port, l2r && held.is_some()).map_err(|e| crate::sys::strerror(&e))?;
+    let l = listener(listen_dev, listen_addr, rule.listen_port, l2r && held.is_some(), &clients).map_err(|e| crate::sys::strerror(&e))?;
     let c = Arc::new(Counters::default());
+    c.listen_fd.store(l.as_raw_fd(), Ordering::Relaxed);
     let counters = c.clone();
     let max = rule.max_connections as u64;
     let port = rule.listen_port;
@@ -205,6 +317,7 @@ pub fn start(
                     continue;
                 }
             };
+            // the second layer: the source filter has already refused other senders' SYNs
             if !clients.contains(&peer.ip()) {
                 c.denied.fetch_add(1, Ordering::Relaxed);
                 log(format!("denied: tcp {peer} -> port {port} (allowed: {allowed})"));
@@ -280,5 +393,34 @@ fn session(conn: TcpStream, out_dev: &str, out_addr: IpAddr, dest: SocketAddr, l
     }
     if !(back && fwd) {
         c.broken.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_filter_jumps_land_on_accept() {
+        // the accept is the last instruction, the drop the one before; every comparison's true branch is the accept
+        for (allowed, v6) in [
+            (vec!["10.99.0.2".parse().unwrap(), "10.99.0.5".parse().unwrap()], false),
+            (vec!["2001:db8::2".parse().unwrap(), "2001:db8::5".parse().unwrap(), "2001:db8::7".parse().unwrap()], true),
+        ] {
+            let p = source_filter(&allowed, v6);
+            let accept = p.len() - 1;
+            assert_eq!((p[accept].k, p[accept - 1].k), (u32::MAX, 0));
+            let mut to_accept = 0;
+            for (i, x) in p.iter().enumerate() {
+                if x.code == (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16 {
+                    if x.jt > 0 {
+                        assert_eq!(i + 1 + x.jt as usize, accept, "instruction {i}");
+                        to_accept += 1;
+                    }
+                    assert!(i + 1 + (x.jf as usize) < accept, "instruction {i} falls past the drop");
+                }
+            }
+            assert_eq!(to_accept, allowed.len());
+        }
     }
 }

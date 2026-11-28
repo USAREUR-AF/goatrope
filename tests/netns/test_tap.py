@@ -1375,14 +1375,25 @@ while True:
 
 # A TCP client: n connections from src (bound to dev), each sends size bytes, closes its sending half
 # and reads to the end. "hold": opens n connections, sends nothing, and reports which the relay closed.
+# "syn": n connection attempts, each given 2 s; "timeout" counts those that got no SYN-ACK at all.
 NET_CLIENT = r"""
 import json, socket, sys, time
 mode, dev, src, dst, port, n, size = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
 def conn():
     c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, 25, dev.encode()); c.bind((src, 0)); c.settimeout(5)
     c.connect((dst, port)); return c
-out = {"ok": 0, "closed": 0, "errors": []}
-if mode == "echo":
+out = {"ok": 0, "closed": 0, "timeout": 0, "errors": []}
+if mode == "syn":
+    for i in range(n):
+        c = socket.socket(); c.setsockopt(socket.SOL_SOCKET, 25, dev.encode()); c.bind((src, 0)); c.settimeout(2)
+        try:
+            c.connect((dst, port)); out["ok"] += 1  # the handshake completed
+        except socket.timeout:
+            out["timeout"] += 1
+        except OSError as e:
+            out["closed"] += 1; out["errors"].append(str(e))
+        c.close()
+elif mode == "echo":
     for i in range(n):
         payload = bytes([65 + i % 26]) * size
         try:
@@ -1508,11 +1519,11 @@ def phase_relay_tcp() -> None:
                "relay tcp: remote -> link both ways (100000 bytes each way, the client's half-close passed on), from the relay's address",
                f"{r['ok']} of 5 echoed; target saw {len(done)} of 5 whole, from {sorted(set(acc))}; {r['errors'][:2]}")
         before = len(lines(logs["link"]))
-        r = client("remote", "echo", "wgo", "10.99.0.3", "10.99.0.1", "7100", "3", "100")
+        r = client("remote", "syn", "wgo", "10.99.0.3", "10.99.0.1", "7100", "3", "0")
         time.sleep(0.5)
-        result(r["ok"] == 0 and len(lines(logs["link"])) == before,
-               "relay tcp: a connection from another authenticated peer is closed, and never reaches the target",
-               f"{r['closed']} of 3 closed; target saw {len(lines(logs['link'])) - before} lines")
+        result(r["timeout"] == 3 and len(lines(logs["link"])) == before,
+               "relay tcp: another authenticated peer gets no SYN-ACK (the port looks closed), and nothing reaches the target",
+               f"{r['timeout']} of 3 attempts got no SYN-ACK, {r['ok']} connected; target saw {len(lines(logs['link'])) - before} lines")
         before = len([ln for ln in lines(logs["link"]) if ln.startswith("accept")])
         r = client("remote", "hold", "wga", "10.99.0.2", "10.99.0.1", "7100", "5", "0")
         time.sleep(1)
@@ -1537,21 +1548,23 @@ def phase_relay_tcp() -> None:
         result(r["ok"] == 3 and len(acc) == 3 and all(ln == "accept 10.99.0.1" for ln in acc),
                "relay link-to-remote tcp: a link machine's connection reaches the remote through the tunnel, both ways",
                f"{r['ok']} of 3 echoed (50000 bytes each way); remote saw {len(acc)} from {sorted(set(acc))}")
-        r = client("linkhost", "echo", "l0", "192.0.2.3", "192.0.2.50", "8001", "3", "100")
+        r = client("linkhost", "syn", "l0", "192.0.2.3", "192.0.2.50", "8001", "3", "0")
         time.sleep(0.5)
         acc2 = [ln for ln in lines(logs["remote-tcp"]) if ln.startswith("accept")]
-        result(r["ok"] == 0 and len(acc2) == len(acc), "relay link-to-remote tcp: a link address not in sources is denied",
-               f"{r['closed']} of 3 closed; remote saw {len(acc2) - len(acc)}")
+        result(r["timeout"] == 3 and len(acc2) == len(acc),
+               "relay link-to-remote tcp: a link address not in sources gets no SYN-ACK, and nothing reaches the remote",
+               f"{r['timeout']} of 3 attempts got no SYN-ACK, {r['ok']} connected; remote saw {len(acc2) - len(acc)}")
         time.sleep(2.5)
         rows = {(x["protocol"], x["listen_port"]): x for x in relay_rows()}
         t, lu, lt = rows.get(("tcp", 7100), {}), rows.get(("udp", 8000), {}), rows.get(("tcp", 8001), {})
-        result(t.get("denied") == 3 and t.get("over_limit") == 2 and t.get("bytes_to_link", 0) >= 500000
-               and t.get("bytes_to_remote", 0) >= 500000 and lu.get("denied") == 5 and lt.get("denied") == 3
-               and t.get("connections") == 0,
-               "relay tcp: relay.health counts connections, bytes each way and denials per rule",
+        # each attempt sends a SYN and retransmits it once within its 2 s: at least 3 drops per rule
+        result(t.get("listener_drops", 0) >= 3 and lt.get("listener_drops", 0) >= 3 and t.get("denied") == 0
+               and lt.get("denied") == 0 and t.get("over_limit") == 2 and t.get("bytes_to_link", 0) >= 500000
+               and t.get("bytes_to_remote", 0) >= 500000 and lu.get("denied") == 5 and t.get("connections") == 0,
+               "relay tcp: relay.health counts connections, bytes each way, SYNs refused by the filter and denials per rule",
                f"7100 {t}; 8000 {lu}; 8001 {lt}")
         p = gr("status", "--config", CFG)
-        result("over the limit" in p.stdout and "broken" in p.stdout and "link-to-remote" not in p.stdout and "connections from 192.0.2.2" in p.stdout,
+        result("over the limit" in p.stdout and "broken" in p.stdout and "refused before the handshake" in p.stdout and "link-to-remote" not in p.stdout and "connections from 192.0.2.2" in p.stdout,
                "relay tcp: status shows the TCP and link-initiated rules in words",
                " | ".join(ln.strip() for ln in p.stdout.splitlines() if "rule" in ln)[:400])
 
