@@ -786,7 +786,19 @@ name = "bounded"
 port = "tp0"
 match = {{ protocol = "udp", dst_port = 5001 }}
 to = [{{ url = "file:///var/lib/goatrope/send/bounded.jsonl", format = "jsonl", max_mb = 1 }}]
+
+[[send]]
+name = "guarded"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5002 }}
+to = ["udp://198.51.100.2:9200"]
 """
+    # the guarded send's destination: a machine behind its own veth, reached through gd0
+    sh("ip netns del gdst", check=False)
+    sh("ip link del gd0", check=False)
+    sh("ip netns add gdst && ip link add gd0 type veth peer name gd1 && ip link set gd1 netns gdst")
+    sh("ip addr add 198.51.100.1/24 dev gd0 && ip link set gd0 up")
+    sh("ip -n gdst addr add 198.51.100.2/24 dev gd1 && ip -n gdst link set gd1 up && ip -n gdst link set lo up")
     write_cfg(cfg)
     rx = subprocess.Popen([sys.executable, "-c", """
 import socket, threading, json, http.server, struct, sys
@@ -866,6 +878,73 @@ import os; os._exit(0)
     mode = oct(os.stat("/var/lib/goatrope/send/plain.jsonl").st_mode & 0o777)
     result(mode == "0o640", "send: file destinations are not world-readable", mode)
     check_exit(0, "send: check after install (heartbeats)")
+    phase_send_route_guard()
+
+
+def phase_send_route_guard() -> None:
+    """#43: a route added while a UDP destination is sending, through the inline bridge, sends nothing there."""
+    # an inline bridge with one port into a namespace that watches it: the link a send must never reach
+    sh("ip netns del glink", check=False)
+    sh("ip link del goatrope0", check=False)
+    sh("ip netns add glink && ip link add goatrope0 type bridge && ip link add gb0 type veth peer name gb1")
+    sh("ip link set gb1 netns glink && ip link set gb0 master goatrope0 && ip link set gb0 up && ip link set goatrope0 up")
+    # the machine on that link answers ARP for the destination's address, so a datagram sent there would arrive
+    # (and has a route back to whichever source address the sender picks, or it would not answer)
+    sh("ip -n glink addr add 198.51.100.2/24 dev gb1 && ip -n glink link set gb1 up && ip -n glink route add default dev gb1")
+    watch = Capture("glink", "gb1", "guard-link")
+    rx = subprocess.Popen(["ip", "netns", "exec", "gdst", sys.executable, "-c", """
+import socket, time, json
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("198.51.100.2", 9200)); s.settimeout(0.3)
+got = []; end = time.time() + 16
+while time.time() < end:
+    try:
+        d = s.recv(65535); got.append(int.from_bytes(d[4:8], "big"))
+    except socket.timeout:
+        pass
+print(json.dumps(got))
+"""], stdout=subprocess.PIPE, text=True)
+    feeder = subprocess.Popen(["ip", "netns", "exec", "feed", sys.executable, "-c", """
+import socket, struct, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind(("f0", 0))
+def ck(h):
+    s_ = sum(struct.unpack("!10H", h)); s_ = (s_ >> 16) + (s_ & 0xffff); return (~(s_ + (s_ >> 16))) & 0xffff
+for i in range(280):
+    pl = b"GRD." + i.to_bytes(4, "big")
+    u = struct.pack("!HHHH", 40000, 5002, 8 + len(pl), 0) + pl
+    h = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(u), 5000 + i, 0, 64, 17, 0, bytes([192, 0, 2, 10]), bytes([192, 0, 2, 20]))
+    h = h[:10] + struct.pack("!H", ck(h)) + h[12:]
+    s.send(b"\\x02\\x00\\x00\\x00\\x00\\x20" + b"\\x02\\x00\\x00\\x00\\x00\\x10" + b"\\x08\\x00" + h + u)
+    time.sleep(0.05)
+"""])
+    def errors() -> int:
+        try:
+            return json.load(open("/var/lib/goatrope/send/guarded.health"))["errors"]
+        except (OSError, ValueError, KeyError):
+            return -1
+    time.sleep(4)
+    e0 = errors()
+    sh("ip route add 198.51.100.2/32 dev goatrope0")  # the inline bridge now carries the route
+    t_add = time.monotonic()
+    time.sleep(5)
+    e1 = errors()
+    sh("ip route del 198.51.100.2/32 dev goatrope0")
+    feeder.wait(timeout=60)
+    got = json.loads(rx.communicate(timeout=60)[0] or "[]")
+    time.sleep(2.5)
+    e2 = errors()
+    frames = watch.stop()
+    on_link = [f for f in frames if b"GRD." in f]
+    sent_during = sorted(i for i in got if 80 <= i < 180)  # datagrams 80-180 were matched while the route was there (4-9 s)
+    result(not on_link, "send: with a route to the destination through the inline bridge, nothing reaches the link",
+           f"{len(on_link)} of {len(frames)} frames on the bridge's link were the feed's")
+    result(e1 - e0 >= 40, "send: while the route goes through the bridge, each attempt is refused and counted as an error",
+           f"errors {e0} -> {e1} in 5 s (about 100 matched)")
+    result(len(got) > 0 and max(got) > 200, "send: once the route is gone, the destination receives again",
+           f"{len(got)} of 280 received, last {max(got) if got else None}; {len(sent_during)} received while the route went through the bridge")
+    result(e2 >= e1, "send: the heartbeat kept counting", f"errors {e2}")
+    # leave no address behind: later phases use 198.51.100.0/24 for their own topology
+    for cmd in ("ip link del goatrope0", "ip netns del glink", "ip link del gd0", "ip netns del gdst"):
+        sh(cmd, check=False)
 
 
 PHASES = {"refusals": phase_refusals, "inline": phase_inline, "reboot-verify": phase_reboot_verify,

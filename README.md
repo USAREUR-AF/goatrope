@@ -154,9 +154,13 @@ and sends it to each destination: `udp://`, `tcp://`
 (`framing = "len32be"` or `"raw"`), `http(s)://` (one POST per message, redirects
 refused) or `file:///var/lib/goatrope/...` (`format = "jsonl"` or `"raw"`, and
 `max_mb`: the file is cut there and one older file kept). A destination whose
-route leaves through a tap port, or whose name does not resolve, is refused at
-install and at send time: decode-and-send never transmits on the tapped link. TCP
-stream reassembly is not built.
+route leaves through a tap port or the inline bridge, or whose name does not resolve, is
+refused at install and at send time: decode-and-send never transmits on the tapped link. The
+name is resolved once and that address is checked and used: UDP and TCP sockets are bound to
+the device the route left by (`SO_BINDTODEVICE`) and checked again every 2 s, so a route added
+later through a tap port makes the sends fail and be counted rather than leave by it; each
+HTTP request resolves once and connects to exactly the address it checked. TCP stream
+reassembly is not built.
 
 A `convert` converts with the goat-transformers engine linked into goatrope
 ([ADR 0006](docs/adr/0006-data-path.md)), the only converter: the send process loads the two

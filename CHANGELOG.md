@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- decode-and-send route guard (#43): a destination is resolved once and the checked address is
+  the one used. UDP and TCP sockets are bound to the device the route left by and checked again
+  every 2 s; a route added later through a tap port or the inline bridge makes the sends fail and
+  be counted. Each HTTP request resolves once and connects only to that checked address. Namespace
+  phase `send`: with a route to a sending destination through the inline bridge, 0 datagrams
+  reached the link and 99 attempts were counted as errors; sending resumed when it was removed.
 - relay: it follows its interfaces. One that is not there is waited for, at start and after a
   restart, and is never a refusal: a relay that starts before the mesh client, or outlives a mesh
   outage of any length, starts forwarding once the interface is back. One that vanishes, or comes

@@ -82,7 +82,7 @@ fn listener(dev: &str, addr: IpAddr, port: u16, freebind: bool) -> io::Result<Tc
 }
 
 /// A connection to `to` from a socket bound to `dev` and `from`, given up after CONNECT_TIMEOUT.
-fn connect(dev: &str, from: IpAddr, to: SocketAddr) -> io::Result<TcpStream> {
+pub(crate) fn connect(dev: &str, from: IpAddr, to: SocketAddr) -> io::Result<TcpStream> {
     let fd = bound_fd_free(dev, from, 0, libc::SOCK_STREAM, false)?;
     let tv = |d: Duration| libc::timeval { tv_sec: d.as_secs() as libc::time_t, tv_usec: 0 };
     // a blocking connect gives up after the send timeout

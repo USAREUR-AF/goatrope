@@ -335,71 +335,124 @@ pub struct Meta {
     pub dport: u16,
 }
 
+/// How often an open UDP or TCP destination's route is checked again.
+const RECHECK: Duration = Duration::from_secs(2);
+
+/// A destination resolved once and checked: the address every send goes to, and the device the
+/// route to it leaves by, to which the socket is bound (SO_BINDTODEVICE).
+#[derive(Clone, Debug, PartialEq)]
+struct Checked {
+    addr: SocketAddr,
+    dev: String,
+}
+
 pub struct Sink {
     pub d: Destination,
     taken: BTreeSet<String>,
-    udp: Option<UdpSocket>,
-    tcp: Option<TcpStream>,
+    udp: Option<(UdpSocket, Checked, Instant)>,
+    tcp: Option<(TcpStream, Checked, Instant)>,
     file: Option<File>,
-    http: Option<ureq::Agent>,
+}
+
+/// A ureq resolver that answers with one address, the one the route guard checked.
+#[derive(Debug)]
+struct Pinned(SocketAddr);
+
+impl ureq::unversioned::resolver::Resolver for Pinned {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let mut v = self.empty();
+        v.push(self.0);
+        Ok(v)
+    }
 }
 
 impl Sink {
     pub fn new(d: Destination, taken: BTreeSet<String>) -> Sink {
-        Sink { d, taken, udp: None, tcp: None, file: None, http: None }
+        Sink { d, taken, udp: None, tcp: None, file: None }
     }
 
-    fn guard(&self) -> Result<(), String> {
-        if let Some(h) = &self.d.host {
-            let devs = destination_devices(h).map_err(|e| format!("{}: {e}; not sending", self.d.url))?;
-            let bad: Vec<&String> = devs.iter().filter(|d| self.taken.contains(*d)).collect();
-            if !bad.is_empty() {
-                return Err(format!(
-                    "{} is reached through tap port {}; not sending",
-                    self.d.url,
-                    bad.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn target(&self) -> String {
+    /// Resolve the destination once and check the route to that address: it must not leave through
+    /// a tap port or the inline bridge. The address and the device are what the send then uses, so
+    /// a name that answers differently later, or a route added later, is never used unchecked.
+    fn guard(&self) -> Result<Checked, String> {
         let h = self.d.host.as_deref().unwrap_or("");
-        let p = self.d.port.unwrap_or(0);
-        if h.contains(':') {
-            format!("[{h}]:{p}")
-        } else {
-            format!("{h}:{p}")
+        let port = self.d.port.unwrap_or(if self.d.scheme == "https" { 443 } else { 80 });
+        let addr = (h, port)
+            .to_socket_addrs()
+            .map_err(|e| format!("{}: cannot resolve {h}: {}; not sending", self.d.url, strerror(&e)))?
+            .next()
+            .ok_or_else(|| format!("{}: cannot resolve {h}: no address; not sending", self.d.url))?;
+        let scope = match addr {
+            SocketAddr::V6(v6) if v6.scope_id() != 0 => link::ifname_of(v6.scope_id()),
+            _ => None,
+        };
+        let dev = if addr.ip().is_loopback() { Some("lo".to_string()) } else { scope.or_else(|| link::route_dev(addr.ip())) };
+        let Some(dev) = dev else {
+            return Err(format!("{}: no route to {}; not sending", self.d.url, addr.ip()));
+        };
+        let bad: Vec<String> = link::lowers(&dev).into_iter().filter(|d| self.taken.contains(d)).collect();
+        if !bad.is_empty() {
+            return Err(format!("{} is reached through tap port {}; not sending", self.d.url, bad.join(", ")));
         }
+        Ok(Checked { addr, dev })
+    }
+
+    /// A socket of type `ty` bound to the checked device, so a later route change cannot send it
+    /// out of another one: its sends fail instead, and are counted.
+    fn bound_to(c: &Checked, ty: libc::c_int) -> Result<std::os::fd::OwnedFd, String> {
+        let any = crate::relay::any_of(c.addr.ip());
+        crate::relay::bound_fd_free(&c.dev, any, 0, ty, false).map_err(|e| strerror(&e))
     }
 
     pub fn send(&mut self, payload: &[u8], meta: &Meta) -> Result<(), String> {
         match self.d.scheme.as_str() {
             "udp" => {
-                if self.udp.is_none() {
-                    self.guard()?;
-                    let bind = if self.d.host.as_deref().unwrap_or("").contains(':') { "[::]:0" } else { "0.0.0.0:0" };
-                    self.udp = Some(UdpSocket::bind(bind).map_err(|e| strerror(&e))?);
+                // checked again every RECHECK: a route that now leaves through a tap port closes the socket
+                if self.udp.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= RECHECK) {
+                    let (sock, was, _) = self.udp.take().unwrap();
+                    let now = self.guard()?;
+                    if now == was {
+                        self.udp = Some((sock, was, Instant::now()));
+                    }
                 }
-                self.udp.as_ref().unwrap().send_to(payload, self.target()).map_err(|e| strerror(&e))?;
+                if self.udp.is_none() {
+                    let c = self.guard()?;
+                    let sock = UdpSocket::from(Self::bound_to(&c, libc::SOCK_DGRAM)?);
+                    self.udp = Some((sock, c, Instant::now()));
+                }
+                let (sock, c, _) = self.udp.as_ref().unwrap();
+                sock.send_to(payload, c.addr).map_err(|e| strerror(&e))?;
                 Ok(())
             }
             "tcp" => {
+                if self.tcp.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= RECHECK) {
+                    let (s, was, _) = self.tcp.take().unwrap();
+                    match self.guard() {
+                        Ok(now) if now == was => self.tcp = Some((s, was, Instant::now())),
+                        other => {
+                            let _ = s.shutdown(Shutdown::Both); // a new address or device: connect again, checked
+                            other?;
+                        }
+                    }
+                }
                 if self.tcp.is_none() {
-                    self.guard()?;
-                    let addr: SocketAddr = self.target().parse().map_err(|_| "bad address".to_string())?;
-                    let s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| strerror(&e))?;
+                    let c = self.guard()?;
+                    let s = crate::relay_tcp::connect(&c.dev, crate::relay::any_of(c.addr.ip()), c.addr).map_err(|e| strerror(&e))?;
                     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
-                    self.tcp = Some(s);
+                    self.tcp = Some((s, c, Instant::now()));
                 }
                 let mut data = Vec::with_capacity(payload.len() + 4);
                 if self.d.framing.as_deref() == Some("len32be") {
                     data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
                 }
                 data.extend_from_slice(payload);
-                if let Err(e) = self.tcp.as_mut().unwrap().write_all(&data) {
-                    if let Some(s) = self.tcp.take() {
+                if let Err(e) = self.tcp.as_mut().unwrap().0.write_all(&data) {
+                    if let Some((s, _, _)) = self.tcp.take() {
                         let _ = s.shutdown(Shutdown::Both);
                     }
                     return Err(strerror(&e));
@@ -407,15 +460,14 @@ impl Sink {
                 Ok(())
             }
             "http" | "https" => {
-                self.guard()?;
-                let agent = self.http.get_or_insert_with(|| {
-                    ureq::Agent::config_builder()
-                        .max_redirects(0)
-                        .http_status_as_error(false)
-                        .timeout_global(Some(Duration::from_secs(5)))
-                        .build()
-                        .into()
-                });
+                // resolved once per request; the connection goes to exactly the address checked
+                let c = self.guard()?;
+                let config = ureq::Agent::config_builder()
+                    .max_redirects(0)
+                    .http_status_as_error(false)
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .build();
+                let agent = ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::new(), Pinned(c.addr));
                 let r = agent
                     .post(&self.d.url)
                     .header("Content-Type", "application/octet-stream")
