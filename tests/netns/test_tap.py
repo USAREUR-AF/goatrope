@@ -691,7 +691,8 @@ def phase_uninstall(config_kept: bool) -> None:
     result(p.returncode == 0, "uninstall", p.stdout.strip()[-300:])
     after = snapshot()
     d = diff(before, after)
-    allowed = [x for x in d if x.startswith(("file /etc/goatrope", "file /var/lib/goatrope"))]
+    # decode-and-send's data is its dynamic user's directory, kept by systemd under /var/lib/private
+    allowed = [x for x in d if x.startswith(("file /etc/goatrope", "file /var/lib/goatrope", "file /var/lib/private"))]
     result(set(d) == set(allowed), "uninstall: only the declaration and the recordings remain",
            "; ".join(x for x in d if x not in allowed)[:600])
     p = subprocess.run(GR + ["uninstall", "--purge"],
@@ -874,6 +875,33 @@ import os; os._exit(0)
     mode = oct(os.stat("/var/lib/goatrope/send/plain.jsonl").st_mode & 0o777)
     result(mode == "0o640", "send: file destinations are not world-readable", mode)
     check_exit(0, "send: check after install (heartbeats)")
+
+    # #40: the process that parses link traffic is not root and holds only CAP_NET_RAW
+    pid = sh("systemctl show -p MainPID --value goatrope-send@plain.service").stdout.strip()
+    st = dict(ln.split(":", 1) for ln in open(f"/proc/{pid}/status").read().splitlines() if ":" in ln)
+    uid, gid = st["Uid"].split()[0], st["Gid"].split()[0]
+    cap = int(st["CapEff"].strip(), 16)
+    result(uid != "0" and gid != "0" and cap == 1 << 13,
+           "send: it runs as a user of its own, not root, with CAP_NET_RAW only", f"uid {uid}, gid {gid}, CapEff {cap:#x}")
+    secret = "/etc/goatrope/test-root-only.key"
+    with open(secret, "w") as f:
+        f.write("not-a-real-key\n")
+    os.chmod(secret, 0o600)
+    reads = {}
+    for path in (secret, "/var/lib/goatrope/state.json"):
+        q = sh(f"nsenter -t {pid} -m -S {uid} -G {gid} -- cat {path}", check=False)
+        reads[path] = "read" if q.returncode == 0 else q.stderr.strip().split(":")[-1].strip()
+    os.remove(secret)
+    result(all(v != "read" for v in reads.values()),
+           "send: root-only files (a mode-600 key, the state file) cannot be read with its credentials, in its view of the files",
+           "; ".join(f"{k}: {v}" for k, v in reads.items()))
+    q = sh(f"nsenter -t {pid} -m -S {uid} -G {gid} -- sh -c 'echo x > /etc/goatrope/x; echo x > /var/lib/goatrope/x'", check=False)
+    result(q.returncode != 0 and not os.path.exists("/etc/goatrope/x") and not os.path.exists("/var/lib/goatrope/x"),
+           "send: it cannot write outside its own directory", q.stderr.strip()[-120:])
+    p = gr("validate", "--config", write_cfg(cfg.replace("/var/lib/goatrope/send/bounded.jsonl", "/var/lib/goatrope/state.json")))
+    write_cfg(cfg)
+    result(p.returncode == 2 and "/var/lib/goatrope/send/" in p.stderr,
+           "send: a file destination outside /var/lib/goatrope/send/ is refused", p.stderr.strip()[-120:])
 
 
 PHASES = {"refusals": phase_refusals, "inline": phase_inline, "reboot-verify": phase_reboot_verify,

@@ -695,12 +695,33 @@ Wants=goatrope-ports.service
 ExecStart={BIN} run-send %i --config {ETC}/goatrope.toml
 Restart=always
 RestartSec=3
-NoNewPrivileges=yes
-ProtectHome=yes
-ProtectSystem=strict
-ReadWritePaths=/var/lib/goatrope
+# It parses link traffic and converts it: a user of its own (every send shares it, and its
+# directory), the capture capability only, nothing of root's readable or writable (#40).
+DynamicUser=yes
+User=goatrope-send
+StateDirectory=goatrope/send
+UMask=0027
 CapabilityBoundingSet=CAP_NET_RAW
 AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_PACKET AF_INET AF_INET6 AF_NETLINK AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

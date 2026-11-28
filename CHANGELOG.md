@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- decode-and-send runs as a dynamic user of its own (`goatrope-send`), not root, with
+  `CAP_NET_RAW` only and a hardened unit (read-only system, no access to root-only files, a system
+  call filter, restricted address families). File destinations must be under
+  `/var/lib/goatrope/send/`, its only writable directory. Fixes #40.
 - check: a listen port's egress drop is judged by what the first egress filter does (the only
   filter at the lowest pref, a matchall on every protocol that drops), not by words in `tc`'s
   output; a pass filter ahead of the drop makes check exit 3. Fixes #42.

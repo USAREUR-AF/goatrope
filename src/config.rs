@@ -755,8 +755,10 @@ fn destination(u: &Value, where_: &str) -> R<Destination> {
             Ok(Destination { url, scheme: s.scheme, host: Some(host), port, path: Some(path), framing: None, format: None, max_mb: None })
         }
         "file" => {
-            if !s.path.starts_with("/var/lib/goatrope/") || s.path.contains("..") {
-                return err(format!("{where_}: a file destination must be under /var/lib/goatrope/"));
+            if !s.path.starts_with("/var/lib/goatrope/send/") || s.path.contains("..") {
+                return err(format!(
+                    "{where_}: a file destination must be under /var/lib/goatrope/send/, the one directory decode-and-send may write"
+                ));
             }
             let fmt = match get("format") {
                 Some(Value::String(f)) if f == "jsonl" || f == "raw" => f.clone(),
