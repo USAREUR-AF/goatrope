@@ -80,6 +80,24 @@ Latency at 10,000 datagrams a second (run 1), relay path p50 / p99 against WireG
 3.0 ms; 1,400 B 511 µs / 21 ms against 428 µs / 3.6 ms; 26.04 64 B 320 µs / 3.0 ms against
 198 µs / 2.8 ms; 512 B 195 µs / 2.7 ms against 147 µs / 2.7 ms.
 
+### Decode-and-send capture under load
+
+10,000 Remote ID messages offered at 2,000 a second to a `[[send]]` with the linked engine and
+one UDP destination, Ubuntu 24.04 (phase `bench-capture`; the busy processes run `while True:
+pass` at normal priority, the confined case uses `systemctl set-property AllowedCPUs=0` on the
+send unit and `taskset -c 0` on 8 busy processes). Messages that reached the destination:
+
+| Condition | One `recv` per frame (before) | TPACKET_V3 ring, 16 MiB | TPACKET_V2 ring, 16 MiB (built) |
+|---|---|---|---|
+| idle | 10,000 | 10,000 | 10,000 |
+| one busy process on every processor | 10,000 | 10,000 | 10,000 |
+| confined to one processor with 8 busy processes there | 10,000 | 10,000 | 10,000 |
+| stopped (SIGSTOP) for 2 s in the middle | 6,219 | 7,574 | 10,000 |
+
+In each case the generator's count and tp0's receive counter were 10,000: the loss was at the
+send process's socket (before) or ring (V3, 2,426 counted as `capture_dropped`). The V3 ring
+hands a part-filled block over every 50 ms, so at this rate its 16 blocks covered 0.8 s.
+
 ## What the numbers say
 
 - **Relay UDP, before.** The relay forwarded 20,000 to 54,000 datagrams a second without

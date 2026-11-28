@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- decode-and-send captures through a TPACKET_V2 ring of frame slots (`capture_mb`, default 16 MiB:
+  8,192 frames), so a stall or a busy machine loses nothing until the ring is full; what the
+  kernel still drops is counted (`capture_dropped`). Each destination has its own queue and
+  thread: a slow destination drops its own messages, counted, and stalls neither the capture nor
+  the others. Errors are printed at most once every 10 s per destination. The heartbeat and
+  `status` show the counts. Namespace phase `send-capture`; the `linked-engine` phase checks the
+  count and the conversion time apart. Fixes #45.
 - relay: it follows its interfaces. One that is not there is waited for, at start and after a
   restart, and is never a refusal: a relay that starts before the mesh client, or outlives a mesh
   outage of any length, starts forwarding once the interface is back. One that vanishes, or comes

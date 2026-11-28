@@ -24,7 +24,7 @@ SPDX-License-Identifier: Apache-2.0
 | Layer-2 lane (ADR 0004 module 6) | the kernel: a bridge of the port and a GRETAP interface, tc flower filters; no user space | not measured; the same kind of path as the mirror | as module 6 builds it |
 | Decode-and-send, conversion | the goat-transformers engine linked into goatrope, in the send process, the only converter; packs loaded once at start, pinned by digest | 22,581 to 52,666 messages/s over two runs on each version (goat-xf run once per message, before: 0.4 to 0.6); one conversion p99 51 to 115 µs, asserted ≤ 1 ms | built; the goat-xf `binary` form is removed |
 | Fragmented datagrams and frames | relayed and mirrored as fragments; the kernel reassembles them; the relay counts this machine's reassembly failures in `relay.health` | after an overload of fragments, unfragmented datagrams 200 of 200, fragmented 0 of 100, and 100 of 100 again after `ipfrag_time` | built; see [Fragments](#fragments) |
-| Decode-and-send, capture | user space, one `recv` per frame on an `AF_PACKET` socket | not measured apart from conversion | unchanged |
+| Decode-and-send, capture | user space, a TPACKET_V2 ring of frame slots (`capture_mb`, default 16 MiB) the kernel fills; each destination its own queue and thread | at 2,000/s with the send process stopped for 2 s: 10,000 of 10,000 (one `recv` per frame from the socket queue before: 6,219) | built; see [Capture](#capture) |
 
 The numbers are from the `bench` phase on one shared workstation whose load changed
 between runs; [performance.md](../performance.md) has the method and every number.
@@ -182,6 +182,39 @@ convert = { component = "goat-transformers", version = "0.8.0", from = "remote-i
   and declare `packs_sha256`. Upgrading the engine is a goatrope release.
 - The engine runs in the send process, which `goatrope-send@<name>.service` restarts if it
   stops; one `[[send]]` failing does not stop another.
+
+## Capture
+
+A `[[send]]` read one frame per `recv` from its packet socket, whose receive queue holds about
+220 small frames: a tenth of a second at 2,000 a second. When the send process did not run for
+longer (a loaded machine, a stall), the kernel dropped the rest, uncounted; sending to each
+destination in turn in the same loop let one slow destination (a TCP peer that stops reading, an
+HTTP endpoint taking its 5 s timeout) stall the capture the same way. Measured at 2,000 Remote
+ID messages a second with the send process stopped for 2 s (SIGSTOP), 6,219 of 10,000 reached
+the destination, all the loss at the socket; a CI run on a loaded runner converted 6,484 of
+10,000.
+
+| Part | Now |
+|---|---|
+| The capture | a TPACKET_V2 ring mapped into the send process: fixed slots, one frame each, sized for the port's MTU (2 KiB at 1,500); `capture_mb` MiB of them (1 to 1,024, default 16: 8,192 frames, about 4 s at 2,000 a second). The kernel copies each frame into a slot as it arrives; the send process reads every waiting slot and hands it back |
+| What is still lost | frames that arrive while every slot is full, counted by the kernel (`PACKET_STATISTICS`) and reported as `capture_dropped`; frames longer than a slot, counted as `capture_truncated` |
+| The destinations | each its own queue (8,192 messages) and thread; a full queue drops the newest message for that destination only, counted as its `dropped` |
+| Errors | one line per destination (and one for conversions) every 10 s at most, then a count of those held back |
+
+A TPACKET_V3 ring of blocks was tried first: the kernel hands a part-filled block to user space
+on a timer (50 ms), so at 2,000 a second each 1 MiB block held about 100 frames and 16 blocks
+covered 0.8 s; the 2 s stall lost 2,426 of 10,000. Fixed slots have no timer and cover the stall.
+
+| At 2,000 messages a second, 10,000 offered (24.04) | One `recv` per frame | TPACKET_V3, 16 MiB | TPACKET_V2, 16 MiB |
+|---|---|---|---|
+| idle | 10,000 | 10,000 | 10,000 |
+| one busy process on every processor | 10,000 | 10,000 | 10,000 |
+| confined to one processor with 8 busy processes there | 10,000 | 10,000 | 10,000 |
+| stopped for 2 s | 6,219 | 7,574 | 10,000 |
+
+Phase `send-capture` asserts that every message offered arrives in the three loaded cases, with
+none dropped by the ring, and that a TCP destination that never reads drops only its own messages
+(counted) while a UDP destination beside it gets 20,000 of 20,000.
 
 ## Fragments
 

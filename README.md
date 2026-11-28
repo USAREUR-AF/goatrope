@@ -158,6 +158,18 @@ route leaves through a tap port, or whose name does not resolve, is refused at
 install and at send time: decode-and-send never transmits on the tapped link. TCP
 stream reassembly is not built.
 
+Frames are captured through a ring the kernel fills as they arrive (TPACKET_V2, one slot per
+frame of the port's MTU): `capture_mb` (1 to 1,024, 16 when not set) sizes it, and 16 MiB holds
+8,192 frames at an MTU of 1,500, about 4 s at 2,000 frames a second, so a busy machine or a stall
+of the send process loses nothing until the ring is full. Each destination has its own queue
+(8,192 messages) and thread: a destination that is slow or down drops its own messages when its
+queue is full, counted, and the capture and the other destinations go on. The heartbeat
+(`/var/lib/goatrope/send/<name>.health`) and `status` give the frames captured, the frames the
+kernel dropped because the ring was full (`capture_dropped`), frames longer than a slot
+(`capture_truncated`), and per destination the messages sent, the ones that could not be sent
+and the ones dropped. An error is printed at most once every 10 s per destination (and for
+conversions), followed by a count of the ones held back.
+
 A `convert` converts with the goat-transformers engine linked into goatrope
 ([ADR 0006](docs/adr/0006-data-path.md)), the only converter: the send process loads the two
 packs and the model modules they use once, at start, and converts each message in process.
@@ -370,6 +382,11 @@ the host's kernel. No hardware is involved. They cover:
   install;
 - decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, and a
   file destination cut at `max_mb`;
+- `send-capture`: at 2,000 messages a second, every message offered is converted and sent with the
+  send process stopped for 2 s, with one busy process on every processor, and confined to one
+  processor with 8 busy processes there (none dropped by the ring); a TCP destination that never
+  reads does not slow a UDP destination beside it (20,000 of 20,000), its own messages are dropped
+  and counted, it writes at most a few journal lines, and `status` shows the drops;
 - `fragments`: a 1,400-byte datagram relayed and a 1,514-byte frame mirrored whole over a
   1,420-byte tunnel; after an overload of them, unfragmented datagrams and small frames still
   cross, `relay.health` counts the reassembly failures, and fragmented traffic crosses again

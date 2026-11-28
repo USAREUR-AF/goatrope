@@ -18,6 +18,7 @@ files = 20
 name = "feed-a"
 port = "enxPORTA"
 match = { protocol = "udp", src = "192.0.2.10", dst_port = 5000 }
+# capture_mb = 16                  # optional: the capture ring, MiB (16 MiB: 8,192 frames, about 4 s at 2,000 a second)
 to = [
   "udp://198.51.100.20:5000",
   { url = "tcp://198.51.100.21:5001", framing = "len32be" },
