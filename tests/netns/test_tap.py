@@ -2953,6 +2953,136 @@ def phase_proxy() -> None:
 
 PHASES["proxy"] = phase_proxy
 
+
+# ---------------------------------------------------------------- the link reaches only the relay's rules (#39)
+
+FILTER_RULE = '  { direction = "link-to-remote", protocol = "udp", remote = "10.99.0.2", listen_port = 7400, remote_port = 7100, sources = ["192.0.2.2"] },\n]'
+FILTER = PROXY.replace(PROXY_RULES, PROXY_RULES[:-1] + FILTER_RULE, 1)
+# a service of the relay machine's own, listening on every address, as SSH does
+OWN_SERVICES = """
+import socket, threading
+t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind(("0.0.0.0", 2222)); t.listen(16)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("0.0.0.0", 5353))
+def udp():
+    while True:
+        d, a = u.recvfrom(2048); u.sendto(b"own-" + d, a)
+threading.Thread(target=udp, daemon=True).start()
+while True:
+    c, _ = t.accept(); c.sendall(b"own-service\\n"); c.close()
+"""
+LINK_PROBE = """
+import socket, sys
+kind, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    if kind == "tcp":
+        s = socket.create_connection((dst, port), timeout=2); print(s.recv(64).decode().strip() or "connected")
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b"x", (dst, port)); print(s.recv(64).decode())
+except (OSError, socket.timeout) as e:
+    print("no answer:", type(e).__name__)
+"""
+
+
+def from_link(kind: str, dst: str, port: int) -> str:
+    return sh(f"ip netns exec linkhost python3 -c '{LINK_PROBE}' {kind} {dst} {port}", check=False).stdout.strip()
+
+
+def filter_drops() -> tuple[int, int]:
+    p = sh("nft -j list table inet goatrope_relay", check=False)
+    if p.returncode:
+        return (-1, -1)
+    c = {o["counter"]["name"]: o["counter"]["packets"] for o in json.loads(p.stdout)["nftables"] if "counter" in o}
+    return (c.get("link_dropped", 0), c.get("elsewhere_dropped", 0))
+
+
+def arp_answer(target: str) -> bool:
+    return sh(f"ip netns exec linkhost arping -c 2 -w 3 -I l0 {target}", check=False).returncode == 0
+
+
+def phase_relay_filter() -> None:
+    """#39: from the link, the relay machine admits only replies and its rules' ports."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    sh("nft delete table inet goatrope_relay", check=False)
+    topo_relay()
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    tap_pub = subprocess.run(["wg", "pubkey"], input=open(f"{WORK}/tap.key").read(), capture_output=True, text=True).stdout.strip()
+    sh(f"ip netns exec remote wg set wga peer {tap_pub} persistent-keepalive 5")
+    prior = {k: open(f"/proc/sys/net/ipv4/conf/r0/{k}").read().strip() for k in ("arp_ignore", "arp_announce")}
+    if os.path.exists(f"{WORK}/proxy_tool.py"):
+        os.remove(f"{WORK}/proxy_tool.py")
+    own = subprocess.Popen([sys.executable, "-c", OWN_SERVICES])
+    servers = [proxy_tool("remote", "serve-remote", bg=True)]
+    time.sleep(1)
+    before_tcp = from_link("tcp", "192.0.2.50", 2222)
+    before_arp = arp_answer("198.51.100.1")
+    result(before_tcp == "own-service" and before_arp,
+           "filter: without it, the link reaches a service of the relay machine and resolves its other addresses",
+           f"tcp 2222: {before_tcp}; ARP for 198.51.100.1 answered: {before_arp}")
+
+    write_cfg(FILTER)
+    before = snapshot()
+    p = gr("install", "--config", CFG)
+    wait_unit("active")
+    held = wait_for(proxy_held, 40)
+    result(p.returncode in (0, 3) and held is not None, "filter: install of a relay with a proxy address and a link-to-remote rule",
+           f"exit {p.returncode}, proxy held after {held} s")
+    time.sleep(2.5)
+    check_exit(0, "filter: installed")
+    arp = {k: open(f"/proc/sys/net/ipv4/conf/r0/{k}").read().strip() for k in ("arp_ignore", "arp_announce")}
+    result(arp == {"arp_ignore": "1", "arp_announce": "2"}, "filter: arp_ignore 1 and arp_announce 2 on the link interface", str(arp))
+    d0 = filter_drops()
+    blocked = {f"tcp {a}:2222": from_link("tcp", a, 2222) for a in ("192.0.2.50", PROXY_IP)}
+    blocked.update({f"udp {a}:5353": from_link("udp", a, 5353) for a in ("192.0.2.50", PROXY_IP)})
+    result(all(v.startswith("no answer") for v in blocked.values()),
+           "filter: the relay machine's own TCP and UDP services do not answer the link, at its link address or a proxy address",
+           "; ".join(f"{k}: {v}" for k, v in blocked.items()))
+    d1 = filter_drops()
+    result(d1[0] >= d0[0] + 4, "filter: each attempt is dropped and counted", f"link_dropped {d0[0]} -> {d1[0]}")
+    result(not arp_answer("198.51.100.1"), "filter: the link no longer resolves the machine's other addresses (arp_ignore)")
+    n = relay_through(10, "fl")
+    l2r_own = proxy_tool("linkhost", "udp", "192.0.2.50", "7400", "5", "own")
+    l2r_proxy = proxy_tool("linkhost", "udp", PROXY_IP, "7100", "5", "px")
+    result(n == 10 and l2r_own == 5 and l2r_proxy == 5,
+           "filter: the declared rules still pass: remote to link, and link to remote at the relay's address and at a proxy address",
+           f"{n} of 10, {l2r_own} of 5, {l2r_proxy} of 5")
+    # from another network: a route to the link address over the underlay, not through the link interface
+    sh("ip -n remote route add 192.0.2.50/32 via 198.51.100.1", check=False)
+    e0 = filter_drops()[1]
+    sh("ip netns exec remote python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);"
+       "[s.sendto(b'x',('192.0.2.50',5353)) for i in range(5)]\"", check=False)
+    time.sleep(0.5)
+    e1 = filter_drops()[1]
+    result(e1 >= e0 + 5, "filter: the link address does not answer from another interface either, counted", f"elsewhere_dropped {e0} -> {e1}")
+    sh("ip -n remote route del 192.0.2.50/32", check=False)
+    p = gr("status", "--config", CFG)
+    line = next((ln.strip() for ln in p.stdout.splitlines() if ln.strip().startswith("filter")), "")
+    result("dropped from the link" in line, "filter: status shows the filter and its counters", line[:200])
+
+    restarts = int(unit_props().get("NRestarts", "0"))
+    sh("nft flush chain inet goatrope_relay link")
+    p = gr("check", "--config", CFG)
+    diffs = [ln for ln in p.stdout.splitlines() if "DIFF" in ln]
+    result(p.returncode == 3 and any("relay-link-filter" in ln for ln in diffs), "filter: a changed table: check exits 3", "; ".join(diffs)[:200])
+    back = wait_for(lambda: int(unit_props().get("NRestarts", "0")) > restarts and gr("check", "--config", CFG).returncode == 0, 60)
+    result(back is not None and from_link("tcp", "192.0.2.50", 2222).startswith("no answer"),
+           "filter: the relay stops, is restarted and puts the table back; check 0", f"after {back} s")
+
+    p = gr("uninstall", "--purge")
+    left = diff(before, snapshot())
+    arp = {k: open(f"/proc/sys/net/ipv4/conf/r0/{k}").read().strip() for k in ("arp_ignore", "arp_announce")}
+    table = sh("nft list table inet goatrope_relay", check=False).returncode == 0
+    result(p.returncode == 0 and not left and not table and arp == prior,
+           "filter: uninstall removes the table and the sysctl file and puts the ARP settings back",
+           f"table left: {table}; arp {arp} (before {prior}); {'; '.join(left)[:200]}")
+    own.kill()
+    for s in servers:
+        s.kill()
+
+
+PHASES["relay-filter"] = phase_relay_filter
+
 TC_OBJ = os.path.join(SRC, "tests", "netns", "build", "relay_tc.o")  # run.sh compiles relay_tc.c when clang is there
 
 
@@ -3348,7 +3478,10 @@ def phase_l2() -> None:
     unit = open("/etc/systemd/system/goatrope-relay.service").read() if os.path.exists("/etc/systemd/system/goatrope-relay.service") else ""
     result("ExecStopPost=/usr/local/sbin/goatrope l2 down" in unit, "l2: the unit closes the lane however the relay stops (ExecStopPost)")
     b_log = open(f"{WORK}/relay-b.log", "w")
-    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    # end B is another machine: its relay.health is its own (ip netns exec gives it a mount namespace)
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB", "sh", "-c",
+                                "mount -t tmpfs tmpfs /var/lib/goatrope && exec \"$0\" relay --config \"$1\"", GR[0], CFG_B],
+                               stdout=b_log, stderr=subprocess.STDOUT)
     waited = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
     result(waited is not None, "l2: both lane ends come up once the WireGuard peers handshake",
            f"after {waited:.1f} s" if waited is not None else open(f"{WORK}/relay-b.log").read()[-300:])
@@ -3639,7 +3772,9 @@ def phase_relay_recreate_l2() -> None:
     write_cfg(L2_A)
     p = gr("install", "--config", CFG)
     b_log = open(f"{WORK}/relay-b-recreate.log", "w")
-    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB"] + GR + ["relay", "--config", CFG_B], stdout=b_log, stderr=subprocess.STDOUT)
+    relay_b = subprocess.Popen(["ip", "netns", "exec", "endB", "sh", "-c",
+                                "mount -t tmpfs tmpfs /var/lib/goatrope && exec \"$0\" relay --config \"$1\"", GR[0], CFG_B],
+                               stdout=b_log, stderr=subprocess.STDOUT)
     up = l2_wait(lambda: l2_up("l2g-lane0") and l2_up("l2g-lane0", "endB"), 60)
     n = l2_ping("hostA", "192.0.2.2", 5)
     result(p.returncode == 0 and up is not None and n == 5, "relay recreate l2: the lane is up and carries frames", f"{n} of 5 pings")

@@ -826,9 +826,20 @@ pub fn install(cfg: &Config) -> R<()> {
     }
     // a lane the previous declaration had and this one does not is removed
     crate::l2::remove(&state["relay"]["l2"], &crate::l2::bridges(cfg));
-    // uninstall removes a boundary interface the relay made, and the layer-2 lanes
+    // the link interface's ARP settings before goatrope changed them, kept across installs; restored
+    // at uninstall (and when another link interface is declared)
+    let old_li = s(&state["relay"], "link_interface").map(String::from);
+    let mut arp_prior = state["relay"]["arp_prior"].clone();
+    if old_li.as_deref() != cfg.relay.as_ref().map(|r| r.link_interface.as_str()) {
+        if old_li.is_some() {
+            crate::relay_filter::remove(old_li.as_deref(), &arp_prior);
+        }
+        arp_prior = cfg.relay.as_ref().map(crate::relay_filter::arp_now).unwrap_or(Value::Null);
+    }
+    // uninstall removes a boundary interface the relay made, the layer-2 lanes and the link filter
     state["relay"] = match &cfg.relay {
-        Some(r) => json!({"transport": r.transport, "remote_interface": r.remote_interface, "l2": crate::l2::state(cfg)}),
+        Some(r) => json!({"transport": r.transport, "remote_interface": r.remote_interface, "l2": crate::l2::state(cfg),
+                          "link_interface": r.link_interface, "arp_prior": arp_prior}),
         None => Value::Null,
     };
     let stale: Vec<String> = state["files"]
@@ -891,6 +902,7 @@ pub fn install(cfg: &Config) -> R<()> {
         install_tap(cfg, tap, nm_present);
     }
     if cfg.relay.is_some() {
+        su::run(&["sysctl", "-q", "-p", crate::relay_filter::SYSCTL]);
         su::systemctl(&["enable", crate::relay::UNIT]);
         su::systemctl(&["restart", crate::relay::UNIT]);
         crate::relay::settle(cfg, 5.0);
@@ -965,6 +977,9 @@ pub fn uninstall(purge: bool) -> R<()> {
         }
     }
     crate::l2::remove(&state["relay"]["l2"], &[]);
+    if state["relay"].is_object() {
+        crate::relay_filter::remove(s(&state["relay"], "link_interface"), &state["relay"]["arp_prior"]);
+    }
     remove(crate::relay::HEALTH);
     if su::nm_active() {
         su::run(&["nmcli", "general", "reload", "conf"]);

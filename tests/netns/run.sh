@@ -115,7 +115,7 @@ for v in "${versions[@]}"; do
 
     start "$c" "$v"
     engine_packs "$c"
-    phase "$c" "$log" listen uninstall send linked-engine components relay boundary uninstall relay-service relay-recreate relay-tcp units erspan proxy fragments l2 relay-recreate-l2
+    phase "$c" "$log" listen uninstall send linked-engine components relay boundary uninstall relay-service relay-recreate relay-tcp units erspan proxy relay-filter fragments l2 relay-recreate-l2
     docker exec "$c" cat /root/gt/results.jsonl >> "$out/ubuntu-$v.results.jsonl" 2>/dev/null || true
     docker rm -f "$c" >/dev/null
 

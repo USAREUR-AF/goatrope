@@ -225,6 +225,26 @@ watchdog setting. With a `[tap]` too, it installs both.
 |---|---|
 | `goatrope-relay.service` is installed as rendered, enabled and active | `file:`, `enabled:` and `unit:` items |
 | the relay is running, not hung: it rewrites `/var/lib/goatrope/relay.health` every 2 s | `relay-health`: written in the last 10 s |
+| from the link, the machine admits only replies and the rules' ports (below) | `relay-link-filter`: the nft table is the one the relay installed from this declaration |
+| the link interface answers ARP only for its own addresses | `relay-arp:<if>:arp_ignore` 1 and `relay-arp:<if>:arp_announce` 2 |
+
+The link is not authenticated, so the relay admits from it only what its rules name. At start it
+installs an nftables table of its own, `inet goatrope_relay`, on the input hook:
+
+| Arriving | Admitted | Everything else |
+|---|---|---|
+| on `link_interface` | replies to flows the machine started (conntrack established or related); each `link-to-remote` rule's protocol and `listen_port` at the address it listens on (the relay's link address, or its proxy address); IPv6 neighbor discovery when the link address is IPv6 | dropped and counted (`link_dropped`): SSH and every other service of the machine do not answer the link, at the link address or at a proxy address |
+| on any other interface but loopback, addressed to the link or proxy addresses | nothing | dropped and counted (`elsewhere_dropped`) |
+
+`net.ipv4.conf.<link_interface>.arp_ignore = 1` and `arp_announce = 2` keep the link from
+resolving the machine's other addresses and keep those addresses out of the ARP requests the
+machine sends on the link. `goatrope install` writes them to `/etc/sysctl.d/91-goatrope-relay.conf`;
+the relay in the foreground sets them itself, and refuses to start when it cannot. Every 2 s the
+relay compares the table with the one it installed; a change stops it (exit 1), and the restart
+puts the table back. The table stays while the relay is stopped, so a stopped relay still admits
+nothing new; `uninstall` removes it and restores the ARP settings. `status` prints both counters.
+The relay needs `nft` (package `nftables`). The link address must be static: a DHCP lease on
+`link_interface` would not be renewed.
 
 The unit has `Restart=on-failure`, so a relay that stops (for example because IP forwarding
 was turned on while it ran, exit 1) is started again. A refusal (exit 2: IPv6 or IP forwarding
@@ -395,6 +415,11 @@ the host's kernel. No hardware is involved. They cover:
   install takes the ports from it at once and leaves the management port alone,
   and uninstall gives them back;
 - the relay (ADR 0002): default deny, refusals, IP forwarding, send errors;
+- `relay-filter` (#39): the relay machine's own TCP and UDP services do not answer the link at its
+  link address or a proxy address, each attempt counted; the link no longer resolves the machine's
+  other addresses; the declared rules still pass both ways; the link address does not answer from
+  another interface; a changed table makes check exit 3 and the restarted relay puts it back;
+  uninstall removes the table and restores the ARP settings;
 - `relay-service` (ADR 0004 module 1): install of a relay-only declaration writes and starts the
   unit and writes no tap file; check exits 0 while it runs, 3 when it is stopped and 3 when it is
   hung (relay.health older than 10 s); a failure is restarted and a refusal is not; uninstall

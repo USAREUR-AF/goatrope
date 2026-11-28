@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- relay: from the link, the relay machine admits only replies and the `link-to-remote` rules'
+  ports at its link and proxy addresses; everything else to the machine is dropped and counted,
+  and nothing addressed to those addresses is admitted from another interface (an nftables table
+  `inet goatrope_relay`). `arp_ignore = 1` and `arp_announce = 2` on the link interface. `check`
+  (`relay-link-filter`, `relay-arp:*`), `status` and `uninstall` cover them. Fixes #39. Namespace
+  phase `relay-filter`.
 - decode-and-send runs as a dynamic user of its own (`goatrope-send`), not root, with
   `CAP_NET_RAW` only and a hardened unit (read-only system, no access to root-only files, a system
   call filter, restricted address families). File destinations must be under
