@@ -14,6 +14,8 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -484,70 +486,6 @@ impl Sink {
 
 // ---------------------------------------------------------------- the forwarder
 
-const ETH_P_ALL: u16 = 0x0003;
-
-/// An AF_PACKET socket on one port, receive only, with a one-second receive timeout.
-struct PacketSocket(libc::c_int);
-
-impl PacketSocket {
-    fn open(ifname: &str) -> Result<PacketSocket, String> {
-        // SAFETY: plain socket(2) call; the descriptor is owned by PacketSocket and closed on drop.
-        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (ETH_P_ALL.to_be()) as libc::c_int) };
-        if fd < 0 {
-            return Err(strerror(&std::io::Error::last_os_error()));
-        }
-        let s = PacketSocket(fd);
-        let name = std::ffi::CString::new(ifname).map_err(|_| "bad interface name".to_string())?;
-        // SAFETY: name is a valid NUL-terminated string.
-        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        if index == 0 {
-            return Err(format!("no interface {ifname}"));
-        }
-        // SAFETY: sockaddr_ll is plain data; zeroed is a valid starting value.
-        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-        sll.sll_family = libc::AF_PACKET as u16;
-        sll.sll_protocol = ETH_P_ALL.to_be();
-        sll.sll_ifindex = index as i32;
-        // SAFETY: sll is a fully initialised sockaddr_ll of the size passed.
-        let rc = unsafe {
-            libc::bind(fd, &sll as *const libc::sockaddr_ll as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_ll>() as u32)
-        };
-        if rc != 0 {
-            return Err(strerror(&std::io::Error::last_os_error()));
-        }
-        let tv = libc::timeval { tv_sec: 1, tv_usec: 0 };
-        // SAFETY: tv is a valid timeval of the size passed.
-        unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const libc::timeval as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            );
-        }
-        Ok(s)
-    }
-
-    /// One frame, or None on the timeout.
-    fn recv(&self, buf: &mut [u8]) -> Option<usize> {
-        // SAFETY: buf is a valid writable buffer of the length passed.
-        let n = unsafe { libc::recv(self.0, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n < 0 {
-            None
-        } else {
-            Some(n as usize)
-        }
-    }
-}
-
-impl Drop for PacketSocket {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor is owned by this value.
-        unsafe { libc::close(self.0) };
-    }
-}
-
 fn write_heartbeat(path: &str, matched: u64, sent: u64, errors: u64, now: f64, extra: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
     fs::write(&tmp, format!("{{\"matched\": {matched}, \"sent\": {sent}, \"errors\": {errors}, \"time\": {}{extra}}}", py_float(now)))?;
@@ -582,86 +520,214 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
     }
     let mut taken: BTreeSet<String> = cfg.tap_ports().into_iter().collect();
     taken.insert("goatrope0".into());
-    let mut sinks: Vec<Sink> = s.to.iter().map(|d| Sink::new(d.clone(), taken.clone())).collect();
-    let sock = match PacketSocket::open(&s.port) {
-        Ok(sock) => sock,
+    // each destination has its own queue and thread: a slow one drops its own messages, counted,
+    // and neither stalls the capture nor the other destinations
+    let dests: Vec<Dest> = s.to.iter().map(|d| Dest::start(Sink::new(d.clone(), taken.clone()), name)).collect();
+    let mut cap = match crate::capture::Capture::open(&s.port, s.capture_mb) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("goatrope send {name}: {}: {e}", s.port);
             return 1;
         }
     };
     let mut frags = Fragments::new();
-    let (mut matched, mut sent, mut errors) = (0u64, 0u64, 0u64);
+    let (mut matched, mut convert_errors) = (0u64, 0u64);
+    let mut convert_log = Throttle::default();
     let health = format!("/var/lib/goatrope/send/{name}.health");
     let _ = fs::create_dir_all("/var/lib/goatrope/send");
     let mut last_hb = 0.0f64;
     let urls: Vec<&str> = s.to.iter().map(|d| d.url.as_str()).collect();
-    println!("goatrope send {name}: {} udp {} -> {}", s.port, s.matcher, urls.join(", "));
+    println!(
+        "goatrope send {name}: {} udp {} -> {}; capture ring {} MiB ({} frames), {QUEUE} messages queued per destination at most",
+        s.port,
+        s.matcher,
+        urls.join(", "),
+        s.capture_mb,
+        cap.slots()
+    );
     let _ = std::io::stdout().flush();
-    let mut buf = vec![0u8; 65535];
     let mut timings = crate::engine::Timings::default();
     loop {
         let now = now_f64();
         if now - last_hb >= 2.0 {
             last_hb = now;
-            let extra = match &converter {
-                Some(l) => format!(
+            cap.read_stats();
+            let sent: u64 = dests.iter().map(|d| d.stats.sent.load(Ordering::Relaxed)).sum();
+            let errors: u64 = convert_errors + dests.iter().map(|d| d.stats.errors.load(Ordering::Relaxed)).sum::<u64>();
+            let rows: Vec<String> = dests.iter().map(|d| d.json()).collect();
+            let mut extra = format!(
+                ", \"capture_packets\": {}, \"capture_dropped\": {}, \"capture_truncated\": {}, \"convert_errors\": {convert_errors}, \"destinations\": [{}]",
+                cap.packets,
+                cap.dropped,
+                cap.truncated,
+                rows.join(", ")
+            );
+            if let Some(l) = &converter {
+                extra.push_str(&format!(
                     ", \"convert\": {}, \"load\": {{\"seconds\": {:.4}, \"files\": {}, \"rss_kib\": {}, \"peak_rss_kib\": {}}}",
                     timings.json(),
                     l.load_s,
                     l.files,
                     l.rss_kib,
                     l.peak_rss_kib
-                ),
-                None => String::new(),
-            };
+                ));
+            }
             // a full disk: keep forwarding; check reports the stale heartbeat
             if let Err(e) = write_heartbeat(&health, matched, sent, errors, now, &extra) {
                 println!("heartbeat: {}", strerror(&e));
             }
+            if let Some(line) = convert_log.flush() {
+                println!("convert failed: {line}");
+            }
+            for d in &dests {
+                d.flush_log();
+            }
+            let _ = std::io::stdout().flush();
         }
-        let Some(n) = sock.recv(&mut buf) else {
-            continue;
-        };
-        // In inline mode a bridge port also shows each frame it transmits (pkttype OUTGOING);
-        // that is the other direction of the link, so it is kept.
-        let Some(d) = parse(&buf[..n], &mut frags, Some(&s.matcher)) else {
-            continue;
-        };
-        if !matches(&s.matcher, &d) {
-            continue;
-        }
-        matched += 1;
-        let meta =
-            Meta { feed: name.to_string(), time: round6(now), src: d.src.clone(), dst: d.dst.clone(), sport: d.sport, dport: d.dport };
-        let converted = converter.as_ref().map(|conv| {
-            let t = Instant::now();
-            let r = conv.convert(&d.payload);
-            timings.record(t.elapsed().as_nanos() as u64);
-            r
-        });
-        let out = match converted {
-            Some(r) => match r {
-                Ok(o) => o,
-                Err(e) => {
-                    errors += 1;
-                    println!("convert failed: {e}");
-                    let _ = std::io::stdout().flush();
-                    continue;
+        cap.next_frames(1000, |frame| {
+            // In inline mode a bridge port also shows each frame it transmits (pkttype OUTGOING);
+            // that is the other direction of the link, so it is kept.
+            let Some(d) = parse(frame, &mut frags, Some(&s.matcher)) else {
+                return;
+            };
+            if !matches(&s.matcher, &d) {
+                return;
+            }
+            matched += 1;
+            let meta = Meta {
+                feed: name.to_string(),
+                time: round6(now_f64()),
+                src: d.src.clone(),
+                dst: d.dst.clone(),
+                sport: d.sport,
+                dport: d.dport,
+            };
+            let out = match converter.as_ref() {
+                Some(conv) => {
+                    let t = Instant::now();
+                    let r = conv.convert(&d.payload);
+                    timings.record(t.elapsed().as_nanos() as u64);
+                    match r {
+                        Ok(o) => o,
+                        Err(e) => {
+                            convert_errors += 1;
+                            convert_log.note(&e);
+                            return;
+                        }
+                    }
                 }
-            },
-            None => d.payload.clone(),
-        };
-        for sink in sinks.iter_mut() {
-            match sink.send(&out, &meta) {
-                Ok(()) => sent += 1,
-                Err(e) => {
-                    errors += 1;
-                    println!("{}: {e}", sink.d.url);
-                    let _ = std::io::stdout().flush();
+                None => d.payload,
+            };
+            let msg = std::sync::Arc::new((out, meta));
+            for dest in &dests {
+                dest.offer(&msg);
+            }
+        });
+    }
+}
+
+/// Messages queued for one destination at most; a full queue drops the newest, counted.
+pub const QUEUE: usize = 8192;
+
+/// One error line per destination (or for conversions) every 10 s at most, with the count of
+/// those not printed.
+#[derive(Default)]
+struct Throttle {
+    last: Option<Instant>,
+    held: u64,
+    first: Option<String>,
+}
+
+impl Throttle {
+    /// An error happened: print it now if the last line is 10 s old, else count it.
+    fn note(&mut self, e: &str) {
+        if self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+            println!("{e}");
+            let _ = std::io::stdout().flush();
+            self.last = Some(Instant::now());
+        } else {
+            self.held += 1;
+            self.first.get_or_insert_with(|| e.to_string());
+        }
+    }
+    /// The line for the errors held back, once 10 s have passed.
+    fn flush(&mut self) -> Option<String> {
+        if self.held == 0 || self.last.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+            return None;
+        }
+        let line = format!("{} more like: {}", self.held, self.first.take().unwrap_or_default());
+        self.held = 0;
+        self.last = Some(Instant::now());
+        Some(line)
+    }
+}
+
+#[derive(Default)]
+struct DestStats {
+    sent: AtomicU64,
+    errors: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// A destination with its own bounded queue and thread.
+struct Dest {
+    url: String,
+    tx: SyncSender<std::sync::Arc<(Vec<u8>, Meta)>>,
+    stats: std::sync::Arc<DestStats>,
+    log: std::sync::Arc<std::sync::Mutex<Throttle>>,
+}
+
+impl Dest {
+    fn start(mut sink: Sink, feed: &str) -> Dest {
+        let (tx, rx) = sync_channel::<std::sync::Arc<(Vec<u8>, Meta)>>(QUEUE);
+        let stats = std::sync::Arc::new(DestStats::default());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Throttle::default()));
+        let url = sink.d.url.clone();
+        let (st, lg, u) = (stats.clone(), log.clone(), url.clone());
+        let _ = std::thread::Builder::new().name(format!("send-{feed}")).spawn(move || {
+            for m in rx {
+                match sink.send(&m.0, &m.1) {
+                    Ok(()) => {
+                        st.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        st.errors.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut l) = lg.lock() {
+                            l.note(&format!("{u}: {e}"));
+                        }
+                    }
                 }
             }
+        });
+        Dest { url, tx, stats, log }
+    }
+
+    /// Queue a message; when the queue is full, drop it and count it.
+    fn offer(&self, m: &std::sync::Arc<(Vec<u8>, Meta)>) {
+        if self.tx.try_send(m.clone()).is_err() {
+            self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut l) = self.log.lock() {
+                l.note(&format!("{}: its queue is full ({QUEUE} messages); dropping", self.url));
+            }
         }
+    }
+
+    fn flush_log(&self) {
+        if let Ok(mut l) = self.log.lock() {
+            if let Some(line) = l.flush() {
+                println!("{line}");
+            }
+        }
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"url\": {}, \"sent\": {}, \"errors\": {}, \"dropped\": {}}}",
+            json_str(&self.url),
+            self.stats.sent.load(Ordering::Relaxed),
+            self.stats.errors.load(Ordering::Relaxed),
+            self.stats.dropped.load(Ordering::Relaxed)
+        )
     }
 }
 
@@ -859,6 +925,22 @@ pub fn status(cfg: &Config) {
             n("errors"),
             urls.join(", ")
         );
+        println!(
+            "         capture: {} frame(s) in the {} MiB ring, {} dropped by the kernel (ring full)",
+            n("capture_packets"),
+            s.capture_mb,
+            n("capture_dropped")
+        );
+        for d in hb.get("destinations").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+            let k = |x: &str| d.get(x).and_then(|v| v.as_u64()).unwrap_or(0);
+            println!(
+                "         {}: {} sent, {} could not be sent, {} dropped (queue full)",
+                d.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                k("sent"),
+                k("errors"),
+                k("dropped")
+            );
+        }
         if let (Some(c), Some(l)) = (hb.get("convert"), hb.get("load")) {
             let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
             println!(
@@ -886,6 +968,20 @@ pub fn status(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttle_holds_errors_for_10_s() {
+        let mut t = Throttle::default();
+        t.note("first");
+        for _ in 0..1000 {
+            t.note("again");
+        }
+        assert_eq!(t.held, 1000);
+        assert!(t.flush().is_none(), "within 10 s nothing more is printed");
+        t.last = Some(Instant::now() - Duration::from_secs(11));
+        assert_eq!(t.flush().as_deref(), Some("1000 more like: again"));
+        assert_eq!(t.held, 0);
+    }
 
     #[test]
     fn reassembly_is_bounded() {

@@ -2440,15 +2440,96 @@ def bench_pipe(pipe: str, packs: str, D: float) -> None:
            "trial_seconds": D / 4})
 
 
+class CpuLoad:
+    """Busy processes at normal priority: one per processor, or `n` on processor `cpu` (where the send process
+    is then confined), the load a shared or busy machine puts on the send process."""
+
+    def __init__(self, n: int | None = None, cpu: int | None = None):
+        pre = ["taskset", "-c", str(cpu)] if cpu is not None else []
+        self.ps = [subprocess.Popen(pre + [sys.executable, "-c", "while True: pass"]) for _ in range(n or os.cpu_count() or 2)]
+
+    def stop(self) -> None:
+        for p in self.ps:
+            p.kill()
+        for p in self.ps:
+            p.wait()
+
+
+def send_under_load(name: str, rate: float, n: int, load: str, extra_to: str = "") -> dict:
+    """A [[send]] with the linked engine on tp0, n Remote ID messages at rate, with or without CPU load: where each one went."""
+    epacks = engine_packs()
+    version, digest = packs_digest(epacks)
+    topo_listen()
+    write_cfg(LISTEN + f"""
+[[send]]
+name = "{name}"
+port = "tp0"
+match = {{ protocol = "udp", dst_port = 5000 }}
+convert = {{ component = "goat-transformers", version = "{version}", from = "remote-id", to = "cot-xml", packs = "{epacks}", packs_sha256 = "{digest}" }}
+to = ["udp://127.0.0.1:9230"{extra_to}]
+""")
+    stand_in_watchdog()
+    p = gr("install", "--config", CFG)
+    if p.returncode != 0:
+        raise RuntimeError(f"install: {(p.stdout + p.stderr)[-300:]}")
+    for _ in range(40):
+        if "loaded" in sh(f"journalctl -u goatrope-send@{name}.service --no-pager", check=False).stdout:
+            break
+        time.sleep(0.5)
+    rx0 = int(open("/sys/class/net/tp0/statistics/rx_packets").read())
+    sink = SinkArgs("", "127.0.0.1", 9230, n / rate, 0, 3, n / rate + 15)
+    if load == "one processor":
+        sh(f"systemctl set-property --runtime goatrope-send@{name}.service AllowedCPUs=0")
+    cpu = CpuLoad() if load == "every processor" else CpuLoad(8, 0) if load == "one processor" else None
+    stopper = None
+    if load == "stopped 2 s":
+        # the send process stopped for 2 s in the middle of the feed, as a long stall would
+        pid = sh(f"systemctl show -p MainPID --value goatrope-send@{name}.service").stdout.strip()
+        stopper = subprocess.Popen(["sh", "-c", f"sleep {n / rate / 3}; kill -STOP {pid}; sleep 2; kill -CONT {pid}"])
+    try:
+        g = gen("feed", "raw-send", "f0", 0, rate, n / rate, next_run(), 5000, REMOTE_ID)
+    finally:
+        if cpu:
+            cpu.stop()
+        if stopper:
+            stopper.wait()
+    got = sink.result()["received"]
+    time.sleep(2.5)
+    hb = json.load(open(f"/var/lib/goatrope/send/{name}.health"))
+    rx = int(open("/sys/class/net/tp0/statistics/rx_packets").read()) - rx0
+    gr("uninstall", "--config", CFG)
+    return {"sent": g["sent"], "tp0_rx": rx, "matched": hb.get("matched"), "arrived": got, "heartbeat": hb}
+
+
+def bench_capture_load() -> None:
+    """decode-and-send at 2,000 messages a second, idle and under CPU load: generator, port, send process, destination."""
+    if not engine_packs():
+        bench("decode-and-send under CPU load: not measured", "no packs", {})
+        return
+    for load in ("idle", "every processor", "one processor", "stopped 2 s"):
+        r = send_under_load("loadbench", 2000, 10000, load)
+        hb = r["heartbeat"]
+        shown = {"idle": "idle", "every processor": "one busy process on every processor",
+                 "one processor": "the send process confined to processor 0 with 8 busy processes there",
+                 "stopped 2 s": "the send process stopped (SIGSTOP) for 2 s in the middle"}[load]
+        bench(f"decode-and-send at 2,000/s, {shown}: {fmt(r['arrived'])} of {fmt(r['sent'])} reached the destination",
+              f"generator sent {fmt(r['sent'])}; tp0 received {fmt(r['tp0_rx'])}; the send process matched {r['matched']}; "
+              f"capture dropped {hb.get('capture_dropped', 'not reported')}; destination queue dropped "
+              f"{[d.get('dropped') for d in hb.get('destinations', [])] or 'not reported'}; {host_line()}",
+              {"path": "send-capture-load", "load": load, **{k: v for k, v in r.items() if k != "heartbeat"}, "heartbeat": hb})
+
+
 def phase_bench() -> None:
     """Data-path ceilings: relay UDP over real WireGuard, the remote mirror, decode-and-send with a converter."""
     print(f"# bench host: {host_line()}; {BENCH_SECONDS:g} s trials, {BENCH_STEPS} search steps", flush=True)
     bench_relay_udp()
     bench_mirror()
     bench_send_convert()
+    bench_capture_load()
 
 
 PHASES["bench"] = phase_bench
+PHASES["bench-capture"] = bench_capture_load
 
 
 # ---------------------------------------------------------------- address proxy (ADR 0004 module 4)
@@ -3028,17 +3109,23 @@ print(json.dumps(got))
     result(len(got) == 50 and all(g.startswith("<event") for g in got),
            "linked-engine: 50 of 50 Remote ID messages converted to Cursor-on-Target XML and sent", f"{len(got)} of 50; {got[0][:80] if got else ''}")
     # one conversion's time, apart from throughput: 10,000 messages at 2,000 a second, timed by the send process
-    gen("feed", "raw-send", "f0", 0, 2000, 5, 2, 5000, REMOTE_ID)
+    rx0 = int(open("/sys/class/net/tp0/statistics/rx_packets").read())
+    g = gen("feed", "raw-send", "f0", 0, 2000, 5, 2, 5000, REMOTE_ID)
     time.sleep(5)
+    rx = int(open("/sys/class/net/tp0/statistics/rx_packets").read()) - rx0
     hb = json.load(open("/var/lib/goatrope/send/linked.health"))
     cv, ld = hb.get("convert", {}), hb.get("load", {})
+    count = cv.get("count", 0) - 50
+    result(g["sent"] >= 9000 and count == g["sent"] and hb.get("capture_dropped", -1) == 0,
+           "linked-engine: every message offered at 2,000 a second (10,000 in 5 s) is converted",
+           f"generator sent {g['sent']}; tp0 received {rx}; the ring dropped {hb.get('capture_dropped')}; converted {count}")
     detail = (f"{cv.get('count')} conversions; p50 {cv.get('p50_us')} us, p99 {cv.get('p99_us')} us, max {cv.get('max_us')} us "
               f"(p50 and p99 over the last 16,384)")
     if os.uname().machine == "x86_64":
-        result(cv.get("count", 0) >= 10050 and cv.get("p99_us", 1e9) <= 1000,
-               "linked-engine: a Remote ID to Cursor-on-Target conversion takes 1 ms or less at p99, over 10,000 messages", detail)
+        result(cv.get("count", 0) >= 1000 and cv.get("p99_us", 1e9) <= 1000,
+               "linked-engine: a Remote ID to Cursor-on-Target conversion takes 1 ms or less at p99", detail)
     else:
-        result(None, "linked-engine: conversion time, over 10,000 messages (the 1 ms assertion is made on amd64)", detail)
+        result(None, "linked-engine: conversion time (the 1 ms assertion is made on amd64)", detail)
     result(None, "linked-engine: the one-time load of the named packs at start",
            f"{ld.get('files')} files in {ld.get('seconds')} s; resident {ld.get('rss_kib')} KiB after it, peak {ld.get('peak_rss_kib')} KiB")
     check_exit(0, "linked-engine: check after install (packs digest, heartbeat)")
@@ -3641,6 +3728,65 @@ def phase_relay_recreate_l2() -> None:
 
 
 PHASES["relay-recreate-l2"] = phase_relay_recreate_l2
+def phase_send_capture() -> None:
+    """decode-and-send keeps every frame through a stall and under CPU load (the capture ring), and one slow
+    destination drops its own messages, counted, while the others get every one (per-destination queues)."""
+    if not engine_packs():
+        result(None, "send-capture: not run (no packs: run.sh copies them from the pinned goat-transformers checkout)")
+        return
+    for load, what in (("stopped 2 s", "the send process stopped (SIGSTOP) for 2 s in the middle"),
+                       ("every processor", "one busy process on every processor"),
+                       ("one processor", "the send process confined to processor 0 with 8 busy processes there")):
+        r = send_under_load("cap", 2000, 10000, load)
+        hb = r["heartbeat"]
+        # the generator, also under the load, may offer a few fewer than 10,000: every one it offered must arrive
+        result(r["sent"] >= 9000 and r["arrived"] == r["sent"] == r["tp0_rx"] and hb.get("capture_dropped") == 0,
+               f"send-capture: at 2,000 a second, {what}: every message offered is converted and sent",
+               f"generator {r['sent']}; tp0 received {r['tp0_rx']}; matched {r['matched']}; ring dropped {hb.get('capture_dropped')}; "
+               f"arrived {r['arrived']}")
+    # a TCP destination that accepts and never reads, beside a UDP destination (no conversion, 1,400-byte payloads)
+    topo_listen()
+    write_cfg(LISTEN + """
+[[send]]
+name = "slow"
+port = "tp0"
+match = { protocol = "udp", dst_port = 5000 }
+to = ["udp://127.0.0.1:9240", { url = "tcp://127.0.0.1:9241", framing = "len32be" }]
+""")
+    stalled = subprocess.Popen([sys.executable, "-c", """
+import socket, time
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096); l.bind(("127.0.0.1", 9241)); l.listen(1)
+c, _ = l.accept(); time.sleep(120)
+"""])
+    stand_in_watchdog()
+    p = gr("install", "--config", CFG)
+    result(p.returncode == 0, "send-capture: install a send with a UDP and a TCP destination", f"exit {p.returncode}")
+    time.sleep(2)
+    sink = SinkArgs("", "127.0.0.1", 9240, 10, 0, 3, 25)
+    g = gen("feed", "raw-send", "f0", 1442, 2000, 10, next_run(), 5000)
+    got = sink.result()["received"]
+    time.sleep(2.5)
+    hb = json.load(open("/var/lib/goatrope/send/slow.health"))
+    dests = {d["url"]: d for d in hb.get("destinations", [])}
+    tcp = dests.get("tcp://127.0.0.1:9241", {})
+    jl = sh("journalctl -u goatrope-send@slow.service --no-pager -o cat", check=False).stdout
+    lines = [ln for ln in jl.splitlines() if "9241" in ln]
+    result(got == g["sent"] == 20000, "send-capture: a TCP destination that never reads does not slow the UDP destination",
+           f"UDP got {got} of {g['sent']}")
+    result(tcp.get("dropped", 0) > 0 and tcp.get("sent", 0) + tcp.get("dropped", 0) + tcp.get("errors", 0) <= 20000,
+           "send-capture: the slow destination's own messages are dropped when its queue is full, and counted",
+           json.dumps(tcp))
+    result(len(lines) <= 5, "send-capture: the slow destination writes at most a few journal lines",
+           f"{len(lines)} line(s): {lines[:2]}")
+    st = gr("status", "--config", CFG).stdout
+    result("dropped (queue full)" in st and "dropped by the kernel" in st, "send-capture: status shows the drops",
+           next((ln.strip() for ln in st.splitlines() if "9241" in ln), ""))
+    stalled.kill()
+    gr("uninstall", "--config", CFG)
+
+
+PHASES["send-capture"] = phase_send_capture
 
 
 if __name__ == "__main__":

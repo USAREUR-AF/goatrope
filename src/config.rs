@@ -131,7 +131,12 @@ pub struct Send {
     pub matcher: Match,
     pub convert: Option<Convert>,
     pub to: Vec<Destination>,
+    /// the capture ring, MiB (docs/adr/0006-data-path.md)
+    pub capture_mb: usize,
 }
+
+/// A `[[send]]`'s capture ring when it names none: at 2,000 frames a second of 1,500 bytes it holds about 5 s.
+pub const DEFAULT_CAPTURE_MB: i64 = 16;
 
 #[derive(Debug, Clone)]
 pub struct Decode {
@@ -798,7 +803,7 @@ fn opt_port(m: &Table, key: &str, where_: &str) -> R<Option<u16>> {
 fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
     let w0 = format!("[[send]] #{}", i + 1);
     let s = as_table(v, &w0)?;
-    keys(s, &w0, &["name", "port", "match", "convert", "to"], &["name", "port", "match", "to"])?;
+    keys(s, &w0, &["name", "port", "match", "convert", "to", "capture_mb"], &["name", "port", "match", "to"])?;
     let name = string(s, "name", &w0)?;
     if !is_name(&name) {
         return err(format!("{w0}.name is lowercase letters, digits and hyphens"));
@@ -859,7 +864,8 @@ fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
         _ => return err(format!("{w}.to must list at least one destination")),
     };
     let to = to.iter().enumerate().map(|(j, d)| destination(d, &format!("{w}.to[{j}]"))).collect::<R<Vec<_>>>()?;
-    Ok(Send { name, port, matcher, convert, to })
+    let capture_mb = if s.contains_key("capture_mb") { int(s, "capture_mb", &w, 1, 1024)? } else { DEFAULT_CAPTURE_MB } as usize;
+    Ok(Send { name, port, matcher, convert, to, capture_mb })
 }
 
 fn decode(v: &Value, i: usize, tap: Option<&Tap>) -> R<Decode> {

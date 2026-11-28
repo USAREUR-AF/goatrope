@@ -5,6 +5,7 @@
 //! Exit codes: 0 success or match; 2 refused or invalid declaration; 3 check differs; 1 error.
 
 mod boundary;
+mod capture;
 mod config;
 mod engine;
 mod l2;
