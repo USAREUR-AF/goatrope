@@ -272,8 +272,49 @@ pub fn link_settings(ifname: &str) -> LinkSettings {
 }
 
 pub fn egress_drop(ifname: &str) -> bool {
-    let p = run(&["tc", "filter", "show", "dev", ifname, "egress"]);
-    p.stdout.contains("matchall") && p.stdout.contains("gact action drop")
+    egress_drop_state(ifname).is_ok()
+}
+
+/// Whether every frame sent through the port's queue is dropped: the filter tc runs first on its
+/// egress hook (chain 0, the lowest pref) is a matchall on every protocol whose one action drops,
+/// and no other filter shares that pref. Filters after it are never reached and are allowed (#42).
+pub fn egress_drop_state(ifname: &str) -> Result<(), String> {
+    let p = run(&["tc", "-j", "filter", "show", "dev", ifname, "egress"]);
+    if p.code != 0 {
+        return Err(format!("tc cannot list the egress filters: {}", p.stderr.trim()));
+    }
+    let v: serde_json::Value = serde_json::from_str(p.stdout.trim()).unwrap_or(serde_json::Value::Array(vec![]));
+    egress_first_drops(&v)
+}
+
+/// The decision of egress_drop_state on `tc -j filter show ... egress` output.
+pub fn egress_first_drops(v: &serde_json::Value) -> Result<(), String> {
+    let filters: Vec<&serde_json::Value> =
+        v.as_array().into_iter().flatten().filter(|f| f.get("options").is_some() && f["chain"].as_u64().unwrap_or(0) == 0).collect();
+    let Some(first) = filters.iter().filter_map(|f| f["pref"].as_u64()).min() else {
+        return Err("no egress filter".into());
+    };
+    let at: Vec<&&serde_json::Value> = filters.iter().filter(|f| f["pref"].as_u64() == Some(first)).collect();
+    if at.len() != 1 {
+        return Err(format!("{} filters share the first pref {first}", at.len()));
+    }
+    let f = at[0];
+    let actions = f["options"]["actions"].as_array().cloned().unwrap_or_default();
+    let drops = f["kind"].as_str() == Some("matchall")
+        && f["protocol"].as_str() == Some("all")
+        && actions.len() == 1
+        && actions[0]["kind"].as_str() == Some("gact")
+        && actions[0]["control_action"]["type"].as_str() == Some("drop")
+        && actions[0]["prob"]["random_type"].as_str().is_none_or(|r| r == "none");
+    if drops {
+        Ok(())
+    } else {
+        Err(format!(
+            "the first egress filter (pref {first}, {} {}) does not drop every frame",
+            f["kind"].as_str().unwrap_or("?"),
+            f["protocol"].as_str().unwrap_or("?")
+        ))
+    }
 }
 
 pub fn systemctl(args: &[&str]) -> Out {
@@ -315,6 +356,29 @@ pub fn statvfs(path: &str) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn filters(v: &str) -> serde_json::Value {
+        serde_json::from_str(v).unwrap()
+    }
+
+    const DROP1: &str = r#"{"protocol":"all","pref":1,"kind":"matchall","chain":0,"options":{"handle":1,"actions":[{"order":1,"kind":"gact","control_action":{"type":"drop"},"prob":{"random_type":"none"}}]}}"#;
+
+    #[test]
+    fn egress_drop_is_judged_by_the_first_filter() {
+        assert!(egress_first_drops(&filters(&format!("[{DROP1}]"))).is_ok());
+        // a pass filter after the drop is never reached
+        let after = DROP1.replace("\"pref\":1", "\"pref\":5").replace("drop", "pass");
+        assert!(egress_first_drops(&filters(&format!("[{DROP1},{after}]"))).is_ok());
+        // a pass at pref 1 and the drop moved to pref 2: frames leave
+        let pass1 = DROP1.replace("drop", "pass");
+        let drop2 = DROP1.replace("\"pref\":1", "\"pref\":2");
+        assert!(egress_first_drops(&filters(&format!("[{pass1},{drop2}]"))).is_err());
+        // a drop of one protocol only
+        assert!(egress_first_drops(&filters(&format!("[{}]", DROP1.replace("\"protocol\":\"all\"", "\"protocol\":\"ip\"")))).is_err());
+        // a drop with a probability lets some frames through
+        assert!(egress_first_drops(&filters(&format!("[{}]", DROP1.replace("\"none\"", "\"netrand\"")))).is_err());
+        assert!(egress_first_drops(&filters("[]")).is_err());
+    }
 
     #[test]
     fn scopes() {

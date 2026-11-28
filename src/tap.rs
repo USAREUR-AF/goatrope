@@ -540,6 +540,8 @@ pub fn apply_ports(cfg: &Config, wait: f64) -> Vec<String> {
         if tap.mode == "listen" {
             if !su::egress_drop(p) {
                 su::run(&["tc", "qdisc", "replace", "dev", p, "clsact"]);
+                // whatever holds pref 1 goes: goatrope's drop is the first filter
+                su::run(&["tc", "filter", "del", "dev", p, "egress", "pref", "1"]);
                 su::run(&["tc", "filter", "add", "dev", p, "egress", "pref", "1", "handle", "1", "matchall", "action", "drop"]);
             }
             if !su::egress_drop(p) {
@@ -1288,13 +1290,16 @@ fn check_tap(cfg: &Config, tap: &Tap) -> Vec<Item> {
         let m = su::master(p);
         if tap.mode == "listen" {
             item(&mut items, format!("no-bridge:{p}"), Some(m.is_none()), "in no bridge", m.unwrap_or_else(|| "in no bridge".into()));
-            let drop = su::egress_drop(p);
+            let drop = su::egress_drop_state(p);
             item(
                 &mut items,
                 format!("egress-drop:{p}"),
-                Some(drop),
-                "every outgoing frame dropped",
-                if drop { "present" } else { "absent" },
+                Some(drop.is_ok()),
+                "every outgoing frame dropped (the first egress filter is a matchall drop)",
+                match drop {
+                    Ok(()) => "present".to_string(),
+                    Err(e) => e,
+                },
             );
             let na = su::is_noarp(p);
             item(&mut items, format!("noarp:{p}"), Some(na), "ARP off", if na { "ARP off" } else { "ARP on" });
