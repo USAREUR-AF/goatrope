@@ -52,8 +52,8 @@ goatrope, the only converter. In the second run the functional suite ran beside 
 | Relay UDP 64 B, datagrams/s, loss under 0.1 % | 135,612 / 157,750 | 97,260 / 111,552 | 21,509 / 54,388 |
 | Relay UDP 512 B | 90,224 / 169,228 | 99,537 / 102,024 | 44,931 / 53,756 |
 | Relay UDP 1,400 B (two fragments in the tunnel) | 69,202 / 129,292 | 66,502 / 36,265 | 31,807 / 6,007 |
-| Relay UDP 64 B in a tc program (prototype, not built) | 214,501 / 297,510 | 193,668 / 173,274 | |
-| Relay UDP 512 B in a tc program (prototype, not built) | 345,632 / 336,930 | 165,173 / 218,871 | |
+| Relay UDP 64 B in a tc program (the C prototype, before the kernel path was built) | 214,501 / 297,510 | 193,668 / 173,274 | |
+| Relay UDP 512 B in a tc program (the C prototype, before the kernel path was built) | 345,632 / 336,930 | 165,173 / 218,871 | |
 | WireGuard alone, 64 B | 323,619 / 344,808 | 285,482 / 137,851 | 283,022 / 364,853 |
 | WireGuard alone, 512 B | 321,755 / 343,431 | 257,005 / 295,927 | 262,743 / 329,822 |
 | WireGuard alone, 1,400 B | 138,335 / 151,392 | 60,387 / 91,677 | 60,870 / 116,969 |
@@ -80,6 +80,29 @@ Latency at 10,000 datagrams a second (run 1), relay path p50 / p99 against WireG
 3.0 ms; 1,400 B 511 µs / 21 ms against 428 µs / 3.6 ms; 26.04 64 B 320 µs / 3.0 ms against
 198 µs / 2.8 ms; 512 B 195 µs / 2.7 ms against 147 µs / 2.7 ms.
 
+### The relay's kernel path
+
+The relay with `kernel_path = true` (ADR 0006), and the same relay without it, in the same
+run. Load average 12 to 23.
+
+| Path | Ubuntu 24.04 | Ubuntu 26.04 |
+|---|---|---|
+| Relay UDP 64 B, user space, datagrams/s, loss under 0.1 % | 77,126 | 169,871 |
+| Relay UDP 64 B, kernel path | 355,614 | 290,137 |
+| Relay UDP 512 B, user space | 166,602 | 178,466 |
+| Relay UDP 512 B, kernel path | 333,509 | 307,289 |
+| Relay UDP 1,400 B, user space (fragments) | 136,849 | 116,317 |
+| Relay UDP 1,400 B, kernel path declared (fragments take the socket path) | 134,000 | 125,618 |
+| WireGuard alone, 64 B / 512 B / 1,400 B, kernel-path run | 340,567 / 339,744 / 156,933 | 351,840 / 384,690 / 125,768 |
+| Dropped at the relay's socket when offered all it can take, 64 B: user space / kernel path | 618,797 / 0 | 619,717 / 0 |
+| Decode-and-send, linked engine, messages/s / one conversion p50, p99, max | 37,895 / 18.2 µs, 32.9 µs, 1,406 µs | 34,894 / 26.6 µs, 44.4 µs, 1,200 µs |
+
+The kernel path carries 0.80 to 1.04 times what WireGuard alone carries; both are at the range
+of the one-process generator and sink (about 400,000 datagrams a second offered unpaced). An
+earlier run, of the program before the length, checksum and MTU checks and the `conf` map,
+gave 352,596 / 321,924 (64 B) and 363,637 / 372,296 (512 B), with user space at 218,068 /
+169,079 and 160,049 / 166,393.
+
 ## What the numbers say
 
 - **Relay UDP, before.** The relay forwarded 20,000 to 54,000 datagrams a second without
@@ -88,9 +111,10 @@ Latency at 10,000 datagrams a second (run 1), relay path p50 / p99 against WireG
   the loss happens (the drops are counted in `RcvbufErrors`): one system call per datagram
   received and one per datagram sent, in one thread, and a 208 KiB receive buffer that a
   burst overflows while the thread is not running.
-- **Relay UDP, after.** Batched system calls and an 8 MiB receive buffer: 90,000 to 170,000
+- **Relay UDP, after.** Batched system calls and an 8 MiB receive buffer: 90,000 to 218,000
   small datagrams a second without loss; WireGuard alone carries 2.0 to 3.6 times as much in
-  seven of eight rows. The tc prototype carries 165,000 to 346,000. The 1,400-byte rows vary most between runs (in one
+  seven of eight rows of the first two runs. The kernel path carries 290,000 to 372,000, what
+  WireGuard alone carries, and drops nothing at the relay's socket. The 1,400-byte rows vary most between runs (in one
   26.04 run the WireGuard-alone ceiling, 27,533, was below the relay's), because a trial that
   overloads the fragment path spoils reassembly for the trials near it.
 - **Fragments.** A 1,400-byte payload does not fit the 1,420-byte WireGuard MTU, so each
@@ -121,7 +145,7 @@ number and the `CLOCK_MONOTONIC` time it was sent; the sink counts only its own 
 | WireGuard alone | the same tunnel to a socket on the relay machine, no relay | the same |
 | Remote mirror | the listen test's veth `tp0` with a clsact qdisc and a `matchall` filter whose action is `mirred egress mirror` to an ERSPAN type II interface (`seq key 1`, `nopmtudisc ignore-df`, MTU 9,000) from `10.99.0.1` to `10.99.0.2` over `wg0`, the settings of ADR 0004 module 5; the collector is an ERSPAN interface in the remote namespace | its `rx_packets` counter |
 | Decode-and-send | a listen tap on `tp0` with one `[[send]]`: match UDP port 5000, `convert` Remote ID to Cursor on Target, destination `udp://127.0.0.1:9201`; frames of a 25-byte Remote ID message injected at the far end of `tp0`. Before ADR 0006 the convert named a pinned goat-xf `binary`, run once per message; after, it is the engine linked into goatrope, with `packs_sha256` from `goatrope packs-digest` | converted messages at the destination |
-| Relay UDP in a tc program | `tests/netns/relay_tc.c`, compiled by run.sh with clang when clang is on the machine, the link interface's index written into it, loaded with `tc filter add dev wg0 ingress bpf direct-action`; the user-space relay keeps running and receives nothing on that port | as for the relay |
+| Relay UDP, kernel path | the same relay with `kernel_path = true` (nothing in netfilter, so no acceptance needed), and without it for the user-space rows; before the kernel path was built, a C prototype compiled with clang was measured in its place | as for the relay |
 | goat-xf-pipe | `goat-xf-pipe --packs-only --from-format remote-id --in udp://127.0.0.1:9210 --out udp://127.0.0.1:9211 --to-format cot-xml`, run by the bench beside the container's goatrope | converted messages at the destination |
 
 - **A ceiling** is found in one trial with the generator unpaced, then a binary search

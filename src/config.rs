@@ -217,6 +217,10 @@ pub struct Relay {
     pub transport: String,
     pub boundary: Option<Boundary>,
     pub proxies: Vec<Proxy>,
+    /// forward what it can in the kernel (docs/adr/0006-data-path.md); off unless declared
+    pub kernel_path: bool,
+    /// the declaration accepts that kernel-path datagrams are not seen by netfilter (the mesh ACL, the host firewall)
+    pub kernel_path_bypasses_netfilter: bool,
     /// opt-in layer-2 lanes (ADR 0004 §6); empty unless declared
     pub l2: Vec<L2>,
 }
@@ -989,7 +993,19 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
     keys(
         r,
         w,
-        &["wip", "transport", "boundary", "remote_interface", "link_interface", "link_address", "allow", "proxy", "l2"],
+        &[
+            "wip",
+            "transport",
+            "boundary",
+            "remote_interface",
+            "link_interface",
+            "link_address",
+            "allow",
+            "proxy",
+            "l2",
+            "kernel_path",
+            "kernel_path_bypasses_netfilter",
+        ],
         &["remote_interface", "link_interface", "link_address", "allow"],
     )?;
     let transport = match r.get("transport") {
@@ -1155,6 +1171,22 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         Some(v) => l2_lanes(v, &remote_if, &link_if, tap, bnd.as_ref())?,
         None => vec![],
     };
+    let flag = |k: &str| -> R<bool> {
+        match r.get(k) {
+            None => Ok(false),
+            Some(v) => match v.as_bool() {
+                Some(b) => Ok(b),
+                None => err(format!("{w}.{k} must be true or false")),
+            },
+        }
+    };
+    let kernel_path = flag("kernel_path")?;
+    let kernel_path_bypasses_netfilter = flag("kernel_path_bypasses_netfilter")?;
+    if kernel_path_bypasses_netfilter && !kernel_path {
+        return err(format!(
+            "{w}.kernel_path_bypasses_netfilter accepts what kernel_path = true does; without kernel_path it means nothing"
+        ));
+    }
     Ok(Relay {
         remote_interface: remote_if,
         link_interface: link_if,
@@ -1164,6 +1196,8 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         boundary: bnd,
         proxies,
         l2,
+        kernel_path,
+        kernel_path_bypasses_netfilter,
     })
 }
 

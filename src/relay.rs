@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::boundary;
 use crate::config::{Config, Relay, RelayRule};
+use crate::kpath;
 use crate::nl;
 use crate::proxy::{self, Hold, Proxies};
 use crate::relay_tcp;
@@ -97,6 +98,18 @@ pub fn preflight(cfg: &Config) -> Result<(), RelayRefusal> {
         ));
     }
     crate::l2::preflight(cfg).map_err(RelayRefusal)?;
+    if r.kernel_path && !r.kernel_path_bypasses_netfilter {
+        let why = match kpath::netfilter_applies(&r.remote_interface, &r.link_interface) {
+            Ok(None) => None,
+            Ok(Some(w)) => Some(w),
+            Err(e) => Some(format!("netfilter's rules cannot be read ({e})")),
+        };
+        if let Some(why) = why {
+            return refuse(format!(
+                "kernel_path = true, and {why}. Datagrams the kernel path forwards are not seen by netfilter (the mesh's ACL, the host firewall); the relay's own rules are then their only control. Declare kernel_path_bypasses_netfilter = true to accept that, or set kernel_path = false"
+            ));
+        }
+    }
     if r.transport == "boundary" {
         // last, so a refusal above leaves the machine as it was
         let b = r.boundary.as_ref().expect("transport boundary has a [relay.boundary]");
@@ -256,6 +269,13 @@ struct RuleState<'a> {
     to_remote: u64,
     denied: u64,
     send_errors: u64,
+    /// the rule's slot in the kernel path's map, when the kernel path carries it
+    kslot: Option<u32>,
+    /// datagrams the kernel path forwarded to the link, and the count when the peer was last read
+    kernel_to_link: u64,
+    kernel_seen: u64,
+    /// datagrams the kernel path matched and could not redirect
+    kernel_failed: u64,
 }
 
 /// The time as Python's json module writes a float: the shortest form that reads back the
@@ -311,13 +331,22 @@ pub fn reassembly() -> (u64, u64) {
     (fails, timeouts)
 }
 
-fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> String {
+fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, kernel: &str) -> String {
     let mut rows: Vec<String> = state
         .iter()
         .map(|s| {
             format!(
-                "{{\"listen_port\": {}, \"protocol\": \"udp\", \"direction\": \"{}\", \"target\": \"{}\", \"to_link\": {}, \"to_remote\": {}, \"denied\": {}, \"send_errors\": {}}}",
-                s.rule.listen_port, s.rule.direction, dest_of(s.rule), s.to_link, s.to_remote, s.denied, s.send_errors
+                "{{\"listen_port\": {}, \"protocol\": \"udp\", \"direction\": \"{}\", \"target\": \"{}\", \"to_link\": {}, \"to_remote\": {}, \"denied\": {}, \"send_errors\": {}, \"kernel_path\": {}, \"kernel_to_link\": {}, \"kernel_failed\": {}}}",
+                s.rule.listen_port,
+                s.rule.direction,
+                dest_of(s.rule),
+                s.to_link + s.kernel_to_link,
+                s.to_remote,
+                s.denied,
+                s.send_errors,
+                s.kslot.is_some(),
+                s.kernel_to_link,
+                s.kernel_failed
             )
         })
         .collect();
@@ -333,7 +362,7 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
     let (fails, timeouts) = reassembly();
     let (f0, t0) = *REASM_AT_START.get_or_init(reassembly);
     format!(
-        "{{\"time\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
+        "{{\"time\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}, \"kernel_path\": {kernel}}}",
         json_float(time),
         rows.join(", "),
         proxies.health_json(),
@@ -342,12 +371,12 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
     )
 }
 
-fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> Result<(), String> {
+fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies, kernel: &str) -> Result<(), String> {
     let dir = std::path::Path::new(HEALTH).parent().unwrap();
     std::fs::create_dir_all(dir).map_err(|e| sys::oserror(&e, &dir.to_string_lossy()))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64();
     let tmp = format!("{HEALTH}.new");
-    let res = std::fs::write(&tmp, health_json(now, state, tcp, proxies))
+    let res = std::fs::write(&tmp, health_json(now, state, tcp, proxies, kernel))
         .map_err(|e| sys::oserror(&e, &tmp))
         .and_then(|_| std::fs::rename(&tmp, HEALTH).map_err(|e| sys::oserror(&e, &tmp)));
     if let Err(e) = res {
@@ -362,6 +391,12 @@ static REASM_AT_START: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::ne
 pub fn run(cfg: &Config) -> i32 {
     // first, so a stop request during start-up still ends in the loop, which removes what it added
     sys::catch_stop_signals();
+    // a kernel-path filter left by a relay that did not stop cleanly forwards with no relay behind
+    // it: remove it before anything else, whatever this declaration says, or do not start
+    if let Err(e) = kpath::detach_all() {
+        eprintln!("goatrope relay: refused: {e}");
+        return crate::EXIT_REFUSED;
+    }
     if let Err(e) = preflight(cfg) {
         eprintln!("goatrope relay: refused: {}", e.0);
         return crate::EXIT_REFUSED;
@@ -451,16 +486,22 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             to_remote: 0,
             denied: 0,
             send_errors: 0,
+            kslot: None,
+            kernel_to_link: 0,
+            kernel_seen: 0,
+            kernel_failed: 0,
         });
         println!("goatrope relay: {shown}");
     }
+    // the kernel path, for the rules it can carry; dropped on every path out of serve, which detaches it
+    let (mut kpath, kernel) = start_kernel_path(r, own, &mut state);
     // each polled socket: (rule state, None for its listening socket or Some(client) for an outgoing one)
     let slots: Vec<(usize, Option<usize>)> = state
         .iter()
         .enumerate()
         .flat_map(|(i, s)| std::iter::once((i, None)).chain((0..s.outs.len()).map(move |k| (i, Some(k)))))
         .collect();
-    health(&state, &tcp, &proxies)?; // at once, so a service manager sees it running
+    health(&state, &tcp, &proxies, &kernel)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
     let mut path = Batched::new();
     let mut denied_log = DeniedLog(None);
@@ -488,13 +529,29 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             // the proxy's fd, if any, is last and has no slot: zip stops before it
             for (pfd, &(i, out)) in fds.iter().zip(slots.iter()) {
                 if pfd.revents != 0 {
+                    if out.is_some() {
+                        // a reply goes to the remote the kernel path last forwarded for, when it forwarded since
+                        kernel_peer(&kpath, &mut state[i]);
+                    }
                     path.pump(&mut state[i], out, &mut denied_log);
                 }
             }
         }
         if last.elapsed() >= Duration::from_secs(2) {
             proxies.check_tunnels();
-            health(&state, &tcp, &proxies)?;
+            if let Some(k) = &mut kpath {
+                // an address added to or removed from the WireGuard interface, or a new link MTU
+                if let Err(e) = k.refresh() {
+                    println!("goatrope relay: kernel path: cannot update its addresses: {e}");
+                }
+                for st in state.iter_mut() {
+                    if let Some((_, n, failed)) = st.kslot.and_then(|i| k.slot(i)) {
+                        st.kernel_to_link = n;
+                        st.kernel_failed = failed;
+                    }
+                }
+            }
+            health(&state, &tcp, &proxies, &kernel)?;
             last = Instant::now();
             let fwd = forwarding(r);
             if !fwd.is_empty() {
@@ -512,6 +569,85 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             if let Err(e) = crate::l2::tick(r) {
                 eprintln!("goatrope relay: stopping: {e}");
                 return Ok(crate::EXIT_ERROR);
+            }
+        }
+    }
+}
+
+/// Load and attach the kernel path for the rules it can carry: UDP, `remote-to-link` or `both`,
+/// IPv4, no proxy address. Returns it (None when not declared or not loaded) and the
+/// `kernel_path` object of relay.health.
+fn start_kernel_path(r: &Relay, own: IpAddr, state: &mut [RuleState]) -> (Option<kpath::KernelPath>, String) {
+    if !r.kernel_path {
+        return (None, "{\"loaded\": false, \"why\": \"not declared (kernel_path = true turns it on)\"}".to_string());
+    }
+    let IpAddr::V4(link) = own else {
+        return (None, "{\"loaded\": false, \"why\": \"the link address is IPv6\"}".to_string());
+    };
+    let mut rules = Vec::new();
+    let mut slots = Vec::new();
+    for (i, st) in state.iter().enumerate() {
+        let (Some(IpAddr::V4(remote)), Some(SocketAddr::V4(dest))) = (st.clients.first().copied(), st.dest) else { continue };
+        if st.rule.link_initiated() || st.held.is_some() || st.outs.len() != 1 {
+            continue;
+        }
+        let Ok(link_port) = st.outs[0].local_addr().map(|a| a.port()) else { continue };
+        slots.push(i);
+        rules.push(kpath::KRule {
+            remote,
+            listen_port: st.rule.listen_port,
+            link,
+            link_port,
+            target: *dest.ip(),
+            target_port: dest.port(),
+        });
+    }
+    let mode = if r.kernel_path_bypasses_netfilter {
+        "bypasses netfilter (accepted by kernel_path_bypasses_netfilter)"
+    } else {
+        "netfilter had no rule for these interfaces at start"
+    };
+    match kpath::KernelPath::start(&r.remote_interface, &r.link_interface, &rules, r.kernel_path_bypasses_netfilter) {
+        Ok(k) => {
+            for (slot, &i) in slots.iter().enumerate() {
+                state[i].kslot = Some(slot as u32);
+            }
+            // what is left (maps, removing the filter) needs no CAP_BPF
+            let dropped = match kpath::drop_cap_bpf() {
+                Ok(()) => "CAP_BPF dropped".to_string(),
+                Err(e) => format!("CAP_BPF not dropped: {e}"),
+            };
+            println!(
+                "goatrope relay: kernel path on {} (tc ingress, pref {}): {} rule(s), {mode}; {dropped}; denials, fragments, replies and the other rules stay in user space",
+                r.remote_interface,
+                kpath::PRIO,
+                k.rules
+            );
+            let j = format!(
+                "{{\"loaded\": true, \"rules\": {}, \"mode\": {}, \"unmatched_locals\": {}}}",
+                k.rules,
+                crate::send::json_str(mode),
+                k.unmatched_locals
+            );
+            (Some(k), j)
+        }
+        Err(e) => {
+            println!("goatrope relay: kernel path not loaded ({e}); every datagram is forwarded in user space");
+            (None, format!("{{\"loaded\": false, \"why\": {}}}", crate::send::json_str(&e)))
+        }
+    }
+}
+
+/// Take the remote the kernel path last forwarded for as the rule's peer, when it has forwarded since
+/// the last look; replies (user space) go there.
+fn kernel_peer(k: &Option<kpath::KernelPath>, st: &mut RuleState) {
+    let (Some(k), Some(slot)) = (k, st.kslot) else { return };
+    if let Some((Some(peer), n, _)) = k.slot(slot) {
+        if n != st.kernel_seen {
+            st.kernel_seen = n;
+            st.kernel_to_link = n;
+            if let Some(p) = st.peers.first_mut() {
+                *p = Some(peer);
             }
         }
     }
@@ -788,13 +924,17 @@ Wants=network-online.target
 [Service]
 Type=exec
 ExecStart={bin} relay --config {etc}/goatrope.toml
+# the kernel path's tc filter goes with the relay, however it stopped (docs/adr/0006-data-path.md)
+ExecStopPost={bin} relay-kernel-off
 Restart=on-failure
 RestartSec=3
 # a refusal (exit {refused}) is not restarted: the unit stays failed, and goatrope check shows it
 RestartPreventExitStatus={refused}
-{l2}# SO_BINDTODEVICE (and ARP probes for a proxy address) need CAP_NET_RAW; the boundary interface and proxy addresses (netlink) need CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+{l2}# SO_BINDTODEVICE (and ARP probes for a proxy address) need CAP_NET_RAW; the boundary interface, proxy addresses and
+# the kernel path's tc filter (netlink) need CAP_NET_ADMIN; loading the kernel path's program needs CAP_BPF, which
+# the relay drops once it is attached
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
@@ -856,6 +996,12 @@ pub fn settle(cfg: &Config, seconds: f64) {
 
 pub fn check(cfg: &Config) -> Vec<Item> {
     let mut items = Vec::new();
+    // the kernel path's filter: what is attached against what the declaration would attach
+    let active = cfg.relay.is_some() && su::unit_active(UNIT) == "active";
+    let (ok, want, have) = kpath::check_item(cfg.relay.as_ref(), active);
+    if cfg.relay.is_some() || !ok {
+        item(&mut items, "relay-kernel-path", Some(ok), want, have);
+    }
     if cfg.relay.is_none() {
         return items;
     }
@@ -878,6 +1024,17 @@ pub fn status(cfg: &Config) {
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
     }
     if let Some((v, _)) = &health {
+        let k = &v["kernel_path"];
+        match k["loaded"].as_bool() {
+            Some(true) => println!(
+                "  relay  kernel path on {}: {} rule(s) forwarded in the kernel (tc ingress, pref {})",
+                r.remote_interface,
+                k["rules"],
+                kpath::PRIO
+            ),
+            Some(false) => println!("  relay  kernel path not loaded: {}", k["why"].as_str().unwrap_or("")),
+            None => {}
+        }
         let n = |k: &str| v["reassembly"][k].as_u64().unwrap_or(0);
         if n("failed") + n("timed_out") > 0 {
             println!(

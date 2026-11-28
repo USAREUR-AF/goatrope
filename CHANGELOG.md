@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- relay kernel path (ADR 0006), opt-in (`kernel_path = true`): a tc program on the WireGuard
+  interface's ingress, built by goatrope as BPF instructions (no object file, no new dependency),
+  forwards the well-formed datagrams of UDP `remote-to-link` and `both` rules to the link with
+  `bpf_redirect_neigh`; everything else stays in user space. It bypasses netfilter, so the relay
+  refuses it while netfilter has rules for these interfaces unless
+  `kernel_path_bypasses_netfilter = true`. No filter outlives the relay: removed before start,
+  on exit, by the unit's `ExecStopPost` (`goatrope relay-kernel-off`, no declaration needed) and
+  by `uninstall`; `check` compares what is attached with the declaration. `CAP_BPF` is dropped
+  once attached. Namespace phase `relay-kernel`.
 - layer-2 lane (ADR 0004 module 6): `[[relay.l2]]` bridges one dedicated port with a GRETAP
   interface to one mesh peer, only with `accept_layer2 = true`. tc flower passes only the declared
   EtherTypes, and from the tunnel only the declared source MACs (ARP only with a matching sender
@@ -13,8 +22,8 @@
   phase `l2`; also run in the emulated arm64 VM.
 - ADR 0006 (Proposed): the data path of each role. Relay UDP is batched in user space
   (`recvmmsg`/`sendmmsg`, 64 datagrams a call, no busy polling) behind one internal interface,
-  with a per-rule `receive_buffer_kb` (default 8,192); a tc program for relay UDP is measured as
-  a prototype (`tests/netns/relay_tc.c`) and designed, not built. Datagrams above the tunnel MTU
+  with a per-rule `receive_buffer_kb` (default 8,192), and a kernel path for relay UDP (above).
+  Datagrams above the tunnel MTU
   are relayed as fragments; `relay.health` counts this machine's reassembly failures.
   Namespace phase `fragments`.
 - decode-and-send converts only with the goat-transformers engine linked into goatrope (0.8.0,
