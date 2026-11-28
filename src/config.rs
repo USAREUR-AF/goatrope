@@ -175,6 +175,12 @@ pub struct RelayRule {
     pub receive_buffer_kb: usize,
     /// a [[relay.proxy]] address the rule's link-side sockets bind to, instead of the relay's own (ADR 0004 §4)
     pub link_address: Option<String>,
+    /// link-to-remote: the multicast group joined on the link interface, or empty
+    pub group: String,
+    /// every remote the rule sends to: `remote` alone, or (a group rule) each one listed
+    pub remotes: Vec<String>,
+    /// remote-to-link with a multicast target: the hop limit of what is sent onto the link
+    pub ttl: u8,
 }
 
 /// A local address on the link that stands for one remote machine (ADR 0004 §4).
@@ -188,6 +194,25 @@ pub struct Proxy {
 impl RelayRule {
     pub fn link_initiated(&self) -> bool {
         self.direction == "link-to-remote"
+    }
+
+    /// A rule that sends to a group on the link, or receives a group from it.
+    pub fn multicast(&self) -> bool {
+        !self.group.is_empty() || parse_ip(&self.target).is_some_and(|t| t.is_multicast())
+    }
+}
+
+/// A multicast group a relay rule may name: IPv4, outside 224.0.0.0/24 (the local network control
+/// block: IGMP, routing protocols), which a relay never sends to or takes from the link.
+fn group_addr(v: &Value, wk: &str) -> R<String> {
+    let x = addr(v, wk)?;
+    match parse_ip(&x) {
+        Some(IpAddr::V4(g)) if g.is_multicast() && g.octets()[..3] != [224, 0, 0] => Ok(x),
+        Some(IpAddr::V4(g)) if g.is_multicast() => {
+            err(format!("{wk} {x} is in 224.0.0.0/24, the local network control block (IGMP, routing protocols); name another group"))
+        }
+        Some(IpAddr::V6(g)) if g.is_multicast() => err(format!("{wk} {x}: IPv6 multicast is not built")),
+        _ => err(format!("{wk} {x} is not a multicast group address")),
     }
 }
 
@@ -1065,6 +1090,8 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             ));
         }
         let l2r = direction == "link-to-remote";
+        let mcast_target = !l2r && a.get("target").and_then(|t| t.as_str()).and_then(parse_ip).is_some_and(|t| t.is_multicast());
+        let group_rule = l2r && a.contains_key("group");
         let mut req = vec!["direction", "protocol", "remote", "listen_port"];
         req.extend(if l2r { ["remote_port", "sources"] } else { ["target", "target_port"] });
         let mut allowed = req.clone();
@@ -1073,8 +1100,24 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             allowed.push("max_connections");
         } else {
             allowed.push("receive_buffer_kb");
+            if l2r {
+                allowed.push("group");
+            } else if mcast_target {
+                allowed.push("ttl");
+            }
         }
         keys(a, &aw, &allowed, &req)?;
+        if (mcast_target || group_rule) && protocol == "tcp" {
+            return err(format!("{aw}: a multicast group carries UDP only"));
+        }
+        if group_rule && a.contains_key("link_address") {
+            return err(format!(
+                "{aw}: a group rule takes no link_address; it receives the group itself, and a proxy address stands for one remote"
+            ));
+        }
+        if mcast_target && direction == "both" {
+            return err(format!("{aw}: a multicast target takes direction \"remote-to-link\"; replies from a group are not one machine's"));
+        }
         // a machine on the link: one host address, not the relay's own, the network or a broadcast
         let on_link = |v: &Value, wk: &str| -> R<String> {
             let x = addr(v, wk)?;
@@ -1092,6 +1135,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             }
             Ok(x)
         };
+        let group = if group_rule { group_addr(&a["group"], &format!("{aw}.group"))? } else { String::new() };
         let (target, target_port, remote_port, sources) = if l2r {
             let list = match &a["sources"] {
                 Value::Array(l) if !l.is_empty() => l,
@@ -1110,8 +1154,28 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
                 sources.push(x);
             }
             (String::new(), 0, int(a, "remote_port", &aw, 1, 65535)? as u16, sources)
+        } else if mcast_target {
+            (group_addr(&a["target"], &format!("{aw}.target"))?, int(a, "target_port", &aw, 1, 65535)? as u16, 0, vec![])
         } else {
             (on_link(&a["target"], &format!("{aw}.target"))?, int(a, "target_port", &aw, 1, 65535)? as u16, 0, vec![])
+        };
+        let ttl = if a.contains_key("ttl") { int(a, "ttl", &aw, 1, 255)? as u8 } else { 1 };
+        // a group rule sends each datagram to every remote listed
+        let remotes = match &a["remote"] {
+            Value::Array(l) if group_rule && !l.is_empty() => {
+                let mut out = Vec::new();
+                for (k, v) in l.iter().enumerate() {
+                    let x = addr(v, &format!("{aw}.remote[{k}]"))?;
+                    if out.contains(&x) {
+                        return err(format!("{aw}.remote: {x} is listed twice"));
+                    }
+                    out.push(x);
+                }
+                out
+            }
+            Value::Array(_) if group_rule => return err(format!("{aw}.remote must name at least one remote")),
+            Value::Array(_) => return err(format!("{aw}.remote: only a rule with a group may list more than one remote")),
+            v => vec![addr(v, &format!("{aw}.remote"))?],
         };
         let max_connections =
             if a.contains_key("max_connections") { int(a, "max_connections", &aw, 1, 4096)? } else { DEFAULT_MAX_CONNECTIONS } as usize;
@@ -1120,7 +1184,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
                 as usize;
         rules.push(RelayRule {
             direction,
-            remote: addr(&a["remote"], &format!("{aw}.remote"))?,
+            remote: remotes[0].clone(),
             listen_port: int(a, "listen_port", &aw, 1, 65535)? as u16,
             target,
             target_port,
@@ -1130,6 +1194,9 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             max_connections,
             receive_buffer_kb,
             link_address: a.get("link_address").map(|v| addr(v, &format!("{aw}.link_address"))).transpose()?,
+            group,
+            remotes,
+            ttl,
         });
     }
     let mut seen = BTreeSet::new();
@@ -1141,11 +1208,11 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         }
     }
     if let Some(b) = &bnd {
-        for rule in &rules {
-            if rule.remote != b.peer_address {
+        for remote in rules.iter().flat_map(|r| r.remotes.iter()) {
+            if *remote != b.peer_address {
                 return err(format!(
-                    "{w}.allow: remote {} is not the boundary point; with transport \"boundary\" every rule's remote is {}",
-                    rule.remote, b.peer_address
+                    "{w}.allow: remote {remote} is not the boundary point; with transport \"boundary\" every rule's remote is {}",
+                    b.peer_address
                 ));
             }
         }
@@ -1592,6 +1659,25 @@ CONVERT
         assert!(e(&twice).contains("declared twice"));
         let extra = proxy("192.0.2.60", "198.51.100.5", "192.0.2.60") + "mac = \"02:00:00:00:00:01\"\n";
         assert!(e(&extra).contains("unknown key"));
+    }
+
+    #[test]
+    fn relay_multicast() {
+        let g = RELAY.replace(
+            "{ direction = \"both\", protocol = \"udp\", remote = \"198.51.100.5\", listen_port = 7000, target = \"192.0.2.2\", target_port = 7000 }",
+            "{ direction = \"link-to-remote\", protocol = \"udp\", group = \"239.1.2.3\", remote = [\"198.51.100.5\", \"198.51.100.6\"], listen_port = 7000, remote_port = 9000, sources = [\"192.0.2.2\"] }",
+        );
+        let r = parse(&g, "x.toml").unwrap().relay.unwrap();
+        assert_eq!(r.rules[0].remotes.len(), 2);
+        assert!(r.rules[0].multicast());
+        assert!(e(&g.replace("239.1.2.3", "224.0.0.5")).contains("local network control block"));
+        assert!(e(&g.replace("239.1.2.3", "ff02::5")).contains("IPv6 multicast is not built"));
+        assert!(e(&g.replace("sources = [", "link_address = \"192.0.2.60\", sources = [")).contains("takes no link_address"));
+        let t = RELAY.replace("\"both\"", "\"remote-to-link\"").replace("target = \"192.0.2.2\"", "target = \"239.1.2.5\", ttl = 4");
+        let r = parse(&t, "x.toml").unwrap().relay.unwrap();
+        assert_eq!((r.rules[0].ttl, r.rules[0].multicast()), (4, true));
+        assert!(e(&t.replace("\"remote-to-link\"", "\"both\"")).contains("replies from a group"));
+        assert!(e(&RELAY.replace("target_port = 7000", "target_port = 7000, ttl = 2")).contains("unknown key"));
     }
 
     #[test]

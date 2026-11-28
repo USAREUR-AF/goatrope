@@ -1591,6 +1591,168 @@ def phase_relay_tcp() -> None:
 
 PHASES["relay-tcp"] = phase_relay_tcp
 
+
+RELAY_MC = """schema = 1
+[relay]
+remote_interface = "wg0"
+link_interface = "r0"
+link_address = "192.0.2.50/24"
+allow = [
+  { direction = "link-to-remote", protocol = "udp", group = "239.1.2.3", remote = ["10.99.0.2", "10.99.0.3"], listen_port = 9000, remote_port = 9000, sources = ["192.0.2.2"] },
+  { direction = "remote-to-link", protocol = "udp", remote = "10.99.0.2", listen_port = 9100, target = "239.1.2.5", target_port = 9100 },
+]
+"""
+
+# Count tagged datagrams arriving at addr:port in this namespace; with a group, join it on dev first.
+MC_RECEIVER = r"""
+import json, socket, struct, sys, time
+addr, port, group, dev, secs = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], float(sys.argv[5])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if group != "-":
+    s.setsockopt(socket.SOL_SOCKET, 25, dev.encode())
+    s.bind((group, port))
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(group) + socket.inet_aton(addr))
+else:
+    s.bind((addr, port))
+s.settimeout(0.3); got = {}; end = time.time() + secs
+while time.time() < end:
+    try:
+        d, a = s.recvfrom(65535)
+    except socket.timeout:
+        continue
+    tag = d.decode().rstrip("0123456789")
+    got.setdefault(tag, []).append(a[0])
+print(json.dumps(got))
+"""
+
+MC_SENDER = r"""
+import socket, sys, time
+src, group, port, n, tag = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(src)); s.bind((src, 0))
+for i in range(n):
+    s.sendto(f"{tag}{i}".encode(), (group, port)); time.sleep(0.02)
+"""
+
+
+def igmp_groups(dev: str) -> list[str]:
+    """The groups /proc/net/igmp lists for one interface."""
+    out, mine = [], False
+    for ln in open("/proc/net/igmp").read().splitlines()[1:]:
+        if not ln.startswith(("\t", " ")):
+            mine = ln.split()[1] == dev
+            continue
+        if mine and ln.split():
+            out.append(socket.inet_ntoa(bytes.fromhex(ln.split()[0])[::-1]))
+    return sorted(out)
+
+
+def phase_relay_multicast() -> None:
+    """ADR 0004 module 3: a group on the link, in either direction."""
+    for leftover in ("wg0", "u0", "r0", "grb0"):
+        sh(f"ip link del {leftover}", check=False)
+    topo_relay()
+    sh("ip -n linkhost addr add 192.0.2.3/24 dev l0")  # a second machine on the link, not in the group rule's sources
+    sh("sysctl -qw net.ipv6.conf.r0.disable_ipv6=1 net.ipv4.conf.r0.forwarding=0 net.ipv4.conf.wg0.forwarding=0 "
+       "net.ipv6.conf.all.forwarding=0")
+    for name, text, want in (
+            ("a group in 224.0.0.0/24", RELAY_MC.replace('"239.1.2.3"', '"224.0.0.9"'), "local network control block"),
+            ("an address that is not a group", RELAY_MC.replace('"239.1.2.3"', '"192.0.2.9"'), "not a multicast group"),
+            ("a group over TCP", RELAY_MC.replace('protocol = "udp", group', 'protocol = "tcp", group'), "unknown key"),
+            ("a multicast target with direction both", RELAY_MC.replace('"remote-to-link", protocol = "udp", remote = "10.99.0.2", listen_port = 9100',
+                                                                       '"both", protocol = "udp", remote = "10.99.0.2", listen_port = 9100'),
+             "replies from a group"),
+            ("ttl on a rule with no group", RELAY_TCP.replace("max_connections = 3", "ttl = 2"), "unknown key"),
+            ("a list of remotes on a rule with no group", RELAY_MC.replace('remote = "10.99.0.2", listen_port = 9100',
+                                                                          'remote = ["10.99.0.2"], listen_port = 9100'),
+             "only a rule with a group")):
+        write_cfg(text)
+        p = gr("validate", "--config", CFG)
+        result(p.returncode == 2 and want in p.stderr, f"relay multicast refused at validation: {name}", p.stderr.strip()[-160:])
+
+    rcv, snd = f"{WORK}/mc-receiver.py", f"{WORK}/mc-sender.py"
+    for path, text in ((rcv, MC_RECEIVER), (snd, MC_SENDER)):
+        with open(path, "w") as f:
+            f.write(text)
+    write_cfg(RELAY_MC)
+    cap = Capture("linkhost", "l0", "relay-mc-link")
+    relay = subprocess.Popen(GR + ["relay", "--config", CFG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(2)
+    try:
+        groups = igmp_groups("r0")
+        result(groups == ["224.0.0.1", "239.1.2.3"], "relay multicast: on its link interface the relay is in the declared group only",
+               f"/proc/net/igmp r0: {groups}")
+        others = [d for d in ("wg0", "lo") if "239.1.2.3" in igmp_groups(d)]
+        result(not others, "relay multicast: the group is joined on the link interface only", f"also on {others}")
+
+        # link -> remotes: one group stream to two remotes. Each remote's peer on wg0 needs an endpoint
+        # first (on a mesh it has one); a handshake from each remote gives it one.
+        for dev in ("wga", "wgo"):
+            sh(f"ip netns exec remote ping -c 1 -W 2 -I {dev} 10.99.0.1", check=False)
+        rx = [subprocess.Popen(["ip", "netns", "exec", "remote", sys.executable, rcv, a, "9000", "-", "-", "8"],
+                               stdout=subprocess.PIPE, text=True) for a in ("10.99.0.2", "10.99.0.3")]
+        time.sleep(0.5)
+        sh(f"ip netns exec linkhost {sys.executable} {snd} 192.0.2.2 239.1.2.3 9000 50 grp", check=False)
+        sh(f"ip netns exec linkhost {sys.executable} {snd} 192.0.2.3 239.1.2.3 9000 10 unlisted", check=False)
+        sh(f"ip netns exec linkhost {sys.executable} {snd} 192.0.2.2 239.1.2.4 9000 10 othergroup", check=False)
+        got = [json.loads(p.communicate(timeout=30)[0] or "{}") for p in rx]
+        n = [len(g.get("grp", [])) for g in got]
+        result(n == [50, 50] and all(set(g.get("grp", [])) == {"10.99.0.1"} for g in got),
+               "relay multicast: a group stream from the link reaches both remotes, through the tunnel",
+               f"{n[0]} of 50 at 10.99.0.2, {n[1]} of 50 at 10.99.0.3")
+        result(not any(g.get("unlisted") for g in got), "relay multicast: group datagrams from a source not listed are denied",
+               f"{[len(g.get('unlisted', [])) for g in got]} of 10")
+        result(not any(g.get("othergroup") for g in got), "relay multicast: a group the rule does not name is not forwarded",
+               f"{[len(g.get('othergroup', [])) for g in got]} of 10")
+
+        # remote -> link: a remote's datagrams arrive on the link as the group
+        lrx = subprocess.Popen(["ip", "netns", "exec", "linkhost", sys.executable, rcv, "192.0.2.2", "9100", "239.1.2.5", "l0", "6"],
+                               stdout=subprocess.PIPE, text=True)
+        time.sleep(0.5)
+        sender = ("import socket,time\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.setsockopt(socket.SOL_SOCKET,25,b'wga')\n"
+                  "s.bind(('10.99.0.2',0))\nfor i in range(30):\n s.sendto(f'down{i}'.encode(),('10.99.0.1',9100)); time.sleep(0.02)\n")
+        sh(f"ip netns exec remote python3 -c \"{sender}\"", check=False)
+        got = json.loads(lrx.communicate(timeout=30)[0] or "{}")
+        result(len(got.get("down", [])) == 30 and set(got.get("down", [])) == {"192.0.2.50"},
+               "relay multicast: a remote's datagrams arrive on the link as the group, from the relay's address",
+               f"{len(got.get('down', []))} of 30 received as members of 239.1.2.5")
+        time.sleep(2.5)
+        rows = {(x["protocol"], x["listen_port"]): x for x in relay_rows()}
+        g, d = rows.get(("udp", 9000), {}), rows.get(("udp", 9100), {})
+        result(g.get("to_remote") == 100 and g.get("denied") == 10 and d.get("to_link") == 30,
+               "relay multicast: relay.health counts each copy and the denials", f"9000 {g}; 9100 {d}")
+        groups = igmp_groups("r0")
+        result(groups == ["224.0.0.1", "239.1.2.3"], "relay multicast: after the traffic, still no other group joined", f"{groups}")
+    finally:
+        relay.terminate()
+        try:
+            relay.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
+    frames = cap.stop()
+    r0mac = bytes.fromhex(open("/sys/class/net/r0/address").read().strip().replace(":", ""))
+    counts, bad = {"arp": 0, "igmp": 0, "group": 0}, []
+    for f in frames:
+        if f[6:12] != r0mac:
+            continue
+        et = f[12:14]
+        if et == b"\x08\x06":
+            counts["arp"] += 1
+        elif et == b"\x08\x00" and f[23] == 2:
+            counts["igmp"] += 1
+        elif et == b"\x08\x00" and f[23] == 17 and f[30:34] == bytes([239, 1, 2, 5]) and f[22] == 1 \
+                and f[26:30] == bytes([192, 0, 2, 50]) and int.from_bytes(f[36:38], "big") == 9100:
+            counts["group"] += 1
+        else:
+            bad.append(f[:40].hex())
+    result(not bad and counts["group"] == 30 and counts["igmp"] >= 1,
+           "relay multicast: on the link the relay sent only ARP, IGMP reports and the group datagrams (TTL 1)",
+           f"{counts}, {len(bad)} other: {bad[:3]}")
+    result(igmp_groups("r0") == ["224.0.0.1"], "relay multicast: the group is left when the relay stops", f"{igmp_groups('r0')}")
+
+
+PHASES["relay-multicast"] = phase_relay_multicast
+
 COMPONENTS = "/opt/gt-components"  # run.sh copies the real binaries here when GOATROPE_TEST_COMPONENTS is set
 REMOTE_ID = "122624160b42bf241b6ed1b4b69808ac0870086b53150e0200"  # goat-transformers' README example message
 NTP = ("240206e90000060000000a80c0000201ed135500c0000000ed13554040000000ed13554043000000ed13554043800000")
