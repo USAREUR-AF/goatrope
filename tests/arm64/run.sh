@@ -9,6 +9,7 @@
 #   IMAGES=<dir>  where the cloud images are kept (default ~/.cache/goatrope-arm64)
 #   OUT=<dir>     where the logs go (default ./test-results)
 #   GOATROPE_ARM64_CONTAINER=<name>  the VM's container is <name>-<version> (default goatrope-arm64)
+#   GOATROPE_ARM64_PHASES="<phase> ..."  run only these phases, with no reboot (default: every phase below)
 #   WATCHDOG_ACTION=none|reset  what qemu does when the watchdog expires (default none: it is
 #                 logged to ubuntu-<v>-arm64.qemu.log; emulated daemon-reloads can take over 10 s)
 #
@@ -111,6 +112,13 @@ vm sh -s <<'EOF' | tee -a "$log"
 echo "### Ubuntu $VERSION $(uname -m), emulated (qemu TCG); kernel $(uname -r); $(systemctl --version | head -1);" \
      "$(python3 --version); $(tcpdump --version 2>&1 | head -1); watchdog: $(ls /dev/watchdog* 2>/dev/null | tr '\n' ' ')"
 EOF
+if [ -n "${GOATROPE_ARM64_PHASES:-}" ]; then
+    # shellcheck disable=SC2086  # a list of phase names, split on purpose
+    phase $GOATROPE_ARM64_PHASES
+    vm 'cat /root/gt/results.jsonl' > "$out/ubuntu-$v-arm64.results.jsonl" 2>/dev/null || true
+    echo "log: $log"
+    exit $rc
+fi
 phase refusals inline
 
 # A reboot: the namespaces and veths are gone, as a USB adapter is absent early in boot.
