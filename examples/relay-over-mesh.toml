@@ -8,6 +8,8 @@ schema = 1
 remote_interface = "wt0"          # the mesh's kernel WireGuard interface
 link_interface = "eth1"           # the sensor's network, an interface of its own
 link_address = "192.0.2.50/24"    # the relay's address on that network
+# kernel_path = true               # optional: forward in the kernel (ADR 0006); netfilter does not see those datagrams,
+# kernel_path_bypasses_netfilter = true   # so on a mesh interface with firewall rules this acceptance is also required
 allow = [
   # the controller's mesh address; the sensor answers the relay, the relay answers the controller
   { direction = "both", protocol = "udp", remote = "203.0.113.20", listen_port = 40000, target = "192.0.2.10", target_port = 40000 },

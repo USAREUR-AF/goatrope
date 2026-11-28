@@ -1,14 +1,17 @@
 // SPDX-FileCopyrightText: 2026 U.S. Federal Government (in countries where recognized)
 // SPDX-License-Identifier: Apache-2.0
 //
-// A measured prototype, not part of goatrope (docs/adr/0006-data-path.md): one relay rule
-// (remote-to-link, UDP) done in the kernel by a tc program on the WireGuard interface's ingress.
-// A datagram from REMOTE to LOCAL:LISTEN is rewritten to LINK:SPORT -> TARGET:TPORT and sent out
-// of the link interface with bpf_redirect_neigh, which fills in the Ethernet header from the
-// neighbor table (the program first pushes a placeholder header for it to replace). Everything else, fragments included, goes on to the relay's socket.
+// THE REFERENCE PROTOTYPE, NOT SHIPPED. goatrope does not build, load or test this file. It is the
+// C program ADR 0006 measured before the relay's kernel path was built; the program the relay
+// loads is written as BPF instructions in src/kpath.rs, with the checks this prototype does not
+// make (lengths, the IP header checksum, the link MTU, GSO, local addresses from a map).
 //
-// The bench compiles it with clang when clang is on the machine, and writes the link interface's
-// index into the program in place of the placeholder 0x7e1f1d00 before loading it with tc.
+// One relay rule (remote-to-link, UDP) in a tc program on the WireGuard interface's ingress: a
+// datagram from REMOTE to LOCAL:LISTEN is rewritten to LINK:SPORT -> TARGET:TPORT and sent out of
+// the link interface with bpf_redirect_neigh, which fills in the Ethernet header from the neighbor
+// table (the program first pushes a placeholder header for it to replace). Everything else,
+// fragments included, goes on to the relay's socket. The link interface's index was written in
+// place of the placeholder 0x7e1f1d00 before loading it with tc.
 //
 //   clang -O2 -target bpf -c relay_tc.c -o relay_tc.o
 #include <linux/bpf.h>

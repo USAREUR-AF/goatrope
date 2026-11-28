@@ -43,13 +43,13 @@ The relay's parts, and the data paths under them, each with its status on `main`
 | One port bridged to one peer, filtered by EtherType and source MAC | `[[relay.l2]]` with `accept_layer2 = true` | built (ADR 0004 §6); also run in the emulated arm64 VM |
 | A dedicated tunnel to a boundary point | `transport = "boundary"`, `[relay.boundary]` | built |
 | Batched UDP forwarding | a rule's `receive_buffer_kb` (default 8,192) | built ([ADR 0006](docs/adr/0006-data-path.md)) |
-| UDP forwarding inside the kernel (a tc program) | | designed (ADR 0006); a prototype is measured, not built |
+| UDP forwarding inside the kernel (a tc program), opt-in; netfilter does not see its datagrams | `kernel_path = true`, and `kernel_path_bypasses_netfilter = true` where netfilter has rules for these interfaces | built (ADR 0006) |
 | Conversion in the send process, with the goat-transformers engine linked in | `convert` in a `[[send]]`, with `packs_sha256` | built (ADR 0006) |
 | Every phase on two machines joined by a real NetBird mesh | | not run yet |
 
 Measured in network namespaces on one shared workstation ([performance.md](docs/performance.md)):
-the relay forwards 97,260 to 157,750 datagrams of 64 bytes a second over WireGuard with under
-0.1 % loss, and the linked converter turns 22,581 to 52,666 Remote ID messages a second into
+the relay forwards 77,000 to 218,000 datagrams of 64 bytes a second over WireGuard with under
+0.1 % loss in user space and 290,000 to 356,000 with its kernel path, and the linked converter turns 22,581 to 52,666 Remote ID messages a second into
 Cursor on Target, one message in 51 to 115 µs at p99. No hardware link and no real mesh is
 measured yet.
 
@@ -118,6 +118,7 @@ proxy (`relay-proxy.toml`) and with a layer-2 lane (`relay-l2.toml`).
 | `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, `relay.health` and the relay's boundary interface, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
 | `goatrope validate` | checks the declaration alone |
 | `goatrope relay` | runs the relay in the foreground (`install` runs it as `goatrope-relay.service`) |
+| `goatrope relay-kernel-off` | removes every filter of the relay's kernel path, on any interface, with no declaration needed; the relay unit runs it after the relay stops |
 | `goatrope packs-digest PACKS FROM TO` | prints the `version` and `packs_sha256` a `convert` with the linked engine declares for those packs |
 | `goatrope l2 down` | closes every layer-2 lane (takes its GRETAP interface down); the relay unit runs it whenever the relay stops |
 | `goatrope boundary key\|sheet\|up\|check\|down` | the relay's boundary interface (`transport = "boundary"`): make the key, print what the boundary point needs, bring it up, check it (exit 0 or 3), remove it |
@@ -291,6 +292,47 @@ A UDP rule may set `receive_buffer_kb` (256 to 1,048,576; 8,192 when not set), t
 buffer of each of its sockets, which holds a burst while the relay is not running
 ([ADR 0006](docs/adr/0006-data-path.md); rates in [performance.md](docs/performance.md)).
 
+The relay can also forward in the kernel, opt-in: `kernel_path = true` in `[relay]` makes it
+attach a tc program to the WireGuard interface's ingress (`pref 3000`) that forwards the
+datagrams of the UDP `remote-to-link` and `both` rules (IPv4, no proxy address) straight to the
+link, without waking the relay ([ADR 0006](docs/adr/0006-data-path.md)). The program forwards
+only what the relay's socket would accept for a rule, and only when well formed (no IP options,
+a valid header checksum, not a fragment, lengths consistent, within the link's MTU); it sends
+each as the relay's link socket would (the relay's link address and that socket's port, to the
+rule's target, TTL 64). Everything else reaches the relay's sockets as before: every denial,
+fragments, the target's replies (sent to the remote the program last saw), IPv6,
+`link-to-remote` rules and rules with a proxy address. It follows addresses added to and removed
+from the WireGuard interface (up to 8 IPv4 addresses) and the link's MTU within 2 s.
+
+**The mesh's ACL and the host firewall do not see kernel-path datagrams.** tc ingress runs
+before netfilter's PREROUTING and INPUT, and the redirect skips OUTPUT and POSTROUTING, so for
+those datagrams the relay's own default-deny rules are the only control. If netfilter has any
+rule that can see the WireGuard interface's input or the link interface's output (a NetBird
+mesh always installs rules on its interface), the relay refuses to start with `kernel_path =
+true` unless the declaration also says `kernel_path_bypasses_netfilter = true`, accepting that
+by name. The relay reads netfilter again every 2 s: a rule that appears while it runs, without
+that acceptance, detaches the kernel path within 2 s, and everything is then forwarded in user
+space where the rule applies (`relay.health`, `status` and `check` say why). A rule that matches
+a literal other interface name does not count; a wildcard that matches the interface (`wg*`)
+does, and so does a base chain with policy drop; when the ruleset cannot be read (nf_tables in
+the kernel and no `nft` command), it refuses.
+
+| `[relay]` key | Default | Means |
+|---|---|---|
+| `kernel_path` | `false` | `true`: forward the eligible rules in the kernel |
+| `kernel_path_bypasses_netfilter` | `false` | `true`: accepted that netfilter does not see kernel-path datagrams; needed when netfilter has rules for these interfaces |
+
+The program needs `CAP_BPF`, which the unit grants and the relay drops once the program is
+attached. When it cannot be loaded, the relay says why and forwards everything in user space.
+No filter outlives the relay: before it starts, the relay removes any filter of its program on
+any interface, whatever its declaration says, and refuses to start if one cannot be removed; it
+removes its own on the way out; the unit's `ExecStopPost` runs `goatrope relay-kernel-off`,
+which needs no declaration, after any exit; `uninstall` removes it too. `relay.health` gives
+`kernel_path` (loaded and its mode, or why not) and each rule's `kernel_to_link` and
+`kernel_failed`; `status` prints them; `check` compares the filters at `pref 3000` on every
+interface with the one the declaration would attach (`relay-kernel-path`) and exits 3 on any
+difference, a stray filter included.
+
 A datagram larger than the tunnel's MTU less 28 bytes (1,392 on WireGuard's 1,420) crosses the
 tunnel as fragments and is relayed whole. After an overload of fragments, fragmented traffic
 is lost until the kernel's reassembly entries time out (`net.ipv4.ipfrag_time`, 30 s by
@@ -370,6 +412,22 @@ the host's kernel. No hardware is involved. They cover:
   install;
 - decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, and a
   file destination cut at `max_mb`;
+- `relay-kernel`: off unless declared; with `kernel_path = true` it forwards 200 of 200 allowed
+  datagrams, each as the relay's socket sends it, IP and UDP checksums verified in the captured
+  frames; crafted packets sent into the tunnel (a UDP checksum of 0, IP options, fragments, bad
+  UDP and IP lengths, a bad IP checksum, a destination that is not the relay's, another peer's
+  source) are forwarded by the kernel only when well formed, and otherwise reach the link
+  exactly as with the socket path alone; still denied: another peer, a port with no rule, the
+  rule's addresses over the underlay; fragments and datagrams over the link MTU go by the
+  socket path; an address added to and removed from wg0 is followed; replies return; a
+  netfilter rule for wg0, or for `wg*`, refuses it unless `kernel_path_bypasses_netfilter =
+  true`, and then that rule does not see its datagrams; a rule added while it runs detaches it
+  within 3 s (0 of 20 then pass the rule); with UDP GRO on wg0, aggregates go by the socket path
+  and every datagram arrives; a refused redirect is counted in `kernel_failed`; a killed relay's filter is removed by the next relay
+  and by `relay-kernel-off` with no valid declaration; without `CAP_BPF` it forwards in user
+  space; the service drops `CAP_BPF`, `check` matches the filter and reports a stray one, its
+  `ExecStopPost` removes the filter after a kill and with an invalid declaration, and
+  `uninstall --purge` removes it;
 - `fragments`: a 1,400-byte datagram relayed and a 1,514-byte frame mirrored whole over a
   1,420-byte tunnel; after an overload of them, unfragmented datagrams and small frames still
   cross, `relay.health` counts the reassembly failures, and fragmented traffic crosses again
@@ -446,7 +504,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `kpath.rs` (the relay's kernel path), `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `nl.rs` and `link.rs` (netlink; WireGuard peers and their handshakes), `sys.rs` and `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |
