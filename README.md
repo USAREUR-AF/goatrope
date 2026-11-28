@@ -27,7 +27,7 @@ On the machine that receives the copy, goatrope runs in up to three declared rol
 |---|---|---|
 | **tap** | records the link: **listen** (a tap device or mirror port hands the machine a copy) or **inline** (the machine bridges the link) | built; tested in network namespaces on Ubuntu 24.04 and 26.04 |
 | **decode-and-send** | takes the tap's copy, extracts the datagrams you name, optionally decodes or converts them with pinned first-bite or goat-transformers components, and sends them to UDP, TCP, HTTP or a file | built; tested in network namespaces |
-| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service; an address proxy for a remote machine); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
+| **relay** | lets a remote machine exchange named datagrams with machines on the link, over the WireGuard mesh the site already runs, or, for a site outside the deployment, over a dedicated tunnel with one peer: the declared boundary point | built (fixed-port UDP rules, as a service; an address proxy for a remote machine; an opt-in layer-2 lane); tested in network namespaces on Ubuntu 24.04 and 26.04; [ADR 0002](docs/adr/0002-relay.md), [ADR 0004](docs/adr/0004-relay-1-0.md) |
 
 It runs with no goat component installed. Why it is a repository of its own, and
 what it leaves to other repositories: [ADR 0001](docs/adr/0001-goatrope-is-its-own-repository.md).
@@ -92,6 +92,7 @@ listen tap with decode-and-send.
 | `goatrope validate` | checks the declaration alone |
 | `goatrope relay` | runs the relay in the foreground (`install` runs it as `goatrope-relay.service`) |
 | `goatrope packs-digest PACKS FROM TO` | prints the `version` and `packs_sha256` a `convert` with the linked engine declares for those packs |
+| `goatrope l2 down` | closes every layer-2 lane (takes its GRETAP interface down); the relay unit runs it whenever the relay stops |
 | `goatrope boundary key\|sheet\|up\|check\|down` | the relay's boundary interface (`transport = "boundary"`): make the key, print what the boundary point needs, bring it up, check it (exit 0 or 3), remove it |
 
 ## What the tap sets, and what `check` reads
@@ -252,6 +253,52 @@ default; goatrope does not change it) while unfragmented traffic keeps flowing.
 `relay.health` carries `reassembly` (this machine's reassembly failures and time-outs since
 the relay started), and `status` prints them when there are any.
 
+## Layer-2 lane (opt-in)
+
+A `[[relay.l2]]` table bridges one dedicated port with a GRETAP interface to one mesh peer
+([ADR 0004](docs/adr/0004-relay-1-0.md) §6), so machines on the two links exchange frames
+as on one segment, within declared lists. It is refused unless the table says
+`accept_layer2 = true`: the lane keeps the risks [ADR 0002](docs/adr/0002-relay.md) lists for
+a layer-2 tunnel (the far side's ARP and broadcasts, any address it claims, the tunnel's loss
+and latency on every frame), bounded by the lists. `examples/relay-l2.toml` is one end; the
+far end declares the same lane with `peer` and `local` swapped and its own `macs`. Status:
+built; tested in network namespaces on Ubuntu 24.04 and 26.04 and in the emulated arm64 VM.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | 1 to 11 lowercase letters, digits or hyphens; the bridge is `l2b-<name>`, the GRETAP interface `l2g-<name>` |
+| `port` | yes | a dedicated Ethernet port: no address, IPv6 off (`disable_ipv6 = 1`), in no other bridge, no qdisc of anyone else's; never a tap port, the management interface, or the relay's link or remote interface |
+| `peer`, `local` | yes | the far end's and this end's IPv4 tunnel addresses on `remote_interface`; `local` must be held there, and on the mesh a WireGuard peer must be allowed `peer`. With `transport = "boundary"`, they are the boundary point and this end |
+| `key` | yes | the GRE key (1 to 4294967295), the same at both ends |
+| `accept_layer2` | yes, `true` | the operator's acceptance of the lane by name |
+| `ethertypes` | yes, 1 to 16 | e.g. `["0x0806", "0x0800"]`. A VLAN tag (0x8100, 0x88a8, 0x9100) is refused, because the filter sees only the outer EtherType |
+| `macs` | yes, 1 to 64 | source MAC addresses accepted from across the tunnel; group and all-zero addresses are refused |
+
+The relay makes the lane when it starts, and owns it while it runs:
+
+| Part | As made |
+|---|---|
+| bridge `l2b-<name>` | the port and the GRETAP interface only; STP off, forward delay 0; no address and no IPv6 address (`addrgenmode none`); multicast snooping and querier off, so multicast floods to the one other member; no VLAN filtering; link-local group frames (01:80:C2:00:00:0X) not forwarded. A tc drop on its own ingress and egress: this machine neither receives from the lane nor sends into it |
+| GRETAP `l2g-<name>` | `local` to `peer`, keyed, bound to `remote_interface`; MTU 1500 with `nopmtudisc` and `ignore-df`, so a 1,514-byte frame crosses as two outer fragments over a WireGuard MTU below 1,500 |
+| filters (tc flower, clsact ingress) | from the port: only the declared EtherTypes. From the tunnel: only the declared EtherTypes from the declared source MACs, and ARP only when its sender hardware address is that source MAC too. Then a matchall drop. Each filter carries a cookie naming what it passes; `goatrope status` and `tc -s filter show` count what passed and what was dropped |
+| state | the GRETAP interface is up only while the WireGuard peer that owns `peer` has a handshake younger than 180 s, read every 2 s; down otherwise. The relay takes it down when it stops (SIGTERM, or the unit's `ExecStopPost=goatrope l2 down` after any stop, a crash included) |
+
+The relay refuses to start when the port is not as above, `ip` or `tc` is missing, the lane's
+interface names are taken by another kind of interface, or `net.bridge.bridge-nf-call-iptables`,
+`-ip6tables` or `-arptables` is 1 (bridged frames would pass through the firewall and its NAT).
+IP forwarding stays off: the relay's forwarding check covers the port, the bridge and the
+GRETAP interface too. Every 2 s the relay re-reads the lane; when any part differs from the
+declaration (a filter removed or changed, the bridge or the GRETAP interface deleted, a setting
+changed), it closes every lane and stops (exit 1), and the unit's restart builds the lane again.
+`check` reports each part (`l2:<name>:bridge`, `:gretap`, `:port`, `:filters:<interface>`,
+`:bridge-nf-call`); `uninstall` deletes the bridge and the GRETAP interface and removes the
+port's filters. The port's own settings (IPv6, up) are the operator's and are not restored.
+
+Each end needs a WireGuard peer that handshakes: when neither end sends a persistent keepalive
+(NetBird sends one every 25 s), an idle tunnel stops handshaking and the lane stays down until
+other traffic to the peer renews it. The relay prints a warning at start when this end's peer
+has none.
+
 ## Tests
 
 `tests/netns/run.sh` runs the tests in a privileged container with systemd as PID 1,
@@ -314,6 +361,14 @@ the host's kernel. No hardware is involved. They cover:
   latest handshake once the peer stops, and taken back after a new probe when it returns; a
   killed relay's address is removed at the next start; SIGTERM and `systemctl stop` remove it;
   `check` and `status` report it; IP forwarding stays off throughout;
+- `l2` (ADR 0004 module 6): refusals without `accept_layer2` and of bad lists; ARP, IPv4 and a
+  declared EtherType crossing both ways between two link hosts, each behind its own lane end,
+  over real WireGuard; an undeclared EtherType, an undeclared source MAC and a spoofed ARP sender
+  dropped and counted; a 1,472-byte ping over a WireGuard MTU of 1,280 (NetBird's); a start that
+  fails while making the lane removes what it made; the lane down within
+  180 s and one tick of the last handshake and up again when it is fresh; check 3 when a filter,
+  the GRETAP interface or the bridge is removed, and 0 once the restarted relay builds it again;
+  uninstall leaves nothing;
 - `deploy`, in an image with Ansible: the play from a release file. Refusals leave the machine,
   `current` and the ledger as they were; install, a second run that changes nothing, repair,
   a changed declaration, a newer release, rollback, and inline with no ping lost on a re-run;
@@ -345,7 +400,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `l2.rs` (the layer-2 lane), `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |

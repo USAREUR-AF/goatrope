@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- layer-2 lane (ADR 0004 module 6): `[[relay.l2]]` bridges one dedicated port with a GRETAP
+  interface to one mesh peer, only with `accept_layer2 = true`. tc flower passes only the declared
+  EtherTypes, and from the tunnel only the declared source MACs (ARP only with a matching sender
+  address); everything else is dropped and counted. The GRETAP interface follows the peer's
+  WireGuard handshake (down after 180 s) and carries 1,500-byte frames over a smaller WireGuard
+  MTU. `check`, `status` and `uninstall` cover it; `goatrope l2 down` closes every lane and runs
+  when the relay unit stops. Namespace phase `l2`.
 - ADR 0006 (Proposed): the data path of each role. Relay UDP is batched in user space
   (`recvmmsg`/`sendmmsg`, 64 datagrams a call, no busy polling) behind one internal interface,
   with a per-rule `receive_buffer_kb` (default 8,192); a tc program for relay UDP is measured as

@@ -822,9 +822,11 @@ pub fn install(cfg: &Config) -> R<()> {
         state["mode"] = json!(tap.mode);
         state["record_directory"] = json!(tap.record.directory);
     }
-    // uninstall removes a boundary interface the relay made
+    // a lane the previous declaration had and this one does not is removed
+    crate::l2::remove(&state["relay"]["l2"], &crate::l2::bridges(cfg));
+    // uninstall removes a boundary interface the relay made, and the layer-2 lanes
     state["relay"] = match &cfg.relay {
-        Some(r) => json!({"transport": r.transport, "remote_interface": r.remote_interface}),
+        Some(r) => json!({"transport": r.transport, "remote_interface": r.remote_interface, "l2": crate::l2::state(cfg)}),
         None => Value::Null,
     };
     let stale: Vec<String> = state["files"]
@@ -960,6 +962,7 @@ pub fn uninstall(purge: bool) -> R<()> {
             let _ = crate::boundary::down(ifname); // the relay's own interface; a mesh interface is never touched
         }
     }
+    crate::l2::remove(&state["relay"]["l2"], &[]);
     remove(crate::relay::HEALTH);
     if su::nm_active() {
         su::run(&["nmcli", "general", "reload", "conf"]);
@@ -1196,6 +1199,7 @@ pub fn check(cfg: &Config) -> Vec<Item> {
         items.extend(check_tap(cfg, tap));
     }
     items.extend(crate::relay::check(cfg));
+    items.extend(crate::l2::check(cfg));
     let src = su::run(&["findmnt", "-no", "SOURCE", "/"]).stdout.trim().to_string();
     let crypt = su::run(&["lsblk", "-no", "TYPE", "-s", &src]).stdout.contains("crypt");
     item(
@@ -1530,6 +1534,7 @@ pub fn status(cfg: &Config) -> i32 {
     if let Some(r) = &cfg.relay {
         println!("{}", crate::relay::banner(r));
         crate::relay::status(cfg);
+        crate::l2::status(cfg);
     }
     send::status(cfg);
     let items = check(cfg);
