@@ -3,6 +3,7 @@
 //! Small helpers for reading the machine and reporting errors as the Python tree did.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::link::SYS_NET;
 
@@ -58,4 +59,30 @@ pub fn forwarding(ifname: &str) -> Vec<&'static str> {
 pub fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }
+}
+
+// ---------------------------------------------------------------- stop on a signal
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// SIGTERM (systemd stop), SIGINT and SIGHUP set a flag the relay loop reads, so it can remove
+/// the proxy addresses it added before it exits. poll(2) returns EINTR on the signal.
+pub fn catch_stop_signals() {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: an all-zero sigaction is valid; the handler only stores to an atomic.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+pub fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
 }

@@ -6,8 +6,8 @@ SPDX-License-Identifier: Apache-2.0
 # Related work
 
 What goatrope takes from established practice, where it comes from, and what goatrope adds.
-The last table lists practice goatrope does not follow yet; each item there is designed or
-proposed, not built.
+The comparison with overlay networks follows the first table. The last table lists practice
+goatrope does not follow yet; each item there is designed or proposed, not built.
 
 ## What goatrope follows
 
@@ -26,6 +26,32 @@ proposed, not built.
 | A rule set that matches EtherType and MAC and ends in drop | ZeroTier 1.14.2, `node/Network.cpp` (`_doZtFilter`), `rule-compiler/rule-compiler.js` and its example rule set (`drop not ethertype 0x0800 not ethertype 0x0806 not ethertype 0x86dd`) | tc flower in the kernel at both lane ends, on the ingress of both bridge members, then a matchall drop that counts; each filter carries a cookie, and the relay stops when one is removed or replaced |
 | A virtual Ethernet MTU above the path MTU, fragmented underneath | ZeroTier 1.14.2, `node/Constants.hpp` (`ZT_DEFAULT_MTU` 2800) and `include/ZeroTierOne.h` (`ZT_DEFAULT_PHYSMTU` 1432), with ZeroTier's own packet fragmentation | GRETAP MTU 1500 with `nopmtudisc` and `ignore-df`: the kernel fragments the outer IPv4 packet and WireGuard carries the fragments; goatrope has no fragmentation code |
 | Namespace topologies for acceptance tests | Linux kernel `tools/testing/selftests/net/` (`rtnetlink.sh`, `forwarding/mirror_gre*.sh`) | `tests/netns`: veth pairs, namespaces, a mirroring switch namespace for ERSPAN, a WireGuard boundary point |
+
+## Overlay networks compared
+
+An overlay network such as ZeroTier makes distant machines members of one virtual Ethernet
+segment. goatrope does not try to be one: in a goat deployment a WireGuard mesh (NetBird) gives
+the machines their addresses, keys and paths, and goatrope adds what the mesh does not do for a
+sensor link. The table sets ZeroTier 1.14.2, read from its source, against goatrope with such a
+mesh, job by job. Each goatrope entry has the status it has on `main`, and the measured figures
+come from the namespace phases in [ADR 0004](adr/0004-relay-1-0.md) (Validation) and from
+[performance.md](performance.md).
+
+| Job | ZeroTier 1.14.2 | goatrope with a WireGuard mesh | Where goatrope does more, or less |
+|---|---|---|---|
+| Membership, addresses, keys, NAT traversal | Its own controller and root servers; members are admitted by the controller (`controller/`, `node/Topology.cpp`) | The mesh's job (NetBird). goatrope holds no peer keys; with `transport = "boundary"` it runs one WireGuard interface with one declared peer | Less: goatrope has no controller and admits no one. A peer's identity is whatever the mesh authenticated |
+| Encryption | Its own protocol: Curve25519 identities, Salsa20/12 with Poly1305, or AES-GMAC-SIV (`node/Packet.hpp`) | WireGuard, the mesh's or goatrope's boundary interface | Neither adds cryptography; goatrope depends on WireGuard's |
+| Default policy | A network created without rules accepts every frame, "a flat L2 segment" (`controller/DB.cpp`) | Default deny: the relay forwards only the ports, directions and peers its rules name, and refuses to start while IP forwarding would route around them | More: nothing crosses that the declaration does not name |
+| Getting a copy of a link that is not on the overlay | Not a ZeroTier function | A tap device, a mirror port, ERSPAN or goatrope's own inline tap, recorded and decoded on the machine; listen ports drop every outgoing frame | More: this is goatrope's main role. Less: a process with `CAP_NET_RAW` can get past the listen drop |
+| Port-level forwarding to a machine on a link | Rules can match ports, but traffic is bridged or routed between members | The relay: UDP and TCP rules in either direction, sent from the relay's own address, with `max_connections` and keepalive bounds | More: a machine on the link needs no client and no route; it sees one local address |
+| A remote machine under a local address | Managed IPs on the virtual network; `osdep/Arp.cpp` answers ARP for its own entries | `[[relay.proxy]]`: an RFC 5227 probe before the address is taken; held only while the peer's WireGuard handshake is younger than 180 s (removed 180.6 and 181.1 s after the last handshake, measured) | More: no address is taken that another machine holds, and none is held for a dead path |
+| Layer-2 bridging | Every member is on the segment; a member may bridge other MACs only when the controller marks it `activeBridge` (`node/Switch.cpp`, `node/IncomingPacket.cpp`) | `[[relay.l2]]`, accepted by name: one port to one peer over GRETAP, only the declared EtherTypes, and from the tunnel only the declared source MACs (ARP only with a matching sender address); the rest dropped and counted | More: a named list of source MACs, not any MAC behind a bridge. Less: one peer per lane, IPv4 tunnel addresses only, and no segment with many members |
+| Frame filtering | A rule engine evaluated on sender and receiver: EtherType, MAC, IP, ports, tags, capabilities (`node/Network.cpp`, `rule-compiler/`) | tc flower in the kernel at both lane ends, a final matchall drop, a cookie on every filter; the relay stops when one is removed or changed | Less: EtherType and source MAC only. More: a tampered filter stops the relay |
+| Full-size frames over a smaller path | A 2,800-byte virtual MTU over a 1,432-byte physical one, with ZeroTier's own fragmentation (`node/Constants.hpp`, `include/ZeroTierOne.h`) | GRETAP MTU 1,500 with outer fragmentation (`nopmtudisc`, `ignore-df`); the kernel fragments and WireGuard carries the fragments. A 1,472-byte ping with DF set crossed 10 of 10 over WireGuard MTU 1,280 (measured) | Equal for 1,500-byte frames; goatrope carries no frames above 1,500 bytes |
+| Following a path that has died | Peer and path timeouts (`ZT_PEER_ACTIVITY_TIMEOUT`, `ZT_PATH_HEARTBEAT_PERIOD`) | The lane and the proxy address follow the WireGuard handshake: the lane went down 180.6 to 182.8 s after the last one in namespaces and 182.0 s in the emulated arm64 VM, and came back within 1 s of a fresh one (2.2 s in the VM) (measured) | More for the link side: the proxy address is withdrawn and the lane closed, so machines on the link stop sending into a dead path |
+| Multicast | Multicast groups with a per-network recipient limit (`multicastLimit`, 32 by default) and broadcast on by default (`node/Multicaster.cpp`, `controller/DB.cpp`) | Designed (ADR 0004 §3), not built. On the lane, multicast and broadcast cross only within the declared EtherTypes and MACs | Less, until it is built |
+| Copying frames to an observer | Rule actions `TEE` and `WATCH` send a copy of a frame to another member (`include/ZeroTierOne.h`) | `[[tap.mirror]]` (ADR 0004 §5): designed, not built. Its kernel path, tc `mirred` to an ERSPAN interface over WireGuard, mirrored 85,397 to 238,555 frames a second with none lost (measured) | Less, until it is built |
+| Platforms | Linux, macOS, Windows and the BSDs (`osdep/*EthernetTap*`), and an Android binding (`java/`) | Ubuntu 24.04 and 26.04 on amd64 and arm64; phones and desktops reach it as mesh peers | Less: goatrope runs only on the machine at the link |
 
 ## Not followed yet
 

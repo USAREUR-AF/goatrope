@@ -6,9 +6,11 @@
   interface to one mesh peer, only with `accept_layer2 = true`. tc flower passes only the declared
   EtherTypes, and from the tunnel only the declared source MACs (ARP only with a matching sender
   address); everything else is dropped and counted. The GRETAP interface follows the peer's
-  WireGuard handshake (down after 180 s) and carries 1,500-byte frames over a smaller WireGuard
-  MTU. `check`, `status` and `uninstall` cover it; `goatrope l2 down` closes every lane and runs
-  when the relay unit stops. Namespace phase `l2`.
+  WireGuard handshake (down after 180 s) and carries 1,500-byte frames over a WireGuard MTU as
+  low as NetBird's 1,280. A start that fails while making a lane leaves none of it behind. The
+  relay's IP forwarding check covers the lane's interfaces. `check`, `status` and `uninstall`
+  cover it; `goatrope l2 down` closes every lane and runs when the relay unit stops. Namespace
+  phase `l2`; also run in the emulated arm64 VM.
 - ADR 0006 (Proposed): the data path of each role. Relay UDP is batched in user space
   (`recvmmsg`/`sendmmsg`, 64 datagrams a call, no busy polling) behind one internal interface,
   with a per-rule `receive_buffer_kb` (default 8,192); a tc program for relay UDP is measured as
@@ -21,6 +23,15 @@
   (p99 115 µs over 10,000 messages on amd64, asserted by namespace phase `linked-engine`); the
   send heartbeat and `status` report each conversion's count, p50, p99 and maximum, and the
   pack load's time and memory. Fixes #29.
+- docs: the README's role and feature tables give each part of the relay its status on `main`;
+  docs/related-work.md compares ZeroTier 1.14.2 with goatrope on a WireGuard mesh, job by job;
+  the landing page shows the relay's parts and the measured rates.
+- tests: `tests/arm64/run.sh` takes `GOATROPE_ARM64_CONTAINER` (the VM's container name, so two VMs
+  can share a host) and `GOATROPE_ARM64_PHASES` (only the named phases, with no reboot). The
+  `boundary` phase keeps the boundary point down while it changes the peer's endpoint, so
+  WireGuard roaming cannot undo the change before the relay starts.
+- source: the WireGuard handshake helpers are in `src/nl.rs` and the relay's stop-signal flag in
+  `src/sys.rs`, shared by the address proxy, the layer-2 lane and the relay loop.
 - tests: `tests/netns/run.sh` and `tests/arm64/run.sh` name their images by a hash of the
   Dockerfile (`goatrope-netns-<hash>`, `goatrope-qemu-arm64-<hash>`), so runs from trees whose
   Dockerfiles differ no longer overwrite each other's image on a shared host.

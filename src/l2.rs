@@ -20,7 +20,7 @@
 //!
 //! The GRETAP interface is up only while the WireGuard peer that owns `peer` has a handshake
 //! younger than 180 s (read every 2 s, with `nl::handshake_age`); it is
-//! taken down when the relay stops (on SIGTERM through `nl::stop_requested`, and ExecStopPost
+//! taken down when the relay stops (on SIGTERM through `sys::stop_requested`, and ExecStopPost
 //! runs `goatrope l2 down`), and when anything about the lane differs from the declaration, after
 //! which the relay exits and the unit's restart builds it again.
 
