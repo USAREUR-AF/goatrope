@@ -3303,6 +3303,9 @@ def phase_l2() -> None:
     result(p.returncode == 2 and not left and "clsact" not in qd,
            "l2: a start that fails while making the lane removes what it made", f"exit {p.returncode}, left {left}: {p.stderr.strip()[-120:]}")
 
+    # a foreground relay of an earlier phase leaves relay.health; uninstall removes it, so start without it
+    if os.path.exists("/var/lib/goatrope/relay.health") and not os.path.exists("/var/lib/goatrope/state.json"):
+        os.remove("/var/lib/goatrope/relay.health")
     before = snapshot()
     p = gr("install", "--config", CFG)
     result(p.returncode == 0, "l2: install of a relay with a lane", f"exit {p.returncode}: {(p.stdout + p.stderr).strip()[-300:]}")
