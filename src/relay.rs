@@ -207,6 +207,24 @@ fn bound_free(dev: &str, addr: IpAddr, port: u16, freebind: bool) -> io::Result<
     Ok(sock)
 }
 
+/// A rule's socket with its receive buffer (`receive_buffer_kb`, docs/adr/0006-data-path.md): a burst
+/// that arrives while the relay's one thread is not running waits there instead of being dropped.
+/// SO_RCVBUFFORCE (the unit has CAP_NET_ADMIN) sets it past net.core.rmem_max; without the capability,
+/// SO_RCVBUF sets as much as rmem_max allows.
+fn sized(sock: io::Result<UdpSocket>, rule: &RelayRule) -> io::Result<UdpSocket> {
+    let sock = sock?;
+    let bytes: libc::c_int = (rule.receive_buffer_kb * 1024).min(i32::MAX as usize) as libc::c_int;
+    let size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    for opt in [libc::SO_RCVBUFFORCE, libc::SO_RCVBUF] {
+        // SAFETY: the option value is a c_int of the size given.
+        let rc = unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, opt, &bytes as *const _ as *const libc::c_void, size) };
+        if rc == 0 {
+            break;
+        }
+    }
+    Ok(sock)
+}
+
 /// The unspecified address of addr's family.
 pub(crate) fn any_of(addr: IpAddr) -> IpAddr {
     if addr.is_ipv4() {
@@ -239,16 +257,6 @@ struct RuleState<'a> {
     send_errors: u64,
 }
 
-impl RuleState<'_> {
-    fn count(&mut self, toward_link: bool) {
-        if toward_link {
-            self.to_link += 1;
-        } else {
-            self.to_remote += 1;
-        }
-    }
-}
-
 /// The time as Python's json module writes a float: the shortest form that reads back the
 /// same, with ".0" on a whole number.
 fn json_float(f: f64) -> String {
@@ -270,6 +278,38 @@ fn dest_of(rule: &RelayRule) -> String {
     }
 }
 
+/// This machine's IP reassembly failures and timeouts so far, IPv4 and IPv6 together
+/// (/proc/net/snmp ReasmFails and ReasmTimeout, /proc/net/snmp6 Ip6ReasmFails and Ip6ReasmTimeout).
+/// A fragmented datagram that the tunnel half-dropped holds reassembly memory until it times out,
+/// and while that memory is full every fragmented datagram is lost (docs/adr/0006-data-path.md).
+pub fn reassembly() -> (u64, u64) {
+    let mut fails = 0;
+    let mut timeouts = 0;
+    if let Some(t) = su::read("/proc/net/snmp") {
+        let ip: Vec<&str> = t.lines().filter(|l| l.starts_with("Ip:")).collect();
+        if ip.len() == 2 {
+            for (k, v) in ip[0].split_whitespace().zip(ip[1].split_whitespace()) {
+                match k {
+                    "ReasmFails" => fails += v.parse::<u64>().unwrap_or(0),
+                    "ReasmTimeout" => timeouts += v.parse::<u64>().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(t) = su::read("/proc/net/snmp6") {
+        for l in t.lines() {
+            let mut w = l.split_whitespace();
+            match (w.next(), w.next().and_then(|v| v.parse::<u64>().ok())) {
+                (Some("Ip6ReasmFails"), Some(n)) => fails += n,
+                (Some("Ip6ReasmTimeout"), Some(n)) => timeouts += n,
+                _ => {}
+            }
+        }
+    }
+    (fails, timeouts)
+}
+
 fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> String {
     let mut rows: Vec<String> = state
         .iter()
@@ -289,7 +329,16 @@ fn health_json(time: f64, state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp
             c.json()
         )
     }));
-    format!("{{\"time\": {}, \"rules\": [{}], \"proxies\": {}}}", json_float(time), rows.join(", "), proxies.health_json())
+    let (fails, timeouts) = reassembly();
+    let (f0, t0) = *REASM_AT_START.get_or_init(reassembly);
+    format!(
+        "{{\"time\": {}, \"rules\": [{}], \"proxies\": {}, \"reassembly\": {{\"failed\": {}, \"timed_out\": {}}}}}",
+        json_float(time),
+        rows.join(", "),
+        proxies.health_json(),
+        fails.saturating_sub(f0),
+        timeouts.saturating_sub(t0)
+    )
 }
 
 fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], proxies: &Proxies) -> Result<(), String> {
@@ -305,6 +354,9 @@ fn health(state: &[RuleState], tcp: &[(&RelayRule, Arc<relay_tcp::Counters>)], p
     }
     Ok(())
 }
+
+/// The reassembly counters when the relay started; relay.health reports what happened since.
+static REASM_AT_START: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
 
 pub fn run(cfg: &Config) -> i32 {
     // first, so a stop request during start-up still ends in the loop, which removes what it added
@@ -323,6 +375,7 @@ pub fn run(cfg: &Config) -> i32 {
 }
 
 fn serve(cfg: &Config) -> Result<i32, String> {
+    REASM_AT_START.get_or_init(reassembly);
     let r = cfg.relay.as_ref().unwrap();
     let link_ip = r.link_address.split('/').next().unwrap_or_default();
     let link_addr: IpAddr = link_ip.parse().map_err(|_| format!("bad link address {link_ip}"))?;
@@ -376,12 +429,12 @@ fn serve(cfg: &Config) -> Result<i32, String> {
             continue;
         }
         let (listen, outs) = if l2r {
-            let listen = bound_free(&r.link_interface, link_addr, rule.listen_port, free).map_err(|e| sys::strerror(&e))?;
-            let outs = clients.iter().map(|_| bound(&r.remote_interface, any_of(remote), 0)).collect::<io::Result<Vec<_>>>();
+            let listen = sized(bound_free(&r.link_interface, link_addr, rule.listen_port, free), rule).map_err(|e| sys::strerror(&e))?;
+            let outs = clients.iter().map(|_| sized(bound(&r.remote_interface, any_of(remote), 0), rule)).collect::<io::Result<Vec<_>>>();
             (listen, outs.map_err(|e| sys::strerror(&e))?)
         } else {
-            let listen = bound(&r.remote_interface, any_of(remote), rule.listen_port).map_err(|e| sys::strerror(&e))?;
-            (listen, vec![bound_free(&r.link_interface, link_addr, 0, free).map_err(|e| sys::strerror(&e))?])
+            let listen = sized(bound(&r.remote_interface, any_of(remote), rule.listen_port), rule).map_err(|e| sys::strerror(&e))?;
+            (listen, vec![sized(bound_free(&r.link_interface, link_addr, 0, free), rule).map_err(|e| sys::strerror(&e))?])
         };
         let n = clients.len();
         state.push(RuleState {
@@ -408,8 +461,8 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         .collect();
     health(&state, &tcp, &proxies)?; // at once, so a service manager sees it running
     let mut last = Instant::now();
-    let mut last_denied_log: Option<Instant> = None;
-    let mut buf = vec![0u8; 65535];
+    let mut path = Batched::new();
+    let mut denied_log = DeniedLog(None);
     loop {
         if proxy::stop_requested() {
             println!("goatrope relay: stopping on a signal");
@@ -430,64 +483,10 @@ fn serve(cfg: &Config) -> Result<i32, String> {
         // SAFETY: fds is a valid array of pollfd of the length given (poll with none is a sleep).
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, proxies.timeout_ms(1000)) };
         if n > 0 {
+            // the proxy's fd, if any, is last and has no slot: zip stops before it
             for (pfd, &(i, out)) in fds.iter().zip(slots.iter()) {
-                if pfd.revents == 0 {
-                    continue;
-                }
-                let st = &mut state[i];
-                let l2r = st.rule.link_initiated();
-                let sock = match out {
-                    None => &st.listen,
-                    Some(k) => &st.outs[k],
-                };
-                let Ok((len, src)) = sock.recv_from(&mut buf) else {
-                    continue;
-                };
-                let data = &buf[..len];
-                let rule = st.rule;
-                // a send toward the link from a proxy address the relay does not hold is a send error
-                let link_blocked = st.held.as_ref().is_some_and(|h| !h.held());
-                match out {
-                    None => {
-                        let Some(c) = st.clients.iter().position(|a| *a == src.ip()) else {
-                            st.denied += 1;
-                            if last_denied_log.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
-                                let allowed = if l2r { rule.sources.join(", ") } else { rule.remote.clone() };
-                                println!("denied: {}:{} -> port {} (allowed: {allowed})", src.ip(), src.port(), rule.listen_port);
-                                last_denied_log = Some(Instant::now());
-                            }
-                            continue;
-                        };
-                        st.peers[c] = Some(src);
-                        let Some(to) = st.dest else {
-                            st.send_errors += 1;
-                            continue;
-                        };
-                        if !l2r && link_blocked {
-                            st.send_errors += 1;
-                            continue;
-                        }
-                        match st.outs[c].send_to(data, to) {
-                            Ok(_) => st.count(!l2r),
-                            // dropped and counted; the relay keeps running
-                            Err(_) => st.send_errors += 1,
-                        }
-                    }
-                    Some(k) => {
-                        let Some(peer) = st.peers[k].filter(|_| st.replies && Some(src) == st.dest) else {
-                            st.denied += 1;
-                            continue;
-                        };
-                        if l2r && link_blocked {
-                            st.send_errors += 1;
-                            continue;
-                        }
-                        match st.listen.send_to(data, peer) {
-                            Ok(_) => st.count(l2r),
-                            // the tunnel is down or the peer has no endpoint: dropped and counted
-                            Err(_) => st.send_errors += 1,
-                        }
-                    }
+                if pfd.revents != 0 {
+                    path.pump(&mut state[i], out, &mut denied_log);
                 }
             }
         }
@@ -514,6 +513,230 @@ fn serve(cfg: &Config) -> Result<i32, String> {
 /// The address a rule's link-side sockets bind to: its proxy address, else the relay's own.
 fn rule_link_ip(rule: &RelayRule, own: IpAddr) -> IpAddr {
     rule.link_address.as_deref().and_then(|a| a.parse().ok()).unwrap_or(own)
+}
+
+// ---------------------------------------------------------------- the UDP data path (docs/adr/0006)
+
+/// Rate-limits the "denied" line: one every 10 s at most.
+struct DeniedLog(Option<Instant>);
+
+/// How datagrams cross the relay. Every UDP rule is forwarded through this one interface; ADR 0006
+/// records what was measured for each way of doing it.
+trait Datapath {
+    /// Forward what is waiting on one of a rule's sockets: its listening socket (`out` None), or the
+    /// outgoing socket of client `out` (the replies). Every datagram is either sent and counted, or
+    /// denied or failed and counted.
+    fn pump(&mut self, st: &mut RuleState, out: Option<usize>, log: &mut DeniedLog);
+}
+
+/// Datagrams per system call.
+const BATCH: usize = 64;
+/// Batches taken from one socket before the others are served.
+const ROUNDS: usize = 8;
+const DGRAM: usize = 65535;
+
+/// User space, batched: recvmmsg takes up to BATCH datagrams in one call, the rule is applied to each,
+/// and sendmmsg sends the allowed ones in one call. The bytes are not copied in between.
+struct Batched {
+    bufs: Vec<u8>,
+    lens: Vec<usize>,
+    from: Vec<libc::sockaddr_storage>,
+    to: Vec<libc::sockaddr_storage>,
+    keep: Vec<usize>,
+}
+
+impl Batched {
+    fn new() -> Batched {
+        // SAFETY: an all-zero sockaddr_storage is a valid value.
+        let zero: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        Batched {
+            bufs: vec![0u8; BATCH * DGRAM],
+            lens: vec![0; BATCH],
+            from: vec![zero; BATCH],
+            to: vec![zero; BATCH],
+            keep: Vec::with_capacity(BATCH),
+        }
+    }
+
+    /// Up to BATCH datagrams from sock, without waiting; their lengths and sources are in self.
+    fn recv(&mut self, sock: &UdpSocket) -> usize {
+        let base = self.bufs.as_mut_ptr();
+        let mut iov: Vec<libc::iovec> =
+            // SAFETY: each pointer is inside bufs, DGRAM bytes apart.
+            (0..BATCH).map(|i| libc::iovec { iov_base: unsafe { base.add(i * DGRAM) } as *mut libc::c_void, iov_len: DGRAM }).collect();
+        // SAFETY: an all-zero mmsghdr is a valid value; the pointers are filled below.
+        let mut msgs: Vec<libc::mmsghdr> = (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+        for (i, m) in msgs.iter_mut().enumerate() {
+            m.msg_hdr.msg_name = &mut self.from[i] as *mut _ as *mut libc::c_void;
+            m.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            m.msg_hdr.msg_iov = &mut iov[i];
+            m.msg_hdr.msg_iovlen = 1;
+        }
+        // SAFETY: msgs, iov, from and bufs outlive the call and hold BATCH entries each.
+        let n = unsafe {
+            libc::recvmmsg(sock.as_raw_fd(), msgs.as_mut_ptr(), BATCH as libc::c_uint, libc::MSG_DONTWAIT as _, std::ptr::null_mut())
+        };
+        if n <= 0 {
+            return 0;
+        }
+        for (i, m) in msgs.iter().take(n as usize).enumerate() {
+            self.lens[i] = m.msg_len as usize;
+        }
+        n as usize
+    }
+
+    /// Send the datagrams in self.keep to the addresses in self.to; returns (sent, failed).
+    fn send(&mut self, sock: &UdpSocket) -> (u64, u64) {
+        let base = self.bufs.as_mut_ptr();
+        let mut iov: Vec<libc::iovec> = self
+            .keep
+            .iter()
+            // SAFETY: each pointer is inside bufs, at a datagram received into it.
+            .map(|&i| libc::iovec { iov_base: unsafe { base.add(i * DGRAM) } as *mut libc::c_void, iov_len: self.lens[i] })
+            .collect();
+        // SAFETY: an all-zero mmsghdr is a valid value; the pointers are filled below.
+        let mut msgs: Vec<libc::mmsghdr> = (0..self.keep.len()).map(|_| unsafe { std::mem::zeroed() }).collect();
+        for (j, m) in msgs.iter_mut().enumerate() {
+            let len = match self.to[j].ss_family as libc::c_int {
+                libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
+                _ => std::mem::size_of::<libc::sockaddr_in>(),
+            };
+            m.msg_hdr.msg_name = &mut self.to[j] as *mut _ as *mut libc::c_void;
+            m.msg_hdr.msg_namelen = len as libc::socklen_t;
+            m.msg_hdr.msg_iov = &mut iov[j];
+            m.msg_hdr.msg_iovlen = 1;
+        }
+        let (mut sent, mut failed, mut at) = (0u64, 0u64, 0usize);
+        while at < msgs.len() {
+            // SAFETY: msgs[at..] and what it points to outlive the call.
+            let k = unsafe {
+                libc::sendmmsg(sock.as_raw_fd(), msgs[at..].as_mut_ptr(), (msgs.len() - at) as libc::c_uint, libc::MSG_DONTWAIT as _)
+            };
+            if k > 0 {
+                sent += k as u64;
+                at += k as usize;
+            } else {
+                // the datagram at `at` cannot be sent (no route, no peer, a full buffer): dropped and counted
+                failed += 1;
+                at += 1;
+            }
+        }
+        (sent, failed)
+    }
+}
+
+fn to_sockaddr(a: SocketAddr, out: &mut libc::sockaddr_storage) {
+    match a {
+        SocketAddr::V4(v) => {
+            // SAFETY: sockaddr_storage is large enough and aligned for a sockaddr_in.
+            let sa = unsafe { &mut *(out as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_port = v.port().to_be();
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v.ip().octets());
+        }
+        SocketAddr::V6(v) => {
+            // SAFETY: sockaddr_storage is large enough and aligned for a sockaddr_in6.
+            let sa = unsafe { &mut *(out as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6) };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = v.port().to_be();
+            sa.sin6_addr.s6_addr = v.ip().octets();
+            sa.sin6_flowinfo = 0;
+            sa.sin6_scope_id = v.scope_id();
+        }
+    }
+}
+
+fn from_sockaddr(s: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match s.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: the family says this storage holds a sockaddr_in.
+            let sa = unsafe { &*(s as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+            Some(SocketAddr::new(IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()), u16::from_be(sa.sin_port)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the family says this storage holds a sockaddr_in6.
+            let sa = unsafe { &*(s as *const libc::sockaddr_storage as *const libc::sockaddr_in6) };
+            Some(SocketAddr::new(IpAddr::from(sa.sin6_addr.s6_addr), u16::from_be(sa.sin6_port)))
+        }
+        _ => None,
+    }
+}
+
+impl Datapath for Batched {
+    fn pump(&mut self, st: &mut RuleState, out: Option<usize>, log: &mut DeniedLog) {
+        let rule = st.rule;
+        let l2r = rule.link_initiated();
+        // a send toward the link from a proxy address the relay does not hold is a send error
+        let link_blocked = st.held.as_ref().is_some_and(|h| !h.held());
+        for _ in 0..ROUNDS {
+            let n = self.recv(match out {
+                None => &st.listen,
+                Some(k) => &st.outs[k],
+            });
+            if n == 0 {
+                return;
+            }
+            // (datagram, the socket it leaves by: Some(client) for an outgoing one, None for the listening one)
+            let mut via: Vec<(usize, Option<usize>, SocketAddr)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let Some(src) = from_sockaddr(&self.from[i]) else {
+                    st.denied += 1;
+                    continue;
+                };
+                match out {
+                    None => {
+                        let Some(c) = st.clients.iter().position(|a| *a == src.ip()) else {
+                            st.denied += 1;
+                            if log.0.is_none_or(|t| t.elapsed() > Duration::from_secs(10)) {
+                                let allowed = if l2r { rule.sources.join(", ") } else { rule.remote.clone() };
+                                println!("denied: {}:{} -> port {} (allowed: {allowed})", src.ip(), src.port(), rule.listen_port);
+                                log.0 = Some(Instant::now());
+                            }
+                            continue;
+                        };
+                        st.peers[c] = Some(src);
+                        match st.dest {
+                            Some(_) if !l2r && link_blocked => st.send_errors += 1,
+                            Some(to) => via.push((i, Some(c), to)),
+                            None => st.send_errors += 1,
+                        }
+                    }
+                    Some(k) => match st.peers[k].filter(|_| st.replies && Some(src) == st.dest) {
+                        Some(_) if l2r && link_blocked => st.send_errors += 1,
+                        Some(peer) => via.push((i, None, peer)),
+                        None => st.denied += 1,
+                    },
+                }
+            }
+            // one sendmmsg per socket the datagrams leave by; each socket's datagrams in the order they arrived
+            let mut socks: Vec<Option<usize>> = via.iter().map(|v| v.1).collect();
+            socks.sort();
+            socks.dedup();
+            for sk in socks {
+                self.keep.clear();
+                for &(i, _, to) in via.iter().filter(|v| v.1 == sk) {
+                    let j = self.keep.len();
+                    to_sockaddr(to, &mut self.to[j]);
+                    self.keep.push(i);
+                }
+                let (sent, failed) = self.send(match sk {
+                    Some(c) => &st.outs[c],
+                    None => &st.listen,
+                });
+                // from the listening socket toward the rule's destination; back toward the sender for replies
+                let toward_link = if sk.is_some() { !l2r } else { l2r };
+                if toward_link {
+                    st.to_link += sent;
+                } else {
+                    st.to_remote += sent;
+                }
+                st.send_errors += failed;
+            }
+            if n < BATCH {
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- install time: unit, check, status
@@ -645,6 +868,16 @@ pub fn status(cfg: &Config) {
     match &health {
         Some((_, age)) => println!("  relay  counters written {age:.1} s ago{}", if *age > STALE_S { " (stale)" } else { "" }),
         None => println!("  relay  no counters yet ({HEALTH} absent)"),
+    }
+    if let Some((v, _)) = &health {
+        let n = |k: &str| v["reassembly"][k].as_u64().unwrap_or(0);
+        if n("failed") + n("timed_out") > 0 {
+            println!(
+                "  relay  this machine failed to reassemble {} fragmented datagram(s), {} timed out, since the relay started: fragmented traffic is lost while that lasts",
+                n("failed"),
+                n("timed_out")
+            );
+        }
     }
     proxy::status(r, health.as_ref().map(|(v, _)| v));
     for rule in &r.rules {

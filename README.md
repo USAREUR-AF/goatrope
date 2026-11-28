@@ -91,6 +91,7 @@ listen tap with decode-and-send.
 | `goatrope uninstall [--purge]` | removes every unit, network file, sysctl and watchdog drop-in install wrote, `relay.health` and the relay's boundary interface, deletes the bridge, and restores each port's offloads, EEE, speed, ARP, IPv6 and up/down state as install found them. Keeps the declaration and recordings unless `--purge` |
 | `goatrope validate` | checks the declaration alone |
 | `goatrope relay` | runs the relay in the foreground (`install` runs it as `goatrope-relay.service`) |
+| `goatrope packs-digest PACKS FROM TO` | prints the `version` and `packs_sha256` a `convert` with the linked engine declares for those packs |
 | `goatrope boundary key\|sheet\|up\|check\|down` | the relay's boundary interface (`transport = "boundary"`): make the key, print what the boundary point needs, bring it up, check it (exit 0 or 3), remove it |
 
 ## What the tap sets, and what `check` reads
@@ -120,8 +121,8 @@ on a mirror port a frame that gets past it reaches the switch.
 
 A `[[send]]` reads frames on one tap port, receive only, reassembles IPv4
 fragments, keeps the UDP datagrams its `match` names (at least one address or
-port is required), optionally converts each payload with a goat-transformers
-binary pinned by SHA-256, and sends it to each destination: `udp://`, `tcp://`
+port is required), optionally converts each payload with the goat-transformers engine linked into goatrope,
+and sends it to each destination: `udp://`, `tcp://`
 (`framing = "len32be"` or `"raw"`), `http(s)://` (one POST per message, redirects
 refused) or `file:///var/lib/goatrope/...` (`format = "jsonl"` or `"raw"`, and
 `max_mb`: the file is cut there and one older file kept). A destination whose
@@ -129,10 +130,18 @@ route leaves through a tap port, or whose name does not resolve, is refused at
 install and at send time: decode-and-send never transmits on the tapped link. TCP
 stream reassembly is not built.
 
-The converter runs `goat-xf convert --packs <packs> --packs-only <from>,<to>` once
-per message. On an amd64 workstation one such run took 0.14 s with the two packs
-(0.7 s with every pack), so a converted feed is limited to a few messages per
-second.
+A `convert` converts with the goat-transformers engine linked into goatrope
+([ADR 0006](docs/adr/0006-data-path.md)), the only converter: the send process loads the two
+packs and the model modules they use once, at start, and converts each message in process.
+`version` must be the linked engine's (`0.8.0`), and `packs_sha256` pins what it loads;
+`goatrope packs-digest <packs> <from> <to>` prints both. The files are read once, hashed,
+and the engine loads those same bytes; a digest that differs refuses the start, and `check`
+reports it. A `convert` that names a goat-xf `binary` is refused. One conversion takes a
+millisecond or less (Remote ID to Cursor on Target on amd64: p99 110 to 115 µs over 10,000
+messages, asserted by phase `linked-engine`); loading the two packs at start takes 0.1 to
+0.4 s and 3.3 MiB.
+`status` shows each conversion's count, p50, p99 and maximum time. Rates are in
+[performance.md](docs/performance.md).
 
 A `[[decode]]` runs a first-bite `mind` binary pinned by SHA-256 on the declared
 ports, with its own dictionary and its own sinks, as its own dynamic user with
@@ -230,6 +239,19 @@ declared, the unit also allows `AF_PACKET` sockets, for the probes.
 `relay.health` carries, per proxy address: `held`, `why`, `handshake_age`, `probes`,
 `conflicts`, `added` and `removed`. `status` prints them.
 
+The relay sleeps in `poll` until a socket is readable, takes up to 64 datagrams from it in one
+`recvmmsg` call, applies the rule to each, and sends the allowed ones in one `sendmmsg` call.
+A UDP rule may set `receive_buffer_kb` (256 to 1,048,576; 8,192 when not set), the receive
+buffer of each of its sockets, which holds a burst while the relay is not running
+([ADR 0006](docs/adr/0006-data-path.md); rates in [performance.md](docs/performance.md)).
+
+A datagram larger than the tunnel's MTU less 28 bytes (1,392 on WireGuard's 1,420) crosses the
+tunnel as fragments and is relayed whole. After an overload of fragments, fragmented traffic
+is lost until the kernel's reassembly entries time out (`net.ipv4.ipfrag_time`, 30 s by
+default; goatrope does not change it) while unfragmented traffic keeps flowing.
+`relay.health` carries `reassembly` (this machine's reassembly failures and time-outs since
+the relay started), and `status` prints them when there are any.
+
 ## Tests
 
 `tests/netns/run.sh` runs the tests in a privileged container with systemd as PID 1,
@@ -254,10 +276,19 @@ the host's kernel. No hardware is involved. They cover:
 - `uninstall` leaves only the declaration and recordings; `uninstall --purge` leaves
   the file tree and port state (IPv6 address generation included) exactly as before
   install;
-- decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, a
-  file destination cut at `max_mb`, and a converter stand-in pinned by hash;
+- decode-and-send to UDP, TCP, HTTP and file destinations, fragment reassembly, and a
+  file destination cut at `max_mb`;
+- `fragments`: a 1,400-byte datagram relayed and a 1,514-byte frame mirrored whole over a
+  1,420-byte tunnel; after an overload of them, unfragmented datagrams and small frames still
+  cross, `relay.health` counts the reassembly failures, and fragmented traffic crosses again
+  once `ipfrag_time` has passed;
+- `linked-engine`, with the packs of the pinned goat-transformers commit (run.sh copies them from
+  Cargo's checkout): a `convert` converts 50 of 50 Remote ID messages to Cursor
+  on Target in the send process, and over 10,000 more, p99 of one conversion 1 ms or less
+  (asserted on amd64); another `version` and a goat-xf `binary` are refused; a changed pack
+  makes `check` exit 3 and is refused at start;
 - `components`, when `GOATROPE_TEST_COMPONENTS` names a directory holding them: the
-  real goat-transformers `goat-xf` converting in a `[[send]]`, and the real
+  linked engine converting with the given packs in a `[[send]]`, and the real
   first-bite `mind` decoding in a `[[decode]]` as its own user;
 - `networkmanager`, in an image with NetworkManager managing the wired ports:
   install takes the ports from it at once and leaves the management port alone,
@@ -314,7 +345,7 @@ and the results.
 | Path | Holds |
 |---|---|
 | `bin/goatrope` | the entry point: runs `bin/x86_64/goatrope` or `bin/aarch64/goatrope`, which `tools/build-bin.sh` builds and each release archive holds |
-| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `relay.rs`, `proxy.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
+| `src/` | the Rust source: `config.rs` (the declaration), `tap.rs`, `send.rs`, `engine.rs` (the linked converter), `relay.rs`, `proxy.rs`, `boundary.rs`, `link.rs` (netlink), `sysutil.rs`, `main.rs`; one static binary ([ADR 0003](docs/adr/0003-goatrope-is-written-in-rust.md)) |
 | `deploy/ansible/` | the play and role that install the tap from a release file |
 | `examples/` | declarations with placeholder names and documentation addresses |
 | `tests/netns/` | the namespace tests, their container, and `benchgen.py` (the `bench` phase's traffic generator) |

@@ -3,8 +3,8 @@
 //! Decode-and-send at run time: take the tap's copy, optionally convert, and send.
 //!
 //! `[[send]]` reads frames on a tap port (receive only), reassembles IPv4 fragments,
-//! keeps the UDP datagrams the match names, optionally converts each payload with a
-//! pinned goat-transformers binary, and sends it to UDP, TCP, HTTP or a file. It never
+//! keeps the UDP datagrams the match names, optionally converts each payload with the
+//! goat-transformers engine linked into goatrope (packs pinned by digest), and sends it to UDP, TCP, HTTP or a file. It never
 //! sends through a tap port: a destination routed through one is not sent to.
 //! `verify-component` checks a pinned first-bite binary and copies it where it runs.
 
@@ -13,12 +13,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::process::{Command, Stdio};
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::config::{Config, Convert, Destination, Match};
+use crate::config::{Config, Destination, Match};
 use crate::link;
 use crate::sys::strerror;
 
@@ -482,54 +482,6 @@ impl Sink {
     }
 }
 
-// ---------------------------------------------------------------- convert
-
-pub fn convert(c: &Convert, payload: &[u8], binary: &str) -> Result<Vec<u8>, String> {
-    let mut packs: Vec<&str> = Vec::new();
-    for f in [&c.from_format, &c.to_format] {
-        let p = f.split(':').next().unwrap_or("");
-        if !packs.contains(&p) {
-            packs.push(p);
-        }
-    }
-    let mut child = Command::new(binary)
-        .args(["convert", "--from", &c.from_format, "--to", &c.to_format, "--packs", &c.packs, "--packs-only", &packs.join(",")])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| strerror(&e))?;
-    let mut input: Vec<u8> = payload.iter().flat_map(|b| format!("{b:02x}").into_bytes()).collect();
-    input.push(b'\n');
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        let _ = stdin.write_all(&input);
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("Command '{binary}' timed out after 10 seconds"));
-            }
-            Err(e) => return Err(strerror(&e)),
-        }
-    }
-    let out = child.wait_with_output().map_err(|e| strerror(&e))?;
-    if !out.status.success() {
-        let e = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(e.chars().take(200).collect());
-    }
-    let mut o = out.stdout;
-    while o.last() == Some(&b'\n') {
-        o.pop();
-    }
-    Ok(o)
-}
-
 // ---------------------------------------------------------------- the forwarder
 
 const ETH_P_ALL: u16 = 0x0003;
@@ -596,9 +548,9 @@ impl Drop for PacketSocket {
     }
 }
 
-fn write_heartbeat(path: &str, matched: u64, sent: u64, errors: u64, now: f64) -> std::io::Result<()> {
+fn write_heartbeat(path: &str, matched: u64, sent: u64, errors: u64, now: f64, extra: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.new");
-    fs::write(&tmp, format!("{{\"matched\": {matched}, \"sent\": {sent}, \"errors\": {errors}, \"time\": {}}}", py_float(now)))?;
+    fs::write(&tmp, format!("{{\"matched\": {matched}, \"sent\": {sent}, \"errors\": {errors}, \"time\": {}{extra}}}", py_float(now)))?;
     fs::rename(&tmp, path)
 }
 
@@ -607,12 +559,23 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
         eprintln!("goatrope: no [[send]] {name}");
         return 2;
     };
-    let mut conv_bin = None;
+    let mut converter = None;
     if let Some(c) = &s.convert {
-        match install_component(&c.binary, &c.sha256) {
-            Some(p) => conv_bin = Some(p),
-            None => {
-                eprintln!("goatrope: {} is not the pinned goat-transformers {}", c.binary, c.version);
+        match crate::engine::Linked::load(c, &c.sha256) {
+            Ok(l) => {
+                println!(
+                    "goatrope send {name}: {} loaded {} files of {} in {:.3} s; resident {} KiB, peak {} KiB",
+                    crate::engine::describe(),
+                    l.files,
+                    c.packs,
+                    l.load_s,
+                    l.rss_kib,
+                    l.peak_rss_kib
+                );
+                converter = Some(l);
+            }
+            Err(e) => {
+                eprintln!("goatrope send {name}: {e}");
                 return 1;
             }
         }
@@ -636,12 +599,24 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
     println!("goatrope send {name}: {} udp {} -> {}", s.port, s.matcher, urls.join(", "));
     let _ = std::io::stdout().flush();
     let mut buf = vec![0u8; 65535];
+    let mut timings = crate::engine::Timings::default();
     loop {
         let now = now_f64();
         if now - last_hb >= 2.0 {
             last_hb = now;
+            let extra = match &converter {
+                Some(l) => format!(
+                    ", \"convert\": {}, \"load\": {{\"seconds\": {:.4}, \"files\": {}, \"rss_kib\": {}, \"peak_rss_kib\": {}}}",
+                    timings.json(),
+                    l.load_s,
+                    l.files,
+                    l.rss_kib,
+                    l.peak_rss_kib
+                ),
+                None => String::new(),
+            };
             // a full disk: keep forwarding; check reports the stale heartbeat
-            if let Err(e) = write_heartbeat(&health, matched, sent, errors, now) {
+            if let Err(e) = write_heartbeat(&health, matched, sent, errors, now, &extra) {
                 println!("heartbeat: {}", strerror(&e));
             }
         }
@@ -659,8 +634,14 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
         matched += 1;
         let meta =
             Meta { feed: name.to_string(), time: round6(now), src: d.src.clone(), dst: d.dst.clone(), sport: d.sport, dport: d.dport };
-        let out = match (&s.convert, &conv_bin) {
-            (Some(c), Some(bin)) => match convert(c, &d.payload, bin) {
+        let converted = converter.as_ref().map(|conv| {
+            let t = Instant::now();
+            let r = conv.convert(&d.payload);
+            timings.record(t.elapsed().as_nanos() as u64);
+            r
+        });
+        let out = match converted {
+            Some(r) => match r {
                 Ok(o) => o,
                 Err(e) => {
                     errors += 1;
@@ -669,7 +650,7 @@ pub fn run_send(cfg: &Config, name: &str) -> i32 {
                     continue;
                 }
             },
-            _ => d.payload.clone(),
+            None => d.payload.clone(),
         };
         for sink in sinks.iter_mut() {
             match sink.send(&out, &meta) {
@@ -828,12 +809,13 @@ pub fn check(cfg: &Config) -> Vec<crate::tap::Item> {
     let mut items = Vec::new();
     for s in &cfg.sends {
         if let Some(c) = &s.convert {
-            let h = sha256_file(&c.binary);
+            let (h, what) =
+                (crate::engine::digest(c).ok(), format!("linked {}, packs_sha256 {}", crate::engine::describe(), &c.sha256[..12]));
             item(
                 &mut items,
                 format!("pin:send:{}", s.name),
                 Some(h.as_deref() == Some(c.sha256.as_str())),
-                format!("goat-transformers {} sha256 {}", c.version, &c.sha256[..12]),
+                what,
                 h.map(|x| x[..12].to_string()).unwrap_or_else(|| "absent".into()),
             );
         }
@@ -877,6 +859,18 @@ pub fn status(cfg: &Config) {
             n("errors"),
             urls.join(", ")
         );
+        if let (Some(c), Some(l)) = (hb.get("convert"), hb.get("load")) {
+            let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+            println!(
+                "         convert: {} message(s), p50 {:.0} us, p99 {:.0} us, max {:.0} us; packs loaded in {:.3} s, resident {:.0} KiB",
+                f(c, "count"),
+                f(c, "p50_us"),
+                f(c, "p99_us"),
+                f(c, "max_us"),
+                f(l, "seconds"),
+                f(l, "rss_kib")
+            );
+        }
     }
     for d in &cfg.decodes {
         println!(

@@ -105,9 +105,8 @@ impl fmt::Display for Match {
 
 #[derive(Debug, Clone)]
 pub struct Convert {
-    pub binary: String,
+    /// The packs digest (`packs_sha256`): what the linked engine loads (docs/adr/0006-data-path.md).
     pub sha256: String,
-    pub version: String,
     pub from_format: String,
     pub to_format: String,
     pub packs: String,
@@ -150,6 +149,8 @@ pub struct Decode {
 }
 
 pub const DEFAULT_MAX_CONNECTIONS: i64 = 64;
+/// A UDP rule's socket receive buffer, in KiB, when the rule names none (docs/adr/0006-data-path.md).
+pub const DEFAULT_RECEIVE_BUFFER_KB: i64 = 8192;
 
 /// One allow rule. "remote-to-link" and "both": the relay listens on the remote interface at
 /// listen_port and sends to target:target_port on the link. "link-to-remote": it listens on its
@@ -170,6 +171,8 @@ pub struct RelayRule {
     pub sources: Vec<String>,
     /// tcp: connections open at once on this rule
     pub max_connections: usize,
+    /// udp: the receive buffer of each of the rule's sockets, KiB
+    pub receive_buffer_kb: usize,
     /// a [[relay.proxy]] address the rule's link-side sockets bind to, instead of the relay's own (ADR 0004 §4)
     pub link_address: Option<String>,
 }
@@ -470,9 +473,13 @@ fn port_list(v: &Value, where_: &str, lo: usize, hi: usize) -> R<Vec<String>> {
 }
 
 fn sha(table: &Table, where_: &str) -> R<String> {
-    let v = string(table, "sha256", where_)?;
+    hex64(table, "sha256", where_)
+}
+
+fn hex64(table: &Table, key: &str, where_: &str) -> R<String> {
+    let v = string(table, key, where_)?;
     if v.len() != 64 || !v.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-        return err(format!("{where_}.sha256 must be 64 lowercase hex digits"));
+        return err(format!("{where_}.{key} must be 64 lowercase hex digits"));
     }
     Ok(v)
 }
@@ -807,15 +814,24 @@ fn send(v: &Value, i: usize, tap: Option<&Tap>) -> R<Send> {
     if let Some(c) = s.get("convert") {
         let cw = format!("{w}.convert");
         let c = as_table(c, &cw)?;
-        let req = ["component", "binary", "sha256", "version", "from", "to", "packs"];
+        if c.contains_key("binary") || c.contains_key("sha256") {
+            return err(format!(
+                "{cw}: goatrope converts with the goat-transformers engine linked into it ({}), not a goat-xf binary; remove `binary` and `sha256`, and declare `packs_sha256` (goatrope packs-digest prints it)",
+                crate::engine::describe()
+            ));
+        }
+        let req = ["component", "version", "from", "to", "packs", "packs_sha256"];
         keys(c, &cw, &req, &req)?;
         if c["component"].as_str() != Some("goat-transformers") {
             return err(format!("{cw}.component: only \"goat-transformers\" converts"));
         }
+        let version = string(c, "version", &cw)?;
+        if version != crate::engine::VERSION {
+            return err(format!("{cw}.version is {version}, but the engine linked into this goatrope is {}", crate::engine::describe()));
+        }
         convert = Some(Convert {
-            binary: string(c, "binary", &cw)?,
-            sha256: sha(c, &cw)?,
-            version: string(c, "version", &cw)?,
+            sha256: hex64(c, "packs_sha256", &cw)?,
+
             from_format: string(c, "from", &cw)?,
             to_format: string(c, "to", &cw)?,
             packs: string(c, "packs", &cw)?,
@@ -1038,6 +1054,8 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         allowed.push("link_address");
         if protocol == "tcp" {
             allowed.push("max_connections");
+        } else {
+            allowed.push("receive_buffer_kb");
         }
         keys(a, &aw, &allowed, &req)?;
         // a machine on the link: one host address, not the relay's own, the network or a broadcast
@@ -1080,6 +1098,9 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
         };
         let max_connections =
             if a.contains_key("max_connections") { int(a, "max_connections", &aw, 1, 4096)? } else { DEFAULT_MAX_CONNECTIONS } as usize;
+        let receive_buffer_kb =
+            if a.contains_key("receive_buffer_kb") { int(a, "receive_buffer_kb", &aw, 256, 1 << 20)? } else { DEFAULT_RECEIVE_BUFFER_KB }
+                as usize;
         rules.push(RelayRule {
             direction,
             remote: addr(&a["remote"], &format!("{aw}.remote"))?,
@@ -1090,6 +1111,7 @@ fn relay(v: &Value, tap: Option<&Tap>) -> R<Relay> {
             remote_port,
             sources,
             max_connections,
+            receive_buffer_kb,
             link_address: a.get("link_address").map(|v| addr(v, &format!("{aw}.link_address"))).transpose()?,
         });
     }
@@ -1283,6 +1305,50 @@ allow = [{ direction = "both", protocol = "udp", remote = "198.51.100.5", listen
         assert!(parse(&with("true"), "x.toml").is_ok());
         assert!(parse(&with("false"), "x.toml").is_ok());
         assert!(e(&with("\"yes\"")).contains("wip must be true or false"));
+    }
+
+    #[test]
+    fn relay_receive_buffer() {
+        let r = parse(RELAY, "x.toml").unwrap().relay.unwrap();
+        assert_eq!(r.rules[0].receive_buffer_kb, 8192);
+        let with = |kb: &str| RELAY.replace("target_port = 7000 }", &format!("target_port = 7000, receive_buffer_kb = {kb} }}"));
+        assert_eq!(parse(&with("1024"), "x.toml").unwrap().relay.unwrap().rules[0].receive_buffer_kb, 1024);
+        assert!(e(&with("16")).contains("receive_buffer_kb"));
+        let tcp = with("1024").replace("\"both\", protocol = \"udp\"", "\"remote-to-link\", protocol = \"tcp\"");
+        assert!(e(&tcp).contains("receive_buffer_kb"));
+    }
+
+    const SEND: &str = r#"schema = 1
+[tap]
+mode = "listen"
+source = "mirror-port"
+ports = ["tp0"]
+management = "eth0"
+[tap.record]
+ports = ["tp0"]
+filter = ""
+file_mb = 5
+files = 4
+[[send]]
+name = "s"
+port = "tp0"
+match = { protocol = "udp", dst_port = 5000 }
+to = ["udp://127.0.0.1:9000"]
+CONVERT
+"#;
+
+    #[test]
+    fn convert_is_the_linked_engine_only() {
+        let c = |line: &str| SEND.replace("CONVERT", line);
+        let linked = format!(
+            "convert = {{ component = \"goat-transformers\", version = \"{}\", from = \"a\", to = \"b\", packs = \"/p\", packs_sha256 = \"{}\" }}",
+            crate::engine::VERSION,
+            "0".repeat(64)
+        );
+        assert!(parse(&c(&linked), "x.toml").is_ok());
+        assert!(e(&c(&linked.replace(crate::engine::VERSION, "0.0.1"))).contains("linked into this goatrope"));
+        let binary = linked.replace("packs_sha256", "binary = \"/x\", sha256");
+        assert!(e(&c(&binary)).contains("not a goat-xf binary"));
     }
 
     #[test]
