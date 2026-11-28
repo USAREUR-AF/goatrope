@@ -39,7 +39,7 @@ The relay's parts, and the data paths under them, each with its status on `main`
 | TCP rules, and traffic that machines on the link start | `protocol = "tcp"`; `direction = "link-to-remote"` with `sources` | built (ADR 0004 §2) |
 | Multicast groups on the link | | designed (ADR 0004 §3), not built |
 | A remote machine under a local address of its own | `[[relay.proxy]]` and a rule's `link_address` | built (ADR 0004 §4) |
-| Frames from a tap port sent to a remote collector as ERSPAN | `[[tap.mirror]]` | designed (ADR 0004 §5), not built; the kernel path it uses is measured in [performance.md](docs/performance.md) |
+| Frames from a tap port sent to a remote collector as ERSPAN | `[[tap.mirror]]` | built (ADR 0004 §5): 160 of 160 frames at a goatrope collector over WireGuard MTU 1,280, 1,514-byte frames whole; the kernel path is measured in [performance.md](docs/performance.md) |
 | One port bridged to one peer, filtered by EtherType and source MAC | `[[relay.l2]]` with `accept_layer2 = true` | built (ADR 0004 §6); also run in the emulated arm64 VM |
 | A dedicated tunnel to a boundary point | `transport = "boundary"`, `[relay.boundary]` | built |
 | Batched UDP forwarding | a rule's `receive_buffer_kb` (default 8,192) | built ([ADR 0006](docs/adr/0006-data-path.md)) |

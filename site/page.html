@@ -167,7 +167,7 @@ footer { border-top: 1px solid var(--rule); padding-block: 30px 50px; color: var
     <div class="way"><h3>A layer-2 lane</h3><p>One dedicated port bridged to one peer, accepted by name. Only the declared EtherTypes cross, and from the tunnel only the declared source MACs; the lane closes when the tunnel goes quiet.</p><p class="st">Built. <code>[[relay.l2]]</code></p></div>
     <div class="way"><h3>A boundary point</h3><p>A site outside the mesh is reached through a WireGuard interface of goatrope's own whose one peer is the declared boundary point, checked every 2 s.</p><p class="st">Built. <code>transport = "boundary"</code></p></div>
     <div class="way"><h3>Multicast groups</h3><p>A group on the link as a rule's target, and a joined group sent to several remotes.</p><p class="st">Designed (ADR 0004), not built.</p></div>
-    <div class="way"><h3>A remote mirror</h3><p>Every frame of a tap port, sent as ERSPAN over the mesh to a collector elsewhere.</p><p class="st">Designed (ADR 0004), not built.</p></div>
+    <div class="way"><h3>A remote mirror</h3><p>Every frame of a tap port, or those a filter names, sent whole as ERSPAN over the mesh to a collector elsewhere. Nothing is sent onto the tapped link.</p><p class="st">Built. <code>[[tap.mirror]]</code></p></div>
   </div>
   <p class="cap">Rules, refusals and what <code>check</code> reads: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/README.md">README</a>. How it compares with an overlay network: <a href="https://github.com/USAREUR-AF/goatrope/blob/main/docs/related-work.md">related-work.md</a>.</p>
 </div></section>
