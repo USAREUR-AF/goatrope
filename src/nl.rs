@@ -6,6 +6,7 @@
 use std::fmt::Debug;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use netlink_packet_core::{
     NetlinkDeserializable, NetlinkMessage, NetlinkPayload, NetlinkSerializable, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
@@ -390,4 +391,90 @@ pub fn wg_set(ifname: &str, s: &WgSet) -> io::Result<()> {
         WireguardAttribute::Peers(vec![WireguardPeer(peer)]),
     ];
     wireguard(WireguardCmd::SetDevice, attrs, 0).map(|_| ())
+}
+
+// ---------------------------------------------------------------- WireGuard peer freshness
+
+/// A tunnel is up while its latest handshake is younger than this (ADR 0004 §4). WireGuard
+/// renews a session at least every 120 s while packets flow (REKEY_AFTER_TIME), and a mesh
+/// peer with a persistent keepalive always has packets flowing.
+pub const HANDSHAKE_FRESH_S: i64 = 180;
+
+/// The peer WireGuard sends `remote` to: the one whose allowed IPs hold it, the longest prefix first.
+pub fn owner(dev: &WgDevice, remote: IpAddr) -> Option<&WgPeer> {
+    dev.peers
+        .iter()
+        .filter_map(|p| {
+            p.allowed_ips.iter().filter(|(net, cidr)| prefix_holds(*net, *cidr, remote)).map(|(_, c)| (*c, p)).max_by_key(|(c, _)| *c)
+        })
+        .max_by_key(|(c, _)| *c)
+        .map(|(_, p)| p)
+}
+
+/// The handshake age, in seconds, of the WireGuard peer on ifname that WireGuard would send
+/// `remote` to: the one whose allowed IPs hold it, the longest prefix first. Err says why there is none.
+pub fn handshake_age(ifname: &str, remote: IpAddr, now: i64) -> Result<i64, String> {
+    let dev = wg_get(ifname).map_err(|e| format!("cannot read {ifname}: {}", crate::sys::strerror(&e)))?;
+    let Some(p) = owner(&dev, remote) else {
+        return Err(format!("no peer on {ifname} has {remote} in its allowed IPs"));
+    };
+    if p.last_handshake == 0 {
+        return Err(format!("the peer for {remote} on {ifname} has not completed a handshake"));
+    }
+    Ok((now - p.last_handshake).max(0))
+}
+
+pub fn prefix_holds(net: IpAddr, cidr: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            let m = if cidr == 0 { 0 } else { u32::MAX << (32 - cidr.min(32) as u32) };
+            u32::from(n) & m == u32::from(i) & m
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            let m = if cidr == 0 { 0 } else { u128::MAX << (128 - cidr.min(128) as u32) };
+            u128::from(n) & m == u128::from(i) & m
+        }
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------- stop on a signal (the relay loop)
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
+}
+
+/// SIGTERM (systemd stop), SIGINT and SIGHUP set a flag the relay loop reads, so it can remove
+/// the proxy addresses it added before it exits. poll(2) returns EINTR on the signal.
+pub fn catch_stop_signals() {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: an all-zero sigaction is valid; the handler only stores to an atomic.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+pub fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(prefix_holds(ip("198.51.100.0"), 24, ip("198.51.100.5")));
+        assert!(!prefix_holds(ip("198.51.100.0"), 25, ip("198.51.100.200")));
+        assert!(prefix_holds(ip("0.0.0.0"), 0, ip("203.0.113.1")));
+        assert!(prefix_holds(ip("2001:db8::"), 32, ip("2001:db8::1")));
+        assert!(!prefix_holds(ip("2001:db8::"), 32, ip("198.51.100.5")));
+    }
 }

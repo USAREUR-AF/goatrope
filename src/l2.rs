@@ -19,8 +19,8 @@
 //!   was not replaced; `tc -s filter show` counts each.
 //!
 //! The GRETAP interface is up only while the WireGuard peer that owns `peer` has a handshake
-//! younger than 180 s (read every 2 s, with the address proxy's `proxy::handshake_age`); it is
-//! taken down when the relay stops (on SIGTERM through `proxy::stop_requested`, and ExecStopPost
+//! younger than 180 s (read every 2 s, with `nl::handshake_age`); it is
+//! taken down when the relay stops (on SIGTERM through `nl::stop_requested`, and ExecStopPost
 //! runs `goatrope l2 down`), and when anything about the lane differs from the declaration, after
 //! which the relay exits and the unit's restart builds it again.
 
@@ -414,19 +414,7 @@ pub fn preflight(cfg: &Config) -> Result<(), String> {
                 return Err(format!("{w}: {} does not hold {}, this end of the lane", r.remote_interface, l.local));
             }
             let peer: IpAddr = l.peer.parse().map_err(|_| format!("{w}: bad peer {}", l.peer))?;
-            let owner = dev
-                .peers
-                .iter()
-                .filter_map(|p| {
-                    p.allowed_ips
-                        .iter()
-                        .filter(|(n, c)| crate::proxy::prefix_holds(*n, *c, peer))
-                        .map(|(_, c)| (*c, p))
-                        .max_by_key(|(c, _)| *c)
-                })
-                .max_by_key(|(c, _)| *c)
-                .map(|(_, p)| p);
-            let Some(owner) = owner else {
+            let Some(owner) = nl::owner(dev, peer) else {
                 return Err(format!(
                     "{w}: no WireGuard peer on {} is allowed {}; the lane's far end must be a peer of the mesh",
                     r.remote_interface, l.peer
@@ -587,7 +575,7 @@ pub fn tick(r: &Relay) -> Result<(), String> {
     for l in &r.l2 {
         let gt = gretap(l);
         let age = handshake_age(r, l).ok();
-        let fresh = age.is_some_and(|a| a < crate::proxy::HANDSHAKE_FRESH_S);
+        let fresh = age.is_some_and(|a| a < nl::HANDSHAKE_FRESH_S);
         let is_up = nl::is_up(&gt).unwrap_or(false);
         if fresh && !is_up {
             nl::set_up(&gt).map_err(|e| format!("{gt}: {e}"))?;
@@ -598,7 +586,7 @@ pub fn tick(r: &Relay) -> Result<(), String> {
                 "goatrope relay: lane {} down: the peer for {} has no handshake in the last {} s",
                 l.name,
                 l.peer,
-                crate::proxy::HANDSHAKE_FRESH_S
+                nl::HANDSHAKE_FRESH_S
             );
         }
     }
@@ -610,7 +598,7 @@ pub fn tick(r: &Relay) -> Result<(), String> {
 fn handshake_age(r: &Relay, l: &L2) -> Result<i64, String> {
     let peer: IpAddr = l.peer.parse().map_err(|_| format!("bad peer {}", l.peer))?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-    crate::proxy::handshake_age(&r.remote_interface, peer, now)
+    nl::handshake_age(&r.remote_interface, peer, now)
 }
 
 /// The lane interfaces that exist, for the relay's IP forwarding check.
